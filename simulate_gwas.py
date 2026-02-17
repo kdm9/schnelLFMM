@@ -203,10 +203,13 @@ def simulate_genotypes(n_samples, n_snps_target, k_pops, pop_props, fst, seed):
 def simulate_phenotypes(G, traits, rng):
     """Simulate phenotypes from genotype matrix G.
 
-    Returns dict of {trait_name: y_vector}.
+    Returns (phenotypes, causal_info) where:
+      phenotypes: dict of {trait_name: y_vector}
+      causal_info: list of (trait_name, snp_index, effect_size) tuples
     """
     n_samples, n_snps = G.shape
     phenotypes = {}
+    causal_info = []
 
     for trait in traits:
         name = trait["name"]
@@ -244,7 +247,10 @@ def simulate_phenotypes(G, traits, rng):
         actual_h2 = var_g / np.var(y) if np.var(y) > 0 else 0
         print(f"  Trait '{name}': {n_causal} causal SNPs, target h2={h2:.3f}, actual h2={actual_h2:.3f}")
 
-    return phenotypes
+        for ci, b in zip(causal_idx, beta):
+            causal_info.append((name, int(ci), float(b)))
+
+    return phenotypes, causal_info
 
 
 def write_fam(path, sample_ids):
@@ -301,6 +307,16 @@ def write_bed(path, G):
             f.write(packed.tobytes())
 
 
+def write_causal(path, causal_info, positions, alleles_list):
+    """Write causal variant ground truth to a TSV file."""
+    with open(path, "w") as f:
+        f.write("trait\tsnp_index\tsnp_id\tchr\tposition\tallele1\tallele2\teffect_size\n")
+        for trait_name, snp_idx, beta in causal_info:
+            pos = positions[snp_idx]
+            a1, a2 = alleles_list[snp_idx]
+            f.write(f"{trait_name}\t{snp_idx}\tsnp_{snp_idx}\t1\t{pos}\t{a1}\t{a2}\t{beta:.6f}\n")
+
+
 def write_phenotypes(path, sample_ids, phenotypes):
     trait_names = list(phenotypes.keys())
     with open(path, "w") as f:
@@ -333,7 +349,7 @@ def main():
     print(f"\nFinal genotype matrix: {G.shape[0]} samples x {G.shape[1]} SNPs")
 
     print("\nSimulating phenotypes ...")
-    phenotypes = simulate_phenotypes(G, traits, rng)
+    phenotypes, causal_info = simulate_phenotypes(G, traits, rng)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -343,10 +359,12 @@ def main():
     write_bim(f"{args.out}.bim", positions, alleles_list)
     write_bed(f"{args.out}.bed", G)
     write_phenotypes(f"{args.out}_phenotypes.tsv", sample_ids, phenotypes)
+    write_causal(f"{args.out}_causal.tsv", causal_info, positions, alleles_list)
 
     print("Done.")
     print(f"  {args.out}.bed / .bim / .fam")
     print(f"  {args.out}_phenotypes.tsv")
+    print(f"  {args.out}_causal.tsv")
 
 
 if __name__ == "__main__":
