@@ -78,6 +78,11 @@ impl BedFile {
             .with_context(|| format!("Failed to open {}", bed_path.display()))?;
         let mmap = unsafe { Mmap::map(&file)? };
 
+        // Hint to the OS that we'll read sequentially (improves readahead)
+        #[cfg(unix)]
+        mmap.advise(memmap2::Advice::Sequential)
+            .with_context(|| format!("madvise(SEQUENTIAL) failed for {}", bed_path.display()))?;
+
         // Validate magic bytes
         if mmap.len() < 3 || mmap[0..3] != BED_MAGIC {
             bail!(
