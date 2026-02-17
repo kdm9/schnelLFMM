@@ -1,4 +1,5 @@
 pub mod bed;
+pub mod parallel;
 pub mod precompute;
 pub mod rsvd;
 pub mod simulate;
@@ -26,6 +27,8 @@ pub struct Lfmm2Config {
     pub n_power_iter: usize,
     /// RNG seed for reproducibility
     pub seed: u64,
+    /// Number of worker threads for parallel chunk processing (0 = sequential)
+    pub n_workers: usize,
 }
 
 impl Default for Lfmm2Config {
@@ -37,6 +40,7 @@ impl Default for Lfmm2Config {
             oversampling: 10,
             n_power_iter: 2,
             seed: 42,
+            n_workers: 0,
         }
     }
 }

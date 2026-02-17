@@ -52,7 +52,7 @@ pub struct BedFile {
     pub n_snps: usize,
     pub bim_records: Vec<BimRecord>,
     pub fam_records: Vec<FamRecord>,
-    mmap: Mmap,
+    pub(crate) mmap: Mmap,
 }
 
 impl BedFile {
@@ -204,8 +204,28 @@ pub fn decode_bed_chunk(packed: &[u8], n_samples: usize, chunk_size: usize) -> A
     out
 }
 
+/// Decode specific SNPs from mmap data into a pre-allocated output matrix.
+///
+/// - `mmap_data`: mmap bytes after the 3-byte header
+/// - `bps`: bytes per SNP
+/// - `n_samples`: number of samples
+/// - `snp_indices`: which SNPs to decode (column indices in the .bed file)
+/// - `out`: pre-allocated output slice (n_samples × snp_indices.len())
+pub fn decode_bed_chunk_into(
+    mmap_data: &[u8],
+    bps: usize,
+    n_samples: usize,
+    snp_indices: &[usize],
+    mut out: ndarray::ArrayViewMut2<f64>,
+) {
+    for (col, &snp_idx) in snp_indices.iter().enumerate() {
+        let snp_bytes = &mmap_data[snp_idx * bps..(snp_idx + 1) * bps];
+        decode_single_snp(snp_bytes, n_samples, out.column_mut(col));
+    }
+}
+
 /// Decode a single SNP column, impute missing to mean, and center.
-fn decode_single_snp(
+pub(crate) fn decode_single_snp(
     snp_bytes: &[u8],
     n_samples: usize,
     mut col: ndarray::ArrayViewMut1<f64>,

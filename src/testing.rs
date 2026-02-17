@@ -4,6 +4,7 @@ use ndarray_linalg::InverseInto;
 use statrs::distribution::{ContinuousCDF, Normal, StudentsT};
 
 use crate::bed::{BedFile, SubsetSpec};
+use crate::parallel::{parallel_stream, DisjointRowWriter};
 use crate::precompute::Precomputed;
 use crate::Lfmm2Config;
 
@@ -36,6 +37,7 @@ pub fn test_associations_fused(
     let p = y_full.n_snps;
     let d = x.ncols();
     let k = config.k;
+    let chunk_size = config.chunk_size;
 
     // Precompute P_U = U_hat @ inv(U_hat^T U_hat) @ U_hat^T (n × n)
     let utu = u_hat.t().dot(u_hat);
@@ -66,7 +68,6 @@ pub fn test_associations_fused(
     let df = (n - d - k) as f64;
 
     // Diagonal elements of CtC_inv for standard error computation
-    // We need CtC_inv[j, j] for each covariate j in 0..d
     let ctc_inv_diag: Vec<f64> = (0..d).map(|j| ctc_inv[(j, j)]).collect();
 
     // Allocate output arrays
@@ -76,60 +77,92 @@ pub fn test_associations_fused(
 
     // Single fused pass over Y_full
     let subset = SubsetSpec::All;
-    for (start, chunk) in y_full.stream_chunks(config.chunk_size, &subset) {
-        let chunk_cols = chunk.ncols();
+    if config.n_workers > 0 {
+        // Pattern A: scatter — each chunk writes to disjoint rows of 3 output arrays
+        let wr_effects = DisjointRowWriter::new(&mut effect_sizes);
+        let wr_tstats = DisjointRowWriter::new(&mut t_stats);
+        let wr_pvals = DisjointRowWriter::new(&mut raw_p_values);
+        parallel_stream(y_full, &subset, chunk_size, config.n_workers, |block| {
+            let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
+            let chunk_cols = block.n_cols;
+            let start = block.seq * chunk_size;
 
-        // Step 3: B = (XtR @ (I - P_U) @ chunk)^T
-        let residual = i_minus_pu.dot(&chunk);
-        let b_chunk = xtr.dot(&residual); // d × chunk_cols
-        effect_sizes
-            .slice_mut(ndarray::s![start..start + chunk_cols, ..])
-            .assign(&b_chunk.t());
+            // Step 3: B = (XtR @ (I - P_U) @ chunk)^T
+            let residual = i_minus_pu.dot(&chunk);
+            let b_chunk = xtr.dot(&residual); // d × chunk_cols
+            let b_chunk_t = b_chunk.t().to_owned();
 
-        // Step 4: OLS with C = [X | U_hat]
-        let coefs = h.dot(&chunk); // (d+K) × chunk_cols
-        let fitted = c.dot(&coefs); // n × chunk_cols
-        let residuals = &chunk - &fitted; // n × chunk_cols
+            // Step 4: OLS with C = [X | U_hat]
+            let coefs = h.dot(&chunk); // (d+K) × chunk_cols
+            let fitted = c.dot(&coefs); // n × chunk_cols
+            let residuals = &chunk - &fitted; // n × chunk_cols
 
-        // Residual sum of squares per locus
-        // sigma2[j] = sum(residuals[:,j]^2) / df
-        for col_in_chunk in 0..chunk_cols {
-            let res_col = residuals.column(col_in_chunk);
-            let rss: f64 = res_col.dot(&res_col);
-            let sigma2 = rss / df;
+            let mut local_tstats = Array2::<f64>::zeros((chunk_cols, d));
+            let mut local_pvals = Array2::<f64>::zeros((chunk_cols, d));
 
-            let snp_idx = start + col_in_chunk;
-            for j in 0..d {
-                let se = (sigma2 * ctc_inv_diag[j]).sqrt();
-                let t = coefs[(j, col_in_chunk)] / se;
-                t_stats[(snp_idx, j)] = t;
+            for col_in_chunk in 0..chunk_cols {
+                let res_col = residuals.column(col_in_chunk);
+                let rss: f64 = res_col.dot(&res_col);
+                let sigma2 = rss / df;
 
-                // Two-sided p-value from Student's t distribution
-                let t_dist = StudentsT::new(0.0, 1.0, df).unwrap();
-                let p_val = 2.0 * t_dist.cdf(-t.abs());
-                raw_p_values[(snp_idx, j)] = p_val;
+                for j in 0..d {
+                    let (t, p_val) = t_test(coefs[(j, col_in_chunk)], sigma2, ctc_inv_diag[j], df);
+                    local_tstats[(col_in_chunk, j)] = t;
+                    local_pvals[(col_in_chunk, j)] = p_val;
+                }
+            }
+
+            unsafe {
+                wr_effects.write_rows(start, &b_chunk_t);
+                wr_tstats.write_rows(start, &local_tstats);
+                wr_pvals.write_rows(start, &local_pvals);
+            }
+        });
+    } else {
+        for (start, chunk) in y_full.stream_chunks(chunk_size, &subset) {
+            let chunk_cols = chunk.ncols();
+
+            // Step 3: B = (XtR @ (I - P_U) @ chunk)^T
+            let residual = i_minus_pu.dot(&chunk);
+            let b_chunk = xtr.dot(&residual); // d × chunk_cols
+            effect_sizes
+                .slice_mut(ndarray::s![start..start + chunk_cols, ..])
+                .assign(&b_chunk.t());
+
+            // Step 4: OLS with C = [X | U_hat]
+            let coefs = h.dot(&chunk); // (d+K) × chunk_cols
+            let fitted = c.dot(&coefs); // n × chunk_cols
+            let residuals = &chunk - &fitted; // n × chunk_cols
+
+            for col_in_chunk in 0..chunk_cols {
+                let res_col = residuals.column(col_in_chunk);
+                let rss: f64 = res_col.dot(&res_col);
+                let sigma2 = rss / df;
+
+                let snp_idx = start + col_in_chunk;
+                for j in 0..d {
+                    let (t, p_val) = t_test(coefs[(j, col_in_chunk)], sigma2, ctc_inv_diag[j], df);
+                    t_stats[(snp_idx, j)] = t;
+                    raw_p_values[(snp_idx, j)] = p_val;
+                }
             }
         }
     }
 
     // GIF calibration (genomic inflation factor)
-    // Convert t-stats to z-scores, compute GIF = median(z^2) / 0.456
     let normal = Normal::new(0.0, 1.0).unwrap();
 
-    // Calibrate each covariate column independently
     let mut calibrated_p = raw_p_values.clone();
     let mut total_gif = 0.0;
 
     for j in 0..d {
         let t_col = t_stats.column(j);
-        // z-scores: use t-stats directly as approximate z-scores for large df
-        let mut z_sq: Vec<f64> = t_col.iter().map(|&t| t * t).collect();
+        let mut z_sq: Vec<f64> = t_col.iter().map(|&t| t * t).filter(|v| v.is_finite()).collect();
         z_sq.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median_z_sq = median_sorted(&z_sq);
         let gif = median_z_sq / 0.456;
         total_gif += gif;
 
-        // Calibrate: z_cal = z / sqrt(GIF), p_cal = 2 * Phi(-|z_cal|)
         let gif_sqrt = gif.sqrt();
         for i in 0..p {
             let z = t_stats[(i, j)];
@@ -148,6 +181,25 @@ pub fn test_associations_fused(
         p_values: calibrated_p,
         gif: avg_gif,
     })
+}
+
+/// Compute t-statistic and two-sided p-value, guarding against zero-variance SNPs.
+///
+/// When se ≈ 0 (monomorphic SNP), t would be Inf/NaN which crashes statrs::StudentsT::cdf.
+/// In that case we return t=0, p=1 (no evidence of association).
+#[inline]
+fn t_test(coef: f64, sigma2: f64, ctc_inv_jj: f64, df: f64) -> (f64, f64) {
+    let se = (sigma2 * ctc_inv_jj).sqrt();
+    if se < 1e-300 || !se.is_finite() {
+        return (0.0, 1.0);
+    }
+    let t = coef / se;
+    if !t.is_finite() {
+        return (0.0, 1.0);
+    }
+    let t_dist = StudentsT::new(0.0, 1.0, df).unwrap();
+    let p_val = 2.0 * t_dist.cdf(-t.abs());
+    (t, p_val)
 }
 
 /// Compute median of a sorted slice.

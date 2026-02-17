@@ -33,6 +33,7 @@ fn test_lfmm2_quick() {
         oversampling: 10,
         n_power_iter: 2,
         seed: 42,
+        n_workers: 0,
     };
 
     // Simulate
@@ -79,6 +80,7 @@ fn test_lfmm2_large() {
         oversampling: 10,
         n_power_iter: 2,
         seed: 42,
+        n_workers: 0,
     };
 
     // Simulate
@@ -139,6 +141,7 @@ fn test_reproducibility() {
         oversampling: 5,
         n_power_iter: 1,
         seed: 42,
+        n_workers: 0,
     };
 
     let sim = simulate(&sim_config);
@@ -279,6 +282,80 @@ fn canonical_correlations(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     // Canonical correlations are the singular values (clamped to [0,1])
     let mean_corr: f64 = s.iter().take(k).map(|&v| v.min(1.0)).sum::<f64>() / k as f64;
     mean_corr
+}
+
+/// Parallel correctness: n_workers=2 should match n_workers=0 within FP tolerance.
+#[test]
+fn test_parallel_matches_sequential() {
+    let sim_config = SimConfig {
+        n_samples: 200,
+        n_snps: 10_000,
+        n_causal: 20,
+        k: 3,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 77777,
+    };
+
+    let sim = simulate(&sim_config);
+
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+    // Sequential run
+    let config_seq = Lfmm2Config {
+        k: 3,
+        lambda: 1e-5,
+        chunk_size: 2_000,
+        oversampling: 10,
+        n_power_iter: 2,
+        seed: 42,
+        n_workers: 0,
+    };
+    let r_seq = fit_lfmm2(&bed, &bed, &sim.x, &config_seq).unwrap();
+
+    // Parallel run
+    let config_par = Lfmm2Config {
+        n_workers: 2,
+        ..config_seq
+    };
+    let r_par = fit_lfmm2(&bed, &bed, &sim.x, &config_par).unwrap();
+
+    // P-values should match within floating-point tolerance.
+    // Pattern A loops are bitwise identical; Pattern B may differ at ~1e-14
+    // due to FP summation order via Mutex.
+    let tol = 1e-10;
+    let p = r_seq.p_values.nrows();
+    let d = r_seq.p_values.ncols();
+    let mut max_diff = 0.0f64;
+    for i in 0..p {
+        for j in 0..d {
+            let diff = (r_seq.p_values[(i, j)] - r_par.p_values[(i, j)]).abs();
+            max_diff = max_diff.max(diff);
+        }
+    }
+    eprintln!("Max p-value diff (seq vs par): {:.2e}", max_diff);
+    assert!(
+        max_diff < tol,
+        "Parallel p-values diverge from sequential: max_diff={:.2e} (tol={:.2e})",
+        max_diff,
+        tol,
+    );
+
+    // GIF should also be very close
+    let gif_diff = (r_seq.gif - r_par.gif).abs();
+    eprintln!("GIF diff: {:.2e}", gif_diff);
+    assert!(
+        gif_diff < tol,
+        "GIF diverges: seq={:.6} par={:.6} diff={:.2e}",
+        r_seq.gif,
+        r_par.gif,
+        gif_diff,
+    );
 }
 
 fn write_rust_results(dir: &Path, results: &lfmm2::testing::TestResults) {

@@ -9,7 +9,8 @@ ndarray-linalg = { version = "0.17", features = ["openblas-static"] }
 ndarray-rand = "0.15"
 blas-src = { version = "0.10", features = ["openblas"] }
 openblas-src = { version = "0.10", features = ["cblas", "static"] }
-rayon = "1.10"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
 memmap2 = "0.9"
 rand = "0.8"
 rand_distr = "0.4"
