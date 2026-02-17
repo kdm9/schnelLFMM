@@ -1,13 +1,26 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ndarray::Array2;
 use ndarray_linalg::InverseInto;
 use statrs::distribution::{ContinuousCDF, Normal, StudentsT};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
 
-use crate::bed::{BedFile, SubsetSpec};
+use crate::bed::{BedFile, BimRecord, SubsetSpec};
 use crate::parallel::{parallel_stream, DisjointRowWriter};
 use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
+
+/// Configuration for streaming results output.
+///
+/// When provided to `test_associations_fused`, each chunk writes a TSV fragment
+/// during the streaming pass. After GIF calibration, fragments are coalesced
+/// into a single output file with calibrated p-values.
+pub struct OutputConfig<'a> {
+    pub path: &'a Path,
+    pub bim: &'a [BimRecord],
+    pub cov_names: &'a [String],
+}
 
 /// Results from the LFMM2 association testing pass.
 pub struct TestResults {
@@ -32,12 +45,17 @@ pub struct TestResults {
 ///   For each SNP j: y_j = C γ_j + ε_j, then t_j = γ̂[1..d] / se(γ̂[1..d]).
 ///   Standard errors come from se²(γ̂_j) = σ̂² · diag((C^T C)^{-1}), where σ̂² = RSS / df.
 ///   Degrees of freedom: df = n - d - K (residual df after fitting d covariates + K latent factors).
+///
+/// When `output` is `Some`, each chunk's effect sizes and t-statistics are written
+/// to a temporary TSV fragment. After GIF calibration, fragments are coalesced into
+/// the final output file with calibrated p-values inserted.
 pub fn test_associations_fused(
     y_full: &BedFile,
     x: &Array2<f64>,
     u_hat: &Array2<f64>,
     pre: &Precomputed,
     config: &Lfmm2Config,
+    output: Option<&OutputConfig>,
 ) -> Result<TestResults> {
     let n = y_full.n_samples;
     let p = y_full.n_snps;
@@ -58,12 +76,6 @@ pub fn test_associations_fused(
     let df = (n - d - k) as f64;
 
     // Precompute P_U = U_hat (U^T U)^{-1} U^T (n × n).
-    //
-    // P_U is the orthogonal projector onto col(U_hat). If U_hat has near-collinear
-    // columns (e.g. K exceeds the effective rank of the data, or a latent factor
-    // is nearly constant), U^T U becomes singular. We use a regularized inverse
-    // to avoid a hard failure — this slightly shrinks the projection but preserves
-    // the residual computation (I - P_U)Y needed for Step 3.
     let utu = u_hat.t().dot(u_hat);
     let utu_inv = safe_inv(&utu, "U_hat^T U_hat")?;
     let p_u = u_hat.dot(&utu_inv).dot(&u_hat.t());
@@ -82,35 +94,40 @@ pub fn test_associations_fused(
     c.slice_mut(ndarray::s![.., d..]).assign(u_hat);
 
     // (C^T C)^{-1}: needed for standard errors.
-    //
-    // If a covariate in X aligns with a latent factor in U_hat (common when an
-    // environmental variable is confounded with population structure), C has
-    // collinear columns and C^T C is singular. Regularized inverse prevents the
-    // crash; affected standard errors will be slightly inflated (conservative).
     let ctc = c.t().dot(&c);
     let ctc_inv = safe_inv(&ctc, "C^T C  where C = [X | U_hat]")?;
 
     // H = (C^T C)^{-1} C^T — the OLS hat matrix for coefficient estimation
     let h = ctc_inv.dot(&c.t());
 
-    // Diagonal of (C^T C)^{-1} for standard error computation:
-    // se(γ̂_j) = sqrt(σ̂² · (C^T C)^{-1}_{jj})
+    // Diagonal of (C^T C)^{-1} for standard error computation
     let ctc_inv_diag: Vec<f64> = (0..d).map(|j| ctc_inv[(j, j)]).collect();
 
     // Allocate output arrays
     let mut effect_sizes = Array2::<f64>::zeros((p, d));
     let mut t_stats = Array2::<f64>::zeros((p, d));
-    let mut raw_p_values = Array2::<f64>::zeros((p, d));
+
+    // Create temp dir for chunk files if writing output
+    let chunk_dir = if output.is_some() {
+        let parent = output.unwrap().path.parent().unwrap_or(Path::new("."));
+        Some(
+            tempfile::Builder::new()
+                .prefix(".lfmm2_chunks_")
+                .tempdir_in(parent)
+                .context("Failed to create temp directory for chunk files")?,
+        )
+    } else {
+        None
+    };
 
     // Single fused pass over Y_full
     let subset = SubsetSpec::All;
-    let n_chunks = ((p + chunk_size - 1) / chunk_size) as u64;
-    let pb = make_progress_bar(n_chunks, "Association tests", config.progress);
+    let n_chunks = (p + chunk_size - 1) / chunk_size;
+    let pb = make_progress_bar(n_chunks as u64, "Association tests", config.progress);
 
     {
         let wr_effects = DisjointRowWriter::new(&mut effect_sizes);
         let wr_tstats = DisjointRowWriter::new(&mut t_stats);
-        let wr_pvals = DisjointRowWriter::new(&mut raw_p_values);
         parallel_stream(y_full, &subset, chunk_size, config.n_workers, |_worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let chunk_cols = block.n_cols;
@@ -127,7 +144,6 @@ pub fn test_associations_fused(
             let residuals = &chunk - &fitted; // n × chunk_cols
 
             let mut local_tstats = Array2::<f64>::zeros((chunk_cols, d));
-            let mut local_pvals = Array2::<f64>::zeros((chunk_cols, d));
 
             for col_in_chunk in 0..chunk_cols {
                 let res_col = residuals.column(col_in_chunk);
@@ -135,17 +151,23 @@ pub fn test_associations_fused(
                 let sigma2 = rss / df;
 
                 for j in 0..d {
-                    let (t, p_val) = t_test(coefs[(j, col_in_chunk)], sigma2, ctc_inv_diag[j], df);
+                    let (t, _) = t_test(coefs[(j, col_in_chunk)], sigma2, ctc_inv_diag[j], df);
                     local_tstats[(col_in_chunk, j)] = t;
-                    local_pvals[(col_in_chunk, j)] = p_val;
                 }
             }
 
             unsafe {
                 wr_effects.write_rows(start, &b_chunk_t);
                 wr_tstats.write_rows(start, &local_tstats);
-                wr_pvals.write_rows(start, &local_pvals);
             }
+
+            // Write chunk TSV fragment if output configured
+            if let Some(ref dir) = chunk_dir {
+                let bim_slice = &output.unwrap().bim[start..start + chunk_cols];
+                write_chunk_tsv(dir.path(), block.seq, bim_slice, &b_chunk_t, &local_tstats, d)
+                    .expect("failed to write chunk file");
+            }
+
             pb.inc(1);
         });
     }
@@ -160,44 +182,133 @@ pub fn test_associations_fused(
     // Calibrated z-scores: z_cal = t / sqrt(GIF), p_cal = 2Φ(-|z_cal|).
     let normal = Normal::new(0.0, 1.0).unwrap();
 
-    let mut calibrated_p = raw_p_values.clone();
+    let mut p_values = Array2::<f64>::zeros((p, d));
+    let mut gif_per_trait = Vec::with_capacity(d);
     let mut total_gif = 0.0;
 
     for j in 0..d {
         let t_col = t_stats.column(j);
-        // Filter non-finite values (shouldn't occur after t_test guard, but be safe)
         let mut z_sq: Vec<f64> = t_col.iter().map(|&t| t * t).filter(|v| v.is_finite()).collect();
         z_sq.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median_z_sq = median_sorted(&z_sq);
 
-        // Guard: if median(t²) ≈ 0, all test statistics are near zero (e.g. all SNPs
-        // monomorphic or K is too large). GIF is undefined; use 1.0 (no calibration)
-        // to avoid division by zero in z_cal = t / sqrt(GIF).
         let gif = if median_z_sq < 1e-10 {
             1.0
         } else {
             median_z_sq / 0.4549
         };
+        gif_per_trait.push(gif);
         total_gif += gif;
 
         let gif_sqrt = gif.sqrt();
         for i in 0..p {
             let z = t_stats[(i, j)];
             let z_cal = z / gif_sqrt;
-            let p_cal = 2.0 * normal.cdf(-z_cal.abs());
-            calibrated_p[(i, j)] = p_cal;
+            p_values[(i, j)] = 2.0 * normal.cdf(-z_cal.abs());
         }
     }
 
     let avg_gif = total_gif / d as f64;
 
+    // Coalesce chunk files into final output
+    if let Some(out) = output {
+        coalesce_output(
+            out.path,
+            out.cov_names,
+            chunk_dir.as_ref().unwrap().path(),
+            n_chunks,
+            &gif_per_trait,
+        )?;
+    }
+
     Ok(TestResults {
         u_hat: u_hat.to_owned(),
         effect_sizes,
         t_stats,
-        p_values: calibrated_p,
+        p_values,
         gif: avg_gif,
     })
+}
+
+/// Write a chunk's effect sizes and t-statistics as a TSV fragment (no header).
+///
+/// Format: `chr\tpos\tsnp_id\tbeta_0\tt_0\tbeta_1\tt_1\t...`
+fn write_chunk_tsv(
+    dir: &Path,
+    seq: usize,
+    bim: &[BimRecord],
+    betas: &Array2<f64>,
+    tstats: &Array2<f64>,
+    d: usize,
+) -> Result<()> {
+    let path = dir.join(format!("chunk_{:06}.tsv", seq));
+    let mut f = BufWriter::new(std::fs::File::create(path)?);
+    let n_rows = betas.nrows();
+    for i in 0..n_rows {
+        write!(f, "{}\t{}\t{}", bim[i].chrom, bim[i].pos, bim[i].snp_id)?;
+        for j in 0..d {
+            write!(f, "\t{:.6e}\t{:.6e}", betas[(i, j)], tstats[(i, j)])?;
+        }
+        writeln!(f)?;
+    }
+    Ok(())
+}
+
+/// Coalesce chunk TSV fragments into a single output file with calibrated p-values.
+///
+/// Reads each chunk file in sequence order, parses t-statistics, applies GIF
+/// calibration, and writes the final output with columns:
+/// `chr\tpos\tsnp_id\tp_cov1\tbeta_cov1\tt_cov1\t...`
+fn coalesce_output(
+    output_path: &Path,
+    cov_names: &[String],
+    chunk_dir: &Path,
+    n_chunks: usize,
+    gif_per_trait: &[f64],
+) -> Result<()> {
+    let d = cov_names.len();
+    let normal = Normal::new(0.0, 1.0).unwrap();
+    let gif_sqrt: Vec<f64> = gif_per_trait.iter().map(|g| g.sqrt()).collect();
+
+    let mut out = BufWriter::new(
+        std::fs::File::create(output_path)
+            .with_context(|| format!("Failed to create {}", output_path.display()))?,
+    );
+
+    // Header: chr, pos, snp_id, then per-covariate p/beta/t triples
+    write!(out, "chr\tpos\tsnp_id")?;
+    for name in cov_names {
+        write!(out, "\tp_{}\tbeta_{}\tt_{}", name, name, name)?;
+    }
+    writeln!(out)?;
+
+    // Concatenate chunk files in sequence order, inserting calibrated p-values
+    for seq in 0..n_chunks {
+        let chunk_path = chunk_dir.join(format!("chunk_{:06}.tsv", seq));
+        let f = std::fs::File::open(&chunk_path)
+            .with_context(|| format!("Failed to open chunk file: {}", chunk_path.display()))?;
+        let reader = BufReader::new(f);
+        for line in reader.lines() {
+            let line = line?;
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            // Chunk format: chr, pos, snp_id, beta_0, t_0, beta_1, t_1, ...
+            write!(out, "{}\t{}\t{}", fields[0], fields[1], fields[2])?;
+            for j in 0..d {
+                let beta_str = fields[3 + j * 2];
+                let t_str = fields[4 + j * 2];
+                let t: f64 = t_str.parse().unwrap_or(0.0);
+                let z_cal = t / gif_sqrt[j];
+                let p_cal = 2.0 * normal.cdf(-z_cal.abs());
+                write!(out, "\t{:.6e}\t{}\t{}", p_cal, beta_str, t_str)?;
+            }
+            writeln!(out)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Invert a square matrix, falling back to diagonal regularization if singular.

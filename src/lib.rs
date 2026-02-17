@@ -13,6 +13,7 @@ use bed::{BedFile, SubsetSpec};
 use precompute::precompute;
 use rsvd::estimate_factors_streaming;
 use testing::{test_associations_fused, TestResults};
+pub use testing::OutputConfig;
 
 /// Configuration for the LFMM2 algorithm.
 pub struct Lfmm2Config {
@@ -83,9 +84,10 @@ pub fn test_associations(
     x: &Array2<f64>,
     u_hat: &Array2<f64>,
     config: &Lfmm2Config,
+    output: Option<&OutputConfig>,
 ) -> Result<TestResults> {
     let pre = precompute(x, config.lambda)?;
-    test_associations_fused(y_full, x, u_hat, &pre, config)
+    test_associations_fused(y_full, x, u_hat, &pre, config, output)
 }
 
 /// Full LFMM2 pipeline: estimate latent factors + test associations.
@@ -100,6 +102,7 @@ pub fn fit_lfmm2(
     y_full: &BedFile,
     x: &Array2<f64>,
     config: &Lfmm2Config,
+    output: Option<&OutputConfig>,
 ) -> Result<TestResults> {
     if config.progress {
         eprintln!("Precomputing SVD of X...");
@@ -116,5 +119,5 @@ pub fn fit_lfmm2(
     if config.progress {
         eprintln!("Testing associations...");
     }
-    test_associations_fused(y_full, x, &u_hat, &pre, config)
+    test_associations_fused(y_full, x, &u_hat, &pre, config, output)
 }

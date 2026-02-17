@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use lfmm2::bed::{BedFile, SubsetSpec};
-use lfmm2::{fit_lfmm2, Lfmm2Config};
+use lfmm2::{fit_lfmm2, Lfmm2Config, OutputConfig};
 
 #[derive(Parser)]
 #[command(name = "lfmm2", about = "Latent Factor Mixed Model v2 — GWAS with latent confounders")]
@@ -156,40 +156,36 @@ fn main() -> Result<()> {
         config.oversampling, config.n_power_iter,
     );
 
-    let y_est = est_bed.as_ref().unwrap_or(&bed);
-    let results = fit_lfmm2(y_est, &est_subset, &bed, &x, &config)?;
-
-    eprintln!("GIF: {:.4}", results.gif);
-
-    // --- Write output ---
-    let results_path = format!("{}.tsv", cli.out);
+    // --- Run LFMM2 with streaming output ---
+    let results_path = PathBuf::from(format!("{}.tsv", cli.out));
     let summary_path = format!("{}.summary.txt", cli.out);
 
-    eprintln!("Writing results to {}...", results_path);
+    let output_config = OutputConfig {
+        path: &results_path,
+        bim: &bed.bim_records,
+        cov_names: &cov_names,
+    };
 
-    write_results(
-        &results_path,
-        &bed.bim_records,
-        &results.effect_sizes,
-        &results.t_stats,
-        &results.p_values,
-        &cov_names,
-    )?;
+    let y_est = est_bed.as_ref().unwrap_or(&bed);
+    let results = fit_lfmm2(y_est, &est_subset, &bed, &x, &config, Some(&output_config))?;
+
+    eprintln!("GIF: {:.4}", results.gif);
+    eprintln!("Results written to {}", results_path.display());
 
     {
         let mut f = std::fs::File::create(&summary_path)
             .with_context(|| format!("Failed to create {}", summary_path))?;
         writeln!(f, "GIF: {:.6}", results.gif)?;
-        writeln!(f, "n_samples: {}", results.u_hat.nrows())?;
-        writeln!(f, "n_snps: {}", results.p_values.nrows())?;
-        writeln!(f, "K: {}", results.u_hat.ncols())?;
-        writeln!(f, "d: {}", results.effect_sizes.ncols())?;
+        writeln!(f, "n_samples: {}", bed.n_samples)?;
+        writeln!(f, "n_snps: {}", bed.n_snps)?;
+        writeln!(f, "K: {}", cli.k)?;
+        writeln!(f, "d: {}", cov_names.len())?;
         writeln!(f, "covariates: {}", cov_names.join(", "))?;
         writeln!(f, "lambda: {}", cli.lambda)?;
         writeln!(f, "threads: {}", cli.threads)?;
     }
 
-    eprintln!("Done. Output: {}, {}", results_path, summary_path);
+    eprintln!("Done. Output: {}, {}", results_path.display(), summary_path);
 
     Ok(())
 }
@@ -355,45 +351,6 @@ fn load_covariates(
     );
 
     Ok((cov_names, x))
-}
-
-/// Write a single results TSV with SNP annotations and per-trait statistics.
-///
-/// Columns: chr, pos, snp_id, then for each trait: p_$TRAIT, beta_$TRAIT, t_$TRAIT
-fn write_results(
-    path: &str,
-    bim: &[lfmm2::bed::BimRecord],
-    effect_sizes: &Array2<f64>,
-    t_stats: &Array2<f64>,
-    p_values: &Array2<f64>,
-    cov_names: &[String],
-) -> Result<()> {
-    let mut f =
-        std::fs::File::create(path).with_context(|| format!("Failed to create {}", path))?;
-    let p = bim.len();
-    let d = cov_names.len();
-
-    // Header: chr, pos, snp_id, then p/beta/t triples per trait
-    let mut header = vec!["chr".to_string(), "pos".to_string(), "snp_id".to_string()];
-    for name in cov_names {
-        header.push(format!("p_{}", name));
-        header.push(format!("beta_{}", name));
-        header.push(format!("t_{}", name));
-    }
-    writeln!(f, "{}", header.join("\t"))?;
-
-    // Data rows
-    for i in 0..p {
-        let rec = &bim[i];
-        let mut vals = vec![rec.chrom.clone(), rec.pos.to_string(), rec.snp_id.clone()];
-        for j in 0..d {
-            vals.push(format!("{:.6e}", p_values[(i, j)]));
-            vals.push(format!("{:.6e}", effect_sizes[(i, j)]));
-            vals.push(format!("{:.6e}", t_stats[(i, j)]));
-        }
-        writeln!(f, "{}", vals.join("\t"))?;
-    }
-    Ok(())
 }
 
 /// Check if --verbose was passed. Used by helper functions that don't have

@@ -4,7 +4,7 @@ use lfmm2::simulate::{
     simulate, write_covariates, write_ground_truth, write_latent_u, write_lfmm_format,
     write_plink, write_r_comparison_script, SimConfig,
 };
-use lfmm2::{fit_lfmm2, Lfmm2Config};
+use lfmm2::{fit_lfmm2, Lfmm2Config, OutputConfig};
 use ndarray::Array2;
 use ndarray_linalg::SVD;
 use std::fs;
@@ -51,7 +51,7 @@ fn test_lfmm2_quick() {
     assert_eq!(bed.n_snps, 10_000);
 
     // Run LFMM2
-    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config).unwrap();
+    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
 
     // Validation checks
     validate_results(&results, &sim, &config);
@@ -109,7 +109,7 @@ fn test_lfmm2_large() {
 
     // Run LFMM2
     eprintln!("Running LFMM2...");
-    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config).unwrap();
+    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
 
     // Validation
     validate_results(&results, &sim, &config);
@@ -153,12 +153,12 @@ fn test_reproducibility() {
     let dir1 = tempfile::tempdir().unwrap();
     write_plink(dir1.path(), "sim", &sim).unwrap();
     let bed1 = BedFile::open(dir1.path().join("sim.bed")).unwrap();
-    let r1 = fit_lfmm2(&bed1, &SubsetSpec::All, &bed1, &sim.x, &config).unwrap();
+    let r1 = fit_lfmm2(&bed1, &SubsetSpec::All, &bed1, &sim.x, &config, None).unwrap();
 
     let dir2 = tempfile::tempdir().unwrap();
     write_plink(dir2.path(), "sim", &sim).unwrap();
     let bed2 = BedFile::open(dir2.path().join("sim.bed")).unwrap();
-    let r2 = fit_lfmm2(&bed2, &SubsetSpec::All, &bed2, &sim.x, &config).unwrap();
+    let r2 = fit_lfmm2(&bed2, &SubsetSpec::All, &bed2, &sim.x, &config, None).unwrap();
 
     // Bitwise identical
     assert_eq!(r1.p_values.shape(), r2.p_values.shape());
@@ -321,14 +321,14 @@ fn test_parallel_matches_sequential() {
         n_workers: 0,
         progress: false,
     };
-    let r_seq = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_seq).unwrap();
+    let r_seq = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_seq, None).unwrap();
 
     // Parallel run
     let config_par = Lfmm2Config {
         n_workers: 2,
         ..config_seq
     };
-    let r_par = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_par).unwrap();
+    let r_par = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_par, None).unwrap();
 
     // P-values should match within floating-point tolerance.
     // Pattern A (disjoint writes) are bitwise identical across thread counts.
@@ -514,7 +514,7 @@ fn test_subset_rate_end_to_end() {
     let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
 
     // Run with Rate(0.5) — estimate on half the SNPs, test on all
-    let r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config).unwrap();
+    let r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config, None).unwrap();
 
     // Output must cover ALL p SNPs, not just the estimation subset
     assert_eq!(r_rate.p_values.nrows(), sim_config.n_snps);
@@ -529,7 +529,7 @@ fn test_subset_rate_end_to_end() {
     );
 
     // P-values should differ from using All (different estimation subset → different U_hat)
-    let r_all = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config).unwrap();
+    let r_all = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
     let mut any_diff = false;
     for i in 0..sim_config.n_snps {
         if (r_rate.p_values[(i, 0)] - r_all.p_values[(i, 0)]).abs() > 1e-10 {
@@ -580,6 +580,7 @@ fn test_subset_indices_end_to_end() {
         &bed,
         &sim.x,
         &config,
+        None,
     )
     .unwrap();
 
@@ -587,7 +588,7 @@ fn test_subset_indices_end_to_end() {
     assert_eq!(r_indices.p_values.nrows(), sim_config.n_snps);
 
     // Since Rate(0.5) produces the same index set as step_by(2), results should match
-    let r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config).unwrap();
+    let r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config, None).unwrap();
 
     let mut max_diff = 0.0f64;
     for i in 0..sim_config.n_snps {
@@ -601,4 +602,94 @@ fn test_subset_indices_end_to_end() {
         "Indices(step_by(2)) should match Rate(0.5): max_diff={:.2e}",
         max_diff,
     );
+}
+
+/// Verify that OutputConfig writes a valid results TSV via chunk coalescing.
+#[test]
+fn test_output_config_writes_results() {
+    let sim_config = SimConfig {
+        n_samples: 100,
+        n_snps: 1_000,
+        n_causal: 5,
+        k: 2,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 88888,
+    };
+
+    let config = Lfmm2Config {
+        k: 2,
+        lambda: 1e-5,
+        chunk_size: 300,
+        oversampling: 5,
+        n_power_iter: 1,
+        seed: 42,
+        n_workers: 0,
+        progress: false,
+    };
+
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+    let cov_names = vec!["cov_0".to_string(), "cov_1".to_string()];
+    let output_path = dir.path().join("results.tsv");
+
+    let output_config = OutputConfig {
+        path: &output_path,
+        bim: &bed.bim_records,
+        cov_names: &cov_names,
+    };
+
+    let results = fit_lfmm2(
+        &bed, &SubsetSpec::All, &bed, &sim.x, &config, Some(&output_config),
+    ).unwrap();
+
+    // Verify file exists and has correct structure
+    let content = fs::read_to_string(&output_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Header + p data rows
+    assert_eq!(
+        lines.len(),
+        sim_config.n_snps + 1,
+        "Expected {} lines (1 header + {} data), got {}",
+        sim_config.n_snps + 1,
+        sim_config.n_snps,
+        lines.len(),
+    );
+
+    // Header structure: chr, pos, snp_id, then 3 columns per covariate
+    let header_fields: Vec<&str> = lines[0].split('\t').collect();
+    assert_eq!(header_fields.len(), 3 + 3 * sim_config.d);
+    assert_eq!(header_fields[0], "chr");
+    assert_eq!(header_fields[1], "pos");
+    assert_eq!(header_fields[2], "snp_id");
+    assert_eq!(header_fields[3], "p_cov_0");
+    assert_eq!(header_fields[4], "beta_cov_0");
+    assert_eq!(header_fields[5], "t_cov_0");
+
+    // Data row structure
+    let data_fields: Vec<&str> = lines[1].split('\t').collect();
+    assert_eq!(data_fields.len(), 3 + 3 * sim_config.d);
+
+    // All p-values in the file should be parseable and in [0, 1]
+    for line in &lines[1..] {
+        let fields: Vec<&str> = line.split('\t').collect();
+        for j in 0..sim_config.d {
+            let p_val: f64 = fields[3 + j * 3].parse().unwrap();
+            assert!(
+                (0.0..=1.0).contains(&p_val),
+                "p-value out of range: {}",
+                p_val,
+            );
+        }
+    }
+
+    // GIF should match the in-memory result
+    assert!(results.gif > 0.5 && results.gif < 3.0);
 }
