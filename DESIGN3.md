@@ -324,7 +324,40 @@ Note: if Y_est is an LD-pruned subset (e.g., 1% of SNPs), the first 6 passes rea
   └──────────────────────────────────────────┘
 ```
 
-Each pass is embarrassingly parallel over column-chunks via rayon.
+### Parallel streaming engine
+
+Each pass uses `parallel_stream()`: 1 decoder thread + N worker threads connected
+via bounded crossbeam channels with a pre-allocated buffer pool.
+
+```
+ Free buffer pool (N+1 pre-allocated SnpBlocks, each n_samples × chunk_size f64)
+        │
+ [Decoder thread]  ─fills→  [bounded channel]  ─→  [Worker 0]
+                   ←returns─ [bounded channel]  ←─  [Worker 1]
+                                                 ←─  [Worker N-1]
+```
+
+- The decoder reads from the memory-mapped .bed file and decodes 2-bit → f64 into
+  pre-allocated buffers. It is the sole producer.
+- Workers receive filled blocks, perform per-chunk BLAS (single-threaded BLAS per worker,
+  `openblas_set_num_threads(1)`), and return blocks to the free pool.
+- Bounded channels of size N+1 provide natural backpressure.
+- Each worker receives a unique `worker_id` (0..N) from the spawn loop.
+
+### Two write patterns
+
+**Pattern A — Disjoint row writes** (sketch, backward passes, testing):
+Each chunk maps to a unique row range in the output matrix (p_est × l or p × d).
+Workers write to non-overlapping rows via `DisjointRowWriter` — no synchronization.
+Achieves full CPU utilization across all workers.
+
+**Pattern B — Per-worker accumulation** (forward passes, projection):
+All workers accumulate partial n × l results into the same shape. Each worker has its
+own `Array2<f64>` accumulator (via `PerWorkerAccumulator`), indexed by `worker_id`.
+After all workers finish, the per-worker buffers are summed. No locks in the hot path.
+
+Memory overhead for Pattern B: `n_workers × n × l × 8` bytes extra (e.g. 8 workers ×
+10k × 20 × 8 = 12.8 MB — negligible).
 
 ---
 
@@ -354,12 +387,13 @@ Each pass is embarrassingly parallel over column-chunks via rayon.
 | Crate | Purpose |
 |-------|---------|
 | `ndarray` | Array types, chunk-level ops |
-| `ndarray-linalg` (MKL backend) | SVD, QR, inv on small dense matrices |
-| `rayon` | Parallel iteration over chunks |
+| `ndarray-linalg` (OpenBLAS backend) | SVD, inv on small dense matrices |
+| `crossbeam-channel` | Bounded MPMC channels for decoder→worker streaming |
 | `memmap2` | Memory-mapped access to .bed files on disk |
-| `rand` / `rand_distr` | Random sketch matrix Ω |
+| `rand` / `rand_chacha` / `rand_distr` | Reproducible random sketch matrix Ω (ChaCha8Rng) |
 | `statrs` | Student's t distribution for p-values |
-| `bed-reader` (optional) | PLINK .bed/.bim/.fam parsing (or implement custom 2-bit decoder) |
+| `clap` | CLI argument parsing |
+| `indicatif` | Progress bars for streaming passes |
 
 ---
 
@@ -451,20 +485,16 @@ fn decode_bed_chunk(
 - Optional: apply unit-variance scaling by `1/sqrt(2*p*(1-p))` where p = mean/2 (allele freq),
   as done in EIGENSTRAT-style analyses. The paper uses different scaling for GEA vs. EWAS.
 
-### File layout options
+### File layout
 
+**Single PLINK .bed file** (standard): SNP-major layout, memory-mapped via
+`memmap2`. Chunk offset = `3 + chunk_start * bytes_per_snp` (3-byte .bed magic
+header). One dedicated decoder thread reads sequentially from the mmap, which
+plays well with the OS readahead on any filesystem (local NVMe, RAID HDD, NFS).
 
-**Single PLINK .bed file** (standard): SNP-major layout, read with seek offsets
-per chunk. Chunk offset = `3 + chunk_start * bytes_per_snp` (3-byte .bed magic
-header). Simple mmap via `memmap2` works well. Ideally: have one thread solely
-responsible for IO, seeking to maximise streaming IO. Assume the underlying FS
-(which may be raid HDD array, NFS, etc, not just fast local nvme) has best
-performance in streaming mode.
-
-In addition to an alternative BED for estimation, support supplying a simple
-random scale factor to do simple thinning of data for estimation subset, or a
-list of SNPs to include by bed file (as in 3+ column chrom\tstart\tend BED, not
-plink BED, they are two completely different formats).
+Estimation subsets are supported via:
+- `--est-bed`: separate LD-pruned .bed file
+- `--est-rate`: thin at a given rate (e.g. 0.01 for 1% of SNPs)
 
 ---
 
@@ -497,60 +527,6 @@ At 3 GB/s NVMe: ~15 minutes
 
 ---
 
-## API Sketch
-
-```rust
-pub struct Lfmm2Config {
-    pub k: usize,              // latent factors (K)
-    pub lambda: f64,           // ridge penalty (λ)
-    pub chunk_size: usize,     // SNPs per chunk (default: 100_000)
-    pub oversampling: usize,   // randomized SVD oversampling (default: 10)
-    pub n_power_iter: usize,   // power iterations q (default: 2)
-}
-
-/// On-disk genotype source (PLINK .bed + .bim + .fam triplet).
-pub struct BedFile {
-    pub bed_path: PathBuf,     // .bed file (2-bit packed, SNP-major)
-    pub n_samples: usize,      // from .fam
-    pub n_snps: usize,         // from .bim
-    pub subset_rate: Option<f64>,  // subset this proportion of SNPs
-    pub snp_subset: Option<PathBuf>,  // subset specifically these SNPs (must have two columns, chrom and pos, can have more)
-}
-
-pub struct Lfmm2Result {
-    pub u_hat: Array2<f64>,         // n × K latent factors, in RAM
-    pub b_path: PathBuf,            // p × d effect sizes, on disk
-    pub scores_path: PathBuf,       // p × d t-statistics, on disk
-    pub pvalues_path: PathBuf,      // p × d p-values (calibrated), on disk
-    pub gif: f64,                   // genomic inflation factor
-}
-
-/// Estimate latent factors from (possibly LD-pruned) Y_est.
-pub fn estimate_factors(
-    y_est: &BedFile,
-    x: &Array2<f64>,
-    config: &Lfmm2Config,
-) -> Result<Array2<f64>>;   // returns U_hat (n × K)
-
-/// Run association tests on all SNPs using pre-estimated U_hat.
-/// Computes B and per-locus t-tests in a single fused pass.
-pub fn test_associations(
-    y_full: &BedFile,
-    x: &Array2<f64>,
-    u_hat: &Array2<f64>,
-    config: &Lfmm2Config,
-) -> Result<Lfmm2Result>;
-
-/// Full pipeline: estimate + test.
-pub fn fit_lfmm2(
-    y_est: &BedFile,           // LD-pruned subset for factor estimation
-    y_full: &BedFile,          // all SNPs for testing
-    x: &Array2<f64>,
-    config: &Lfmm2Config,
-) -> Result<Lfmm2Result>;
-```
-
----
 
 ## Cross-reference to Paper
 

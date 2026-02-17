@@ -66,12 +66,12 @@ impl Default for Lfmm2Config {
 /// 3. Recover U_hat = Q @ D_λ_inv @ U_small[:, :K]
 pub fn estimate_factors(
     y_est: &BedFile,
+    subset: &SubsetSpec,
     x: &Array2<f64>,
     config: &Lfmm2Config,
 ) -> Result<Array2<f64>> {
     let pre = precompute(x, config.lambda)?;
-    let subset = SubsetSpec::All;
-    estimate_factors_streaming(y_est, &subset, &pre, config)
+    estimate_factors_streaming(y_est, subset, &pre, config)
 }
 
 /// Run association tests on all SNPs using pre-estimated U_hat.
@@ -90,11 +90,13 @@ pub fn test_associations(
 
 /// Full LFMM2 pipeline: estimate latent factors + test associations.
 ///
-/// - y_est: LD-pruned subset for factor estimation (Steps 0-2)
+/// - y_est: BedFile for factor estimation (may be LD-pruned or the same as y_full)
+/// - est_subset: which SNPs from y_est to use (All, Rate, or Indices)
 /// - y_full: All SNPs for testing (Steps 3-4)
 /// - x: Covariate matrix (n × d)
 pub fn fit_lfmm2(
     y_est: &BedFile,
+    est_subset: &SubsetSpec,
     y_full: &BedFile,
     x: &Array2<f64>,
     config: &Lfmm2Config,
@@ -103,11 +105,14 @@ pub fn fit_lfmm2(
         eprintln!("Precomputing SVD of X...");
     }
     let pre = precompute(x, config.lambda)?;
-    let subset = SubsetSpec::All;
     if config.progress {
-        eprintln!("Estimating latent factors (RSVD, {} power iterations)...", config.n_power_iter);
+        let p_est = y_est.subset_snp_count(est_subset);
+        eprintln!(
+            "Estimating latent factors (RSVD, {} power iterations, {} estimation SNPs)...",
+            config.n_power_iter, p_est,
+        );
     }
-    let u_hat = estimate_factors_streaming(y_est, &subset, &pre, config)?;
+    let u_hat = estimate_factors_streaming(y_est, est_subset, &pre, config)?;
     if config.progress {
         eprintln!("Testing associations...");
     }

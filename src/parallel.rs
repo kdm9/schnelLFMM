@@ -1,4 +1,5 @@
 use ndarray::Array2;
+use std::cell::UnsafeCell;
 
 use crate::bed::{decode_bed_chunk_into, BedFile, SubsetSpec};
 
@@ -80,6 +81,51 @@ impl DisjointRowWriter {
     }
 }
 
+/// Lock-free per-worker accumulator for forward passes that sum partial results.
+///
+/// Each worker thread writes exclusively to its own buffer (indexed by worker_id).
+/// After all workers finish, call `.sum()` to merge all buffers.
+///
+/// Safety invariant: each worker_id must be used by exactly one thread at a time.
+/// This is guaranteed by `parallel_stream`, which assigns unique indices to workers.
+pub struct PerWorkerAccumulator {
+    buffers: Vec<UnsafeCell<Array2<f64>>>,
+}
+
+unsafe impl Sync for PerWorkerAccumulator {}
+
+impl PerWorkerAccumulator {
+    /// Create `n_workers` zero-initialized accumulators of the given shape.
+    pub fn new(n_workers: usize, shape: (usize, usize)) -> Self {
+        let buffers = (0..n_workers)
+            .map(|_| UnsafeCell::new(Array2::<f64>::zeros(shape)))
+            .collect();
+        PerWorkerAccumulator { buffers }
+    }
+
+    /// Get a mutable reference to the buffer for `worker_id`.
+    ///
+    /// # Safety
+    /// Caller must ensure no two threads access the same `worker_id` concurrently.
+    pub unsafe fn get_mut(&self, worker_id: usize) -> &mut Array2<f64> {
+        &mut *self.buffers[worker_id].get()
+    }
+
+    /// Consume the accumulator and return the element-wise sum of all buffers.
+    pub fn sum(self) -> Array2<f64> {
+        let mut buffers: Vec<Array2<f64>> = self
+            .buffers
+            .into_iter()
+            .map(|cell| cell.into_inner())
+            .collect();
+        let mut total = buffers.pop().expect("PerWorkerAccumulator must have >= 1 buffer");
+        for buf in buffers {
+            total += &buf;
+        }
+        total
+    }
+}
+
 /// Expand a `SubsetSpec` into a `Vec<usize>` of SNP indices.
 pub fn subset_indices(subset: &SubsetSpec, n_snps: usize) -> Vec<usize> {
     match subset {
@@ -107,7 +153,7 @@ pub fn parallel_stream<F>(
     n_workers: usize,
     process_fn: F,
 ) where
-    F: Fn(&SnpBlock) + Send + Sync,
+    F: Fn(usize, &SnpBlock) + Send + Sync,
 {
     let n_workers = n_workers.max(1);
     let indices = subset_indices(subset, bed.n_snps);
@@ -154,13 +200,13 @@ pub fn parallel_stream<F>(
         });
 
         // Worker threads: receive filled blocks, process, return to free pool
-        for _ in 0..n_workers {
+        for worker_id in 0..n_workers {
             let filled_rx = filled_rx.clone();
             let free_tx = free_tx.clone();
             let process_fn = &process_fn;
             s.spawn(move || {
                 while let Ok(block) = filled_rx.recv() {
-                    process_fn(&block);
+                    process_fn(worker_id, &block);
                     // Return block to free pool (ignore error if decoder is done)
                     let _ = free_tx.send(block);
                 }

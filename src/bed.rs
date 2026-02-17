@@ -160,7 +160,18 @@ pub fn decode_bed_chunk_into(
     }
 }
 
-/// Decode a single SNP column, impute missing to mean, and center.
+/// Decode a single SNP column, impute missing to mean, center, and standardize.
+///
+/// After decoding 2-bit genotypes to {0, 1, 2}, this function:
+/// 1. Computes the per-SNP mean (excluding missing values)
+/// 2. Imputes missing values to the mean (centered = 0)
+/// 3. Centers all values by subtracting the mean
+/// 4. Applies Eigenstrat-style variance standardization: divides by sqrt(2p(1-p))
+///    where p = mean/2 is the allele frequency. This gives each SNP unit variance
+///    under Hardy-Weinberg equilibrium, preventing high-frequency SNPs from
+///    dominating the PCA/SVD.
+///
+/// Monomorphic SNPs (p=0 or p=1) have zero variance and are left as all zeros.
 pub(crate) fn decode_single_snp(
     snp_bytes: &[u8],
     n_samples: usize,
@@ -187,12 +198,18 @@ pub(crate) fn decode_single_snp(
         0.0
     };
 
-    // Pass 2: impute missing -> mean, then center all values
+    // Eigenstrat scaling factor: 1 / sqrt(2p(1-p)) where p = mean/2
+    let p = mean / 2.0;
+    let denom = (2.0 * p * (1.0 - p)).sqrt();
+    // For monomorphic SNPs (p=0 or p=1), denom=0; leave as all zeros.
+    let scale = if denom > 1e-10 { 1.0 / denom } else { 0.0 };
+
+    // Pass 2: impute missing -> mean, center, and standardize
     for sample in 0..n_samples {
         if col[sample].is_nan() {
-            col[sample] = 0.0; // missing -> mean, centered = 0
+            col[sample] = 0.0; // missing -> mean, centered = 0, scaled = 0
         } else {
-            col[sample] -= mean;
+            col[sample] = (col[sample] - mean) * scale;
         }
     }
 }
@@ -341,12 +358,14 @@ mod tests {
         let packed = &data[3..];
         let decoded = decode_bed_chunk(packed, n, p);
 
-        // Verify decoded values are centered versions of original
+        // Verify decoded values are centered and Eigenstrat-scaled
         for snp in 0..p {
             let col: Vec<f64> = (0..n).map(|i| genotypes[(i, snp)] as f64).collect();
             let mean: f64 = col.iter().sum::<f64>() / n as f64;
+            let af = mean / 2.0;
+            let scale = 1.0 / (2.0 * af * (1.0 - af)).sqrt();
             for sample in 0..n {
-                let expected = col[sample] - mean;
+                let expected = (col[sample] - mean) * scale;
                 assert!(
                     (decoded[(sample, snp)] - expected).abs() < 1e-10,
                     "Mismatch at ({}, {}): got {}, expected {}",
@@ -370,10 +389,12 @@ mod tests {
         let decoded = decode_bed_chunk(&packed, n, 1);
 
         // Mean of non-missing = (0 + 1 + 2) / 3 = 1.0
-        // After centering: 0-1=-1, missing->0, 1-1=0, 2-1=1
-        assert!((decoded[(0, 0)] - (-1.0)).abs() < 1e-10);
+        // Allele freq p = 0.5, 2p(1-p) = 0.5, scale = 1/sqrt(0.5) = sqrt(2)
+        // Centered: [-1, 0, 0, 1], scaled: [-sqrt(2), 0, 0, sqrt(2)]
+        let s = std::f64::consts::SQRT_2;
+        assert!((decoded[(0, 0)] - (-s)).abs() < 1e-10);
         assert!((decoded[(1, 0)] - 0.0).abs() < 1e-10); // imputed to mean, centered = 0
         assert!((decoded[(2, 0)] - 0.0).abs() < 1e-10);
-        assert!((decoded[(3, 0)] - 1.0).abs() < 1e-10);
+        assert!((decoded[(3, 0)] - s).abs() < 1e-10);
     }
 }

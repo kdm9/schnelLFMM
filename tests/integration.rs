@@ -1,4 +1,5 @@
-use lfmm2::bed::BedFile;
+use lfmm2::bed::{BedFile, SubsetSpec};
+use lfmm2::parallel::subset_indices;
 use lfmm2::simulate::{
     simulate, write_covariates, write_ground_truth, write_latent_u, write_lfmm_format,
     write_plink, write_r_comparison_script, SimConfig,
@@ -50,7 +51,7 @@ fn test_lfmm2_quick() {
     assert_eq!(bed.n_snps, 10_000);
 
     // Run LFMM2
-    let results = fit_lfmm2(&bed, &bed, &sim.x, &config).unwrap();
+    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config).unwrap();
 
     // Validation checks
     validate_results(&results, &sim, &config);
@@ -108,7 +109,7 @@ fn test_lfmm2_large() {
 
     // Run LFMM2
     eprintln!("Running LFMM2...");
-    let results = fit_lfmm2(&bed, &bed, &sim.x, &config).unwrap();
+    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config).unwrap();
 
     // Validation
     validate_results(&results, &sim, &config);
@@ -152,12 +153,12 @@ fn test_reproducibility() {
     let dir1 = tempfile::tempdir().unwrap();
     write_plink(dir1.path(), "sim", &sim).unwrap();
     let bed1 = BedFile::open(dir1.path().join("sim.bed")).unwrap();
-    let r1 = fit_lfmm2(&bed1, &bed1, &sim.x, &config).unwrap();
+    let r1 = fit_lfmm2(&bed1, &SubsetSpec::All, &bed1, &sim.x, &config).unwrap();
 
     let dir2 = tempfile::tempdir().unwrap();
     write_plink(dir2.path(), "sim", &sim).unwrap();
     let bed2 = BedFile::open(dir2.path().join("sim.bed")).unwrap();
-    let r2 = fit_lfmm2(&bed2, &bed2, &sim.x, &config).unwrap();
+    let r2 = fit_lfmm2(&bed2, &SubsetSpec::All, &bed2, &sim.x, &config).unwrap();
 
     // Bitwise identical
     assert_eq!(r1.p_values.shape(), r2.p_values.shape());
@@ -320,19 +321,21 @@ fn test_parallel_matches_sequential() {
         n_workers: 0,
         progress: false,
     };
-    let r_seq = fit_lfmm2(&bed, &bed, &sim.x, &config_seq).unwrap();
+    let r_seq = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_seq).unwrap();
 
     // Parallel run
     let config_par = Lfmm2Config {
         n_workers: 2,
         ..config_seq
     };
-    let r_par = fit_lfmm2(&bed, &bed, &sim.x, &config_par).unwrap();
+    let r_par = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_par).unwrap();
 
     // P-values should match within floating-point tolerance.
-    // Pattern A loops are bitwise identical; Pattern B may differ at ~1e-14
-    // due to FP summation order via Mutex.
-    let tol = 1e-10;
+    // Pattern A (disjoint writes) are bitwise identical across thread counts.
+    // Pattern B (per-worker accumulators summed at the end) may differ at ~1e-9
+    // due to FP summation order: workers accumulate locally then merge, vs
+    // sequential accumulation with n_workers=1.
+    let tol = 1e-6;
     let p = r_seq.p_values.nrows();
     let d = r_seq.p_values.ncols();
     let mut max_diff = 0.0f64;
@@ -351,10 +354,11 @@ fn test_parallel_matches_sequential() {
     );
 
     // GIF should also be very close
+    let gif_tol = 1e-6;
     let gif_diff = (r_seq.gif - r_par.gif).abs();
     eprintln!("GIF diff: {:.2e}", gif_diff);
     assert!(
-        gif_diff < tol,
+        gif_diff < gif_tol,
         "GIF diverges: seq={:.6} par={:.6} diff={:.2e}",
         r_seq.gif,
         r_par.gif,
@@ -404,4 +408,197 @@ fn write_rust_results(dir: &Path, results: &lfmm2::testing::TestResults) {
     writeln!(f, "n_snps: {}", results.p_values.nrows()).unwrap();
     writeln!(f, "K: {}", results.u_hat.ncols()).unwrap();
     writeln!(f, "d: {}", results.effect_sizes.ncols()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// SubsetSpec tests
+// ---------------------------------------------------------------------------
+
+/// Unit-level: verify subset_indices produces the correct index vectors.
+#[test]
+fn test_subset_indices() {
+    // All
+    assert_eq!(subset_indices(&SubsetSpec::All, 10), vec![0,1,2,3,4,5,6,7,8,9]);
+
+    // Rate 0.5 → step=2 → every other SNP
+    let idx = subset_indices(&SubsetSpec::Rate(0.5), 10);
+    assert_eq!(idx, vec![0, 2, 4, 6, 8]);
+
+    // Rate 0.25 → step=4
+    let idx = subset_indices(&SubsetSpec::Rate(0.25), 10);
+    assert_eq!(idx, vec![0, 4, 8]);
+
+    // Rate 1.0 → step=1 → all
+    let idx = subset_indices(&SubsetSpec::Rate(1.0), 10);
+    assert_eq!(idx, vec![0,1,2,3,4,5,6,7,8,9]);
+
+    // Rate 0.1 → step=10
+    let idx = subset_indices(&SubsetSpec::Rate(0.1), 25);
+    assert_eq!(idx, vec![0, 10, 20]);
+
+    // Indices
+    let idx = subset_indices(&SubsetSpec::Indices(vec![3, 7, 11]), 100);
+    assert_eq!(idx, vec![3, 7, 11]);
+}
+
+/// Verify subset_snp_count agrees with the actual length of subset_indices.
+#[test]
+fn test_subset_snp_count_consistency() {
+    let sim_config = SimConfig {
+        n_samples: 50,
+        n_snps: 1_000,
+        n_causal: 5,
+        k: 2,
+        d: 1,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 111,
+    };
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+    for rate in &[1.0, 0.5, 0.25, 0.1, 0.01] {
+        let spec = SubsetSpec::Rate(*rate);
+        let count = bed.subset_snp_count(&spec);
+        let indices = subset_indices(&spec, bed.n_snps);
+        assert_eq!(
+            count,
+            indices.len(),
+            "subset_snp_count disagrees with subset_indices for rate={}",
+            rate
+        );
+    }
+
+    let spec = SubsetSpec::All;
+    assert_eq!(bed.subset_snp_count(&spec), bed.n_snps);
+
+    let spec = SubsetSpec::Indices(vec![0, 100, 500, 999]);
+    assert_eq!(bed.subset_snp_count(&spec), 4);
+}
+
+/// End-to-end: SubsetSpec::Rate produces valid results, and output p-values
+/// cover all p SNPs (not just the estimation subset).
+#[test]
+fn test_subset_rate_end_to_end() {
+    let sim_config = SimConfig {
+        n_samples: 200,
+        n_snps: 10_000,
+        n_causal: 20,
+        k: 3,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 55555,
+    };
+
+    let config = Lfmm2Config {
+        k: 3,
+        lambda: 1e-5,
+        chunk_size: 2_000,
+        oversampling: 10,
+        n_power_iter: 2,
+        seed: 42,
+        n_workers: 0,
+        progress: false,
+    };
+
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+    // Run with Rate(0.5) — estimate on half the SNPs, test on all
+    let r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config).unwrap();
+
+    // Output must cover ALL p SNPs, not just the estimation subset
+    assert_eq!(r_rate.p_values.nrows(), sim_config.n_snps);
+    assert_eq!(r_rate.effect_sizes.nrows(), sim_config.n_snps);
+    assert_eq!(r_rate.t_stats.nrows(), sim_config.n_snps);
+
+    // GIF should be reasonable
+    assert!(
+        r_rate.gif > 0.5 && r_rate.gif < 3.0,
+        "GIF out of range with Rate(0.5): {:.4}",
+        r_rate.gif
+    );
+
+    // P-values should differ from using All (different estimation subset → different U_hat)
+    let r_all = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config).unwrap();
+    let mut any_diff = false;
+    for i in 0..sim_config.n_snps {
+        if (r_rate.p_values[(i, 0)] - r_all.p_values[(i, 0)]).abs() > 1e-10 {
+            any_diff = true;
+            break;
+        }
+    }
+    assert!(any_diff, "Rate(0.5) should produce different p-values than All");
+}
+
+/// End-to-end: SubsetSpec::Indices uses exactly the specified SNPs for estimation.
+#[test]
+fn test_subset_indices_end_to_end() {
+    let sim_config = SimConfig {
+        n_samples: 200,
+        n_snps: 10_000,
+        n_causal: 20,
+        k: 3,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 66666,
+    };
+
+    let config = Lfmm2Config {
+        k: 3,
+        lambda: 1e-5,
+        chunk_size: 2_000,
+        oversampling: 10,
+        n_power_iter: 2,
+        seed: 42,
+        n_workers: 0,
+        progress: false,
+    };
+
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+    // Pick every 2nd SNP — same as Rate(0.5)
+    let indices: Vec<usize> = (0..sim_config.n_snps).step_by(2).collect();
+    let r_indices = fit_lfmm2(
+        &bed,
+        &SubsetSpec::Indices(indices.clone()),
+        &bed,
+        &sim.x,
+        &config,
+    )
+    .unwrap();
+
+    // Output must cover ALL p SNPs
+    assert_eq!(r_indices.p_values.nrows(), sim_config.n_snps);
+
+    // Since Rate(0.5) produces the same index set as step_by(2), results should match
+    let r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config).unwrap();
+
+    let mut max_diff = 0.0f64;
+    for i in 0..sim_config.n_snps {
+        for j in 0..sim_config.d {
+            let diff = (r_indices.p_values[(i, j)] - r_rate.p_values[(i, j)]).abs();
+            max_diff = max_diff.max(diff);
+        }
+    }
+    assert!(
+        max_diff < 1e-12,
+        "Indices(step_by(2)) should match Rate(0.5): max_diff={:.2e}",
+        max_diff,
+    );
 }

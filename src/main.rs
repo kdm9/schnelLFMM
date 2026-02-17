@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use lfmm2::bed::BedFile;
+use lfmm2::bed::{BedFile, SubsetSpec};
 use lfmm2::{fit_lfmm2, Lfmm2Config};
 
 #[derive(Parser)]
@@ -105,7 +105,11 @@ fn main() -> Result<()> {
         cov_names.join(", ")
     );
 
-    // --- Open estimation BED if provided ---
+    // --- Estimation subset ---
+    if cli.est_bed.is_some() && cli.est_rate.is_some() {
+        anyhow::bail!("Cannot specify both --est-bed and --est-rate");
+    }
+
     let est_bed = if let Some(ref est_path) = cli.est_bed {
         eprintln!("Loading estimation BED file: {}", est_path.display());
         let eb = BedFile::open(est_path)?;
@@ -123,6 +127,16 @@ fn main() -> Result<()> {
         Some(eb)
     } else {
         None
+    };
+
+    let est_subset = if let Some(rate) = cli.est_rate {
+        if !(0.0..=1.0).contains(&rate) {
+            anyhow::bail!("--est-rate must be in (0.0, 1.0], got {}", rate);
+        }
+        eprintln!("  Estimation subset: thinning at rate {}", rate);
+        SubsetSpec::Rate(rate)
+    } else {
+        SubsetSpec::All
     };
 
     let config = Lfmm2Config {
@@ -143,7 +157,7 @@ fn main() -> Result<()> {
     );
 
     let y_est = est_bed.as_ref().unwrap_or(&bed);
-    let results = fit_lfmm2(y_est, &bed, &x, &config)?;
+    let results = fit_lfmm2(y_est, &est_subset, &bed, &x, &config)?;
 
     eprintln!("GIF: {:.4}", results.gif);
 

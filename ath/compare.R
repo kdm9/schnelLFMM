@@ -7,10 +7,19 @@ LFMM_K = 5
 lea_lfmm_file = sprintf("lea_lfmm2_k%d.tsv", LFMM_K)
 if (!file.exists(lea_lfmm_file)) {
     message("Running LEA lfmm2 (K=", LFMM_K, ")...")
-    message("  ped2lfmm")
-    lfmm_file = ped2lfmm("1k1g_intersect.ped")
+    lfmm_file = "1k1g_intersect.lfmm"
+    if (!file.exists(lfmm_file)) {
+        message("  ped2lfmm")
+        lfmm_file = ped2lfmm("1k1g_intersect.ped")
+    }
     message("  read.lfmm")
     Y = read.lfmm(lfmm_file)
+    for (i in seq_len(ncol(Y))) {
+        y = Y[,i]
+        y[is.na(y)] = mean(y, na.rm=T)
+        Y[,i] = y
+    }
+
     pheno = read.delim("pheno.tsv")
     X = pheno$FT10
 

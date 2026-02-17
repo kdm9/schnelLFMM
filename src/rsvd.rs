@@ -4,10 +4,9 @@ use ndarray_linalg::SVD;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Normal};
-use std::sync::Mutex;
 
 use crate::bed::{BedFile, SubsetSpec};
-use crate::parallel::{parallel_stream, DisjointRowWriter};
+use crate::parallel::{parallel_stream, DisjointRowWriter, PerWorkerAccumulator};
 use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
@@ -49,7 +48,7 @@ pub fn estimate_factors_streaming(
     {
         let pb = make_progress_bar(n_chunks, "RSVD sketch", show);
         let writer = DisjointRowWriter::new(&mut z);
-        parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
+        parallel_stream(y_est, subset, chunk_size, config.n_workers, |_worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let z_block = chunk.t().dot(&mt_omega);
             unsafe {
@@ -66,23 +65,23 @@ pub fn estimate_factors_streaming(
     // Step 1b: Power iterations
     for iter in 0..config.n_power_iter {
         // Forward pass: A @ Q_z = M @ Y_est @ Q_z (n × l, accumulated)
-        let mut a_qz = Array2::<f64>::zeros((n, l));
+        let a_qz;
         {
             let label = format!("Power iter {}/{} (fwd)", iter + 1, config.n_power_iter);
             let pb = make_progress_bar(n_chunks, &label, show);
-            let acc = Mutex::new(a_qz);
-            parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
+            let n_w = config.n_workers.max(1);
+            let acc = PerWorkerAccumulator::new(n_w, (n, l));
+            parallel_stream(y_est, subset, chunk_size, config.n_workers, |worker_id, block| {
                 let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
                 let offset = block.seq * chunk_size;
                 let q_z_block =
                     q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
                 let y_qz = chunk.dot(&q_z_block);
                 let partial = pre.m.dot(&y_qz);
-                let mut guard = acc.lock().unwrap();
-                *guard += &partial;
+                unsafe { *acc.get_mut(worker_id) += &partial; }
                 pb.inc(1);
             });
-            a_qz = acc.into_inner().unwrap();
+            a_qz = acc.sum();
             pb.finish_and_clear();
         }
 
@@ -96,7 +95,7 @@ pub fn estimate_factors_streaming(
             let label = format!("Power iter {}/{} (bwd)", iter + 1, config.n_power_iter);
             let pb = make_progress_bar(n_chunks, &label, show);
             let writer = DisjointRowWriter::new(&mut z);
-            parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
+            parallel_stream(y_est, subset, chunk_size, config.n_workers, |_worker_id, block| {
                 let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
                 let z_block = chunk.t().dot(&mt_q);
                 unsafe {
@@ -112,22 +111,22 @@ pub fn estimate_factors_streaming(
 
     // Step 2: Project and recover SVD
     // B_svd = A @ Q_z = M @ Y_est @ Q_z (n × l)
-    let mut b_svd = Array2::<f64>::zeros((n, l));
+    let b_svd;
     {
         let pb = make_progress_bar(n_chunks, "RSVD project", show);
-        let acc = Mutex::new(b_svd);
-        parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
+        let n_w = config.n_workers.max(1);
+        let acc = PerWorkerAccumulator::new(n_w, (n, l));
+        parallel_stream(y_est, subset, chunk_size, config.n_workers, |worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let offset = block.seq * chunk_size;
             let q_z_block =
                 q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
             let y_qz = chunk.dot(&q_z_block);
             let partial = pre.m.dot(&y_qz);
-            let mut guard = acc.lock().unwrap();
-            *guard += &partial;
+            unsafe { *acc.get_mut(worker_id) += &partial; }
             pb.inc(1);
         });
-        b_svd = acc.into_inner().unwrap();
+        b_svd = acc.sum();
         pb.finish_and_clear();
     }
 

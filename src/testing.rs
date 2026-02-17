@@ -111,7 +111,7 @@ pub fn test_associations_fused(
         let wr_effects = DisjointRowWriter::new(&mut effect_sizes);
         let wr_tstats = DisjointRowWriter::new(&mut t_stats);
         let wr_pvals = DisjointRowWriter::new(&mut raw_p_values);
-        parallel_stream(y_full, &subset, chunk_size, config.n_workers, |block| {
+        parallel_stream(y_full, &subset, chunk_size, config.n_workers, |_worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let chunk_cols = block.n_cols;
             let start = block.seq * chunk_size;

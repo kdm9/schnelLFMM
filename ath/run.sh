@@ -21,5 +21,6 @@ wc -l intersection.fam
 plink1.9 --bfile 1k1g --out 1k1g_intersect --keep intersection.fam --make-bed
 plink1.9 --recode ped --out 1k1g_intersect --bfile 1k1g_intersect
 
+cargo build --release --bin lfmm2
 ../target/release/lfmm2 --bed 1k1g_intersect.bed --cov pheno.tsv -k 5 --out ath_ft10_rs_k5 -t 12
 ../target/release/lfmm2 --bed 1k1g_intersect.bed --cov pheno.tsv -k 20 --out ath_ft10_rs_k20 -t 12
