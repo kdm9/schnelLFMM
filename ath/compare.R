@@ -1,5 +1,6 @@
 library(tidyverse)
 library(rhdf5)
+LFMM_K = 5
 
 h5f = H5Fopen("261.hdf5")
 
@@ -7,7 +8,7 @@ aragwas = dplyr::bind_rows(h5f$pvalues, .id = "chrom") |>
     mutate(across(beta:variance_explained, as.numeric)) |> 
     glimpse()
 
-lfmmooc = read_tsv("ath_ft10_rs_k5.tsv") |>
+lfmmooc = read_tsv(sprintf("ath_ft10_rs_k%d.tsv", LFMM_K)) |>
     mutate(chrom=sprintf("chr%d", chr)) |>
     glimpse()
 
