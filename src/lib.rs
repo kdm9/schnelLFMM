@@ -27,7 +27,14 @@ pub struct Lfmm2Config {
     pub n_power_iter: usize,
     /// RNG seed for reproducibility
     pub seed: u64,
-    /// Number of worker threads for parallel chunk processing (0 = sequential)
+    /// Number of worker threads for parallel chunk processing.
+    ///
+    /// - 0 = sequential (BLAS uses all cores for each matmul)
+    /// - T > 0 = T workers with single-threaded BLAS each (set OPENBLAS_NUM_THREADS=1)
+    ///
+    /// The CLI sets BLAS thread vars automatically. Library callers should set
+    /// OPENBLAS_NUM_THREADS=1 (and MKL_NUM_THREADS=1) before any BLAS call
+    /// when using n_workers > 0.
     pub n_workers: usize,
 }
 

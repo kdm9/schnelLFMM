@@ -27,6 +27,15 @@ pub struct Precomputed {
 /// 3. M = D_λ @ Q^T
 /// 4. ridge_inv = (X^T X + λI)^{-1}
 pub fn precompute(x: &Array2<f64>, lambda: f64) -> Result<Precomputed> {
+    if lambda <= 0.0 {
+        anyhow::bail!(
+            "Ridge penalty λ must be positive, got {}. \
+             λ=0 makes the D_λ diagonal singular (d_λ[j] = 0/(0+σ²) = 0, d_λ_inv = ∞). \
+             Use a small positive value like 1e-10.",
+            lambda,
+        );
+    }
+
     let n = x.nrows();
     let d = x.ncols();
 

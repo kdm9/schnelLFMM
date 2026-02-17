@@ -70,10 +70,29 @@ fn default_threads() -> usize {
 }
 
 fn main() -> Result<()> {
-    // Prevent BLAS from spawning its own threads (contention with our workers)
-    std::env::set_var("OPENBLAS_NUM_THREADS", "1");
-
     let cli = Cli::parse();
+
+    // Configure BLAS threading to complement our own worker pool.
+    //
+    // OpenBLAS (pthreads backend) uses a single global thread pool of size
+    // OPENBLAS_NUM_THREADS. When multiple OS threads call BLAS concurrently,
+    // they contend for this shared pool: one caller gets the full pool while
+    // others fall back to single-threaded execution.
+    //
+    // Parallel mode (--threads T > 0):
+    //   Force BLAS single-threaded. Each of our T workers runs its own
+    //   single-threaded BLAS call concurrently → T cores utilized, zero
+    //   contention. Setting B>1 would only let one lucky worker use B threads
+    //   while T-1 others serialize, wasting cores.
+    //
+    // Sequential mode (--threads 0):
+    //   No worker pool, so let BLAS use all available cores for each matmul.
+    //   This gives full BLAS parallelism on the large n×n multiplications
+    //   (M @ chunk, (I-P_U) @ chunk) which dominate compute time.
+    if cli.threads > 0 {
+        std::env::set_var("OPENBLAS_NUM_THREADS", "1");
+        std::env::set_var("MKL_NUM_THREADS", "1");
+    }
 
     if cli.verbose {
         eprintln!("Loading covariates from {}...", cli.cov.display());
@@ -201,9 +220,19 @@ fn load_covariates(path: &Path) -> Result<Array2<f64>> {
         let vals: Vec<f64> = line
             .split('\t')
             .map(|s| {
-                s.trim()
+                let v = s
+                    .trim()
                     .parse::<f64>()
-                    .with_context(|| format!("Failed to parse value '{}' on line {}", s.trim(), i + 2))
+                    .with_context(|| format!("Failed to parse value '{}' on line {}", s.trim(), i + 2))?;
+                if !v.is_finite() {
+                    anyhow::bail!(
+                        "Non-finite covariate value ({}) on line {}: \
+                         NaN/Inf in covariates will propagate through all matrix operations",
+                        v,
+                        i + 2,
+                    );
+                }
+                Ok(v)
             })
             .collect::<Result<Vec<_>>>()?;
         if !rows.is_empty() && vals.len() != rows[0].len() {
