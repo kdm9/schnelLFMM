@@ -172,18 +172,21 @@ pub fn write_plink(dir: &Path, prefix: &str, sim: &SimData) -> Result<()> {
 }
 
 /// Write covariate matrix as tab-separated file with header.
+///
+/// Format matches what `load_covariates` expects:
+/// first column = sample ID (IND0, IND1, ...), first row = header.
 pub fn write_covariates(path: &Path, x: &Array2<f64>) -> Result<()> {
     let mut file = std::fs::File::create(path)?;
     let d = x.ncols();
 
-    // Header
-    let header: Vec<String> = (0..d).map(|j| format!("env_{}", j)).collect();
-    writeln!(file, "{}", header.join("\t"))?;
+    // Header: sample_id followed by covariate names
+    let cov_names: Vec<String> = (0..d).map(|j| format!("env_{}", j)).collect();
+    writeln!(file, "sample_id\t{}", cov_names.join("\t"))?;
 
-    // Data rows
+    // Data rows: sample ID followed by values
     for i in 0..x.nrows() {
         let vals: Vec<String> = (0..d).map(|j| format!("{:.6}", x[(i, j)])).collect();
-        writeln!(file, "{}", vals.join("\t"))?;
+        writeln!(file, "IND{}\t{}", i, vals.join("\t"))?;
     }
     Ok(())
 }

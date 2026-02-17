@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ndarray::Array2;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,8 @@ struct Cli {
     #[arg(short = 'b', long)]
     bed: PathBuf,
 
-    /// Covariate file (TSV with header, n rows × d cols)
+    /// Covariate/phenotype file (CSV or TSV, auto-detected from extension).
+    /// First row = header, first column = sample ID.
     #[arg(short = 'c', long)]
     cov: PathBuf,
 
@@ -74,55 +76,38 @@ fn main() -> Result<()> {
 
     // Configure BLAS threading to complement our own worker pool.
     //
-    // OpenBLAS (pthreads backend) uses a single global thread pool of size
-    // OPENBLAS_NUM_THREADS. When multiple OS threads call BLAS concurrently,
-    // they contend for this shared pool: one caller gets the full pool while
-    // others fall back to single-threaded execution.
-    //
     // Parallel mode (--threads T > 0):
-    //   Force BLAS single-threaded. Each of our T workers runs its own
-    //   single-threaded BLAS call concurrently → T cores utilized, zero
-    //   contention. Setting B>1 would only let one lucky worker use B threads
-    //   while T-1 others serialize, wasting cores.
-    //
+    //   Force BLAS single-threaded so T workers each run independent matmuls.
     // Sequential mode (--threads 0):
-    //   No worker pool, so let BLAS use all available cores for each matmul.
-    //   This gives full BLAS parallelism on the large n×n multiplications
-    //   (M @ chunk, (I-P_U) @ chunk) which dominate compute time.
+    //   Let BLAS use all cores for each matmul.
     if cli.threads > 0 {
         std::env::set_var("OPENBLAS_NUM_THREADS", "1");
         std::env::set_var("MKL_NUM_THREADS", "1");
     }
 
-    if cli.verbose {
-        eprintln!("Loading covariates from {}...", cli.cov.display());
-    }
-    let x = load_covariates(&cli.cov)?;
+    // --- Load genotype data ---
+    eprintln!("Loading BED file: {}", cli.bed.display());
+    let bed = BedFile::open(&cli.bed)?;
+    eprintln!(
+        "  {} samples x {} SNPs",
+        bed.n_samples, bed.n_snps
+    );
+
+    // --- Load covariates with sample matching ---
+    eprintln!("Loading covariates from: {}", cli.cov.display());
+    let (cov_names, x) = load_covariates(&cli.cov, &bed.fam_records)?;
     let n = x.nrows();
     let d = x.ncols();
-    if cli.verbose {
-        eprintln!("  {} samples × {} covariates", n, d);
-    }
+    eprintln!(
+        "  {} samples x {} covariates: [{}]",
+        n,
+        d,
+        cov_names.join(", ")
+    );
 
-    if cli.verbose {
-        eprintln!("Opening BED file {}...", cli.bed.display());
-    }
-    let bed = BedFile::open(&cli.bed)?;
-    if bed.n_samples != n {
-        anyhow::bail!(
-            "Sample count mismatch: BED has {} samples, covariate file has {}",
-            bed.n_samples,
-            n
-        );
-    }
-    if cli.verbose {
-        eprintln!("  {} samples × {} SNPs", bed.n_samples, bed.n_snps);
-    }
-
+    // --- Open estimation BED if provided ---
     let est_bed = if let Some(ref est_path) = cli.est_bed {
-        if cli.verbose {
-            eprintln!("Opening estimation BED file {}...", est_path.display());
-        }
+        eprintln!("Loading estimation BED file: {}", est_path.display());
         let eb = BedFile::open(est_path)?;
         if eb.n_samples != n {
             anyhow::bail!(
@@ -131,9 +116,10 @@ fn main() -> Result<()> {
                 n
             );
         }
-        if cli.verbose {
-            eprintln!("  {} samples × {} SNPs", eb.n_samples, eb.n_snps);
-        }
+        eprintln!(
+            "  {} samples x {} SNPs (for factor estimation)",
+            eb.n_samples, eb.n_snps
+        );
         Some(eb)
     } else {
         None
@@ -149,121 +135,238 @@ fn main() -> Result<()> {
         n_workers: cli.threads,
     };
 
-    if cli.verbose {
-        eprintln!(
-            "Running LFMM2: K={}, lambda={}, chunk_size={}, threads={}, oversampling={}, power_iter={}",
-            config.k, config.lambda, config.chunk_size, config.n_workers,
-            config.oversampling, config.n_power_iter,
-        );
-    }
+    eprintln!(
+        "Running LFMM2: K={}, lambda={:.1e}, chunk_size={}, threads={}, oversampling={}, power_iter={}",
+        config.k, config.lambda, config.chunk_size, config.n_workers,
+        config.oversampling, config.n_power_iter,
+    );
 
     let y_est = est_bed.as_ref().unwrap_or(&bed);
     let results = fit_lfmm2(y_est, &bed, &x, &config)?;
 
-    if cli.verbose {
-        eprintln!("GIF: {:.4}", results.gif);
-        eprintln!("Writing output files with prefix '{}'...", cli.out);
-    }
+    eprintln!("GIF: {:.4}", results.gif);
 
-    write_tsv(
-        &format!("{}.effect_sizes.tsv", cli.out),
-        &results.effect_sizes,
-        "beta",
-    )?;
-    write_tsv(
-        &format!("{}.t_stats.tsv", cli.out),
-        &results.t_stats,
-        "t",
-    )?;
-    write_tsv(
-        &format!("{}.p_values.tsv", cli.out),
-        &results.p_values,
-        "p",
-    )?;
+    // --- Write output files ---
+    let effect_path = format!("{}.effect_sizes.tsv", cli.out);
+    let tstat_path = format!("{}.t_stats.tsv", cli.out);
+    let pval_path = format!("{}.p_values.tsv", cli.out);
+    let summary_path = format!("{}.summary.txt", cli.out);
+
+    eprintln!("Writing output files with prefix '{}'...", cli.out);
+
+    write_tsv(&effect_path, &results.effect_sizes, &cov_names, "beta")?;
+    write_tsv(&tstat_path, &results.t_stats, &cov_names, "t")?;
+    write_tsv(&pval_path, &results.p_values, &cov_names, "p")?;
 
     // Write summary
     {
-        let path = format!("{}.summary.txt", cli.out);
-        let mut f = std::fs::File::create(&path)
-            .with_context(|| format!("Failed to create {}", path))?;
+        let mut f = std::fs::File::create(&summary_path)
+            .with_context(|| format!("Failed to create {}", summary_path))?;
         writeln!(f, "GIF: {:.6}", results.gif)?;
         writeln!(f, "n_samples: {}", results.u_hat.nrows())?;
         writeln!(f, "n_snps: {}", results.p_values.nrows())?;
         writeln!(f, "K: {}", results.u_hat.ncols())?;
         writeln!(f, "d: {}", results.effect_sizes.ncols())?;
+        writeln!(f, "covariates: {}", cov_names.join(", "))?;
         writeln!(f, "lambda: {}", cli.lambda)?;
         writeln!(f, "threads: {}", cli.threads)?;
     }
 
-    if cli.verbose {
-        eprintln!("Done.");
-    }
+    eprintln!(
+        "Done. Output: {}, {}, {}, {}",
+        effect_path, tstat_path, pval_path, summary_path
+    );
 
     Ok(())
 }
 
-/// Load a TSV covariate file with a header row into an Array2<f64>.
-fn load_covariates(path: &Path) -> Result<Array2<f64>> {
+/// Guess the field delimiter from a file's extension.
+/// .csv → comma, everything else (.tsv, .txt, etc.) → tab.
+fn guess_delimiter(path: &Path) -> char {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("csv") => ',',
+        _ => '\t',
+    }
+}
+
+/// Load a covariate/phenotype file and match samples to .fam order.
+///
+/// File format:
+/// - First row: header. Cell A1 (sample ID column name) may be blank.
+/// - First column: sample identifiers (matched against .fam IIDs).
+/// - Remaining columns: numeric covariate values.
+/// - Delimiter: comma for .csv, tab otherwise.
+///
+/// Returns (covariate_names, data_matrix) where rows are in .fam order.
+fn load_covariates(
+    path: &Path,
+    fam: &[lfmm2::bed::FamRecord],
+) -> Result<(Vec<String>, Array2<f64>)> {
+    let delim = guess_delimiter(path);
+    let delim_name = if delim == ',' { "CSV" } else { "TSV" };
+
+    if cli_verbose() {
+        eprintln!("  Detected {} format (delimiter: {:?})", delim_name, delim);
+    }
+
     let file = std::fs::File::open(path)
         .with_context(|| format!("Failed to open covariate file: {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
 
-    // Skip header
-    let _header = lines
+    // Parse header row
+    let header_line = lines
         .next()
         .ok_or_else(|| anyhow::anyhow!("Covariate file is empty"))??;
+    let header_fields: Vec<&str> = header_line.split(delim).collect();
+    if header_fields.len() < 2 {
+        anyhow::bail!(
+            "Covariate file header has only {} field(s) — expected at least a sample ID column \
+             and one covariate column (delimiter: {:?})",
+            header_fields.len(),
+            delim,
+        );
+    }
 
-    let mut rows: Vec<Vec<f64>> = Vec::new();
+    // First header field is the sample ID column name (may be blank); rest are covariate names
+    let cov_names: Vec<String> = header_fields[1..]
+        .iter()
+        .map(|s| s.trim().to_string())
+        .collect();
+    let n_covs = cov_names.len();
+
+    // Parse data rows: sample_id → values
+    let mut sample_data: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut file_order: Vec<String> = Vec::new();
+
     for (i, line) in lines.enumerate() {
         let line = line?;
-        let vals: Vec<f64> = line
-            .split('\t')
-            .map(|s| {
-                let v = s
-                    .trim()
-                    .parse::<f64>()
-                    .with_context(|| format!("Failed to parse value '{}' on line {}", s.trim(), i + 2))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(delim).collect();
+        if fields.len() != n_covs + 1 {
+            anyhow::bail!(
+                "Line {} has {} fields, expected {} (1 sample ID + {} covariates)",
+                i + 2,
+                fields.len(),
+                n_covs + 1,
+                n_covs,
+            );
+        }
+
+        let sample_id = fields[0].trim().to_string();
+        let vals: Vec<f64> = fields[1..]
+            .iter()
+            .enumerate()
+            .map(|(j, s)| {
+                let v = s.trim().parse::<f64>().with_context(|| {
+                    format!(
+                        "Failed to parse value '{}' for covariate '{}' on line {} (sample '{}')",
+                        s.trim(),
+                        cov_names[j],
+                        i + 2,
+                        sample_id,
+                    )
+                })?;
                 if !v.is_finite() {
                     anyhow::bail!(
-                        "Non-finite covariate value ({}) on line {}: \
-                         NaN/Inf in covariates will propagate through all matrix operations",
+                        "Non-finite value ({}) for covariate '{}' on line {} (sample '{}'): \
+                         NaN/Inf will propagate through all matrix operations",
                         v,
+                        cov_names[j],
                         i + 2,
+                        sample_id,
                     );
                 }
                 Ok(v)
             })
             .collect::<Result<Vec<_>>>()?;
-        if !rows.is_empty() && vals.len() != rows[0].len() {
+
+        if sample_data.contains_key(&sample_id) {
             anyhow::bail!(
-                "Line {} has {} columns, expected {}",
+                "Duplicate sample ID '{}' in covariate file (line {})",
+                sample_id,
                 i + 2,
-                vals.len(),
-                rows[0].len()
             );
         }
-        rows.push(vals);
+        file_order.push(sample_id.clone());
+        sample_data.insert(sample_id, vals);
     }
 
-    if rows.is_empty() {
+    if sample_data.is_empty() {
         anyhow::bail!("Covariate file has no data rows");
     }
 
-    let n = rows.len();
-    let d = rows[0].len();
-    let flat: Vec<f64> = rows.into_iter().flatten().collect();
-    Ok(Array2::from_shape_vec((n, d), flat)?)
+    eprintln!(
+        "  Read {} samples from covariate file",
+        sample_data.len()
+    );
+
+    // Match samples to .fam order using IID
+    let n = fam.len();
+    let mut x = Array2::<f64>::zeros((n, n_covs));
+    let mut matched = 0;
+
+    for (row, fam_rec) in fam.iter().enumerate() {
+        let vals = sample_data.get(&fam_rec.iid).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Sample '{}' (FID='{}') from .fam file not found in covariate file.\n\
+                 .fam has {} samples, covariate file has {}.\n\
+                 First few covariate sample IDs: [{}]",
+                fam_rec.iid,
+                fam_rec.fid,
+                n,
+                sample_data.len(),
+                file_order.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+            )
+        })?;
+        for (j, &v) in vals.iter().enumerate() {
+            x[(row, j)] = v;
+        }
+        matched += 1;
+    }
+
+    let extra = sample_data.len() - matched;
+    if extra > 0 {
+        eprintln!(
+            "  Warning: {} sample(s) in covariate file not present in .fam file (ignored)",
+            extra,
+        );
+    }
+
+    eprintln!(
+        "  Matched {} samples to .fam order",
+        matched,
+    );
+
+    Ok((cov_names, x))
 }
 
-/// Write an Array2<f64> as a TSV file with a header row.
-fn write_tsv(path: &str, data: &Array2<f64>, col_prefix: &str) -> Result<()> {
+/// Write an Array2<f64> as a TSV file with named column headers.
+///
+/// Headers are formatted as "{prefix}_{name}" for each covariate name.
+fn write_tsv(
+    path: &str,
+    data: &Array2<f64>,
+    cov_names: &[String],
+    prefix: &str,
+) -> Result<()> {
     let mut f =
         std::fs::File::create(path).with_context(|| format!("Failed to create {}", path))?;
     let d = data.ncols();
 
     // Header
-    let header: Vec<String> = (0..d).map(|j| format!("{}_{}", col_prefix, j)).collect();
+    let header: Vec<String> = cov_names
+        .iter()
+        .map(|name| format!("{}_{}", prefix, name))
+        .collect();
+    // Fallback if names don't match column count (shouldn't happen, but be safe)
+    let header: Vec<String> = if header.len() == d {
+        header
+    } else {
+        (0..d).map(|j| format!("{}_{}", prefix, j)).collect()
+    };
     writeln!(f, "{}", header.join("\t"))?;
 
     // Data
@@ -272,4 +375,10 @@ fn write_tsv(path: &str, data: &Array2<f64>, col_prefix: &str) -> Result<()> {
         writeln!(f, "{}", vals.join("\t"))?;
     }
     Ok(())
+}
+
+/// Check if --verbose was passed. Used by helper functions that don't have
+/// direct access to the Cli struct.
+fn cli_verbose() -> bool {
+    std::env::args().any(|a| a == "--verbose" || a == "-v")
 }
