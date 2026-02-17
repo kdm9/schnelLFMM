@@ -1,0 +1,24 @@
+[package]
+name = "lfmm2"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ndarray = { version = "0.16", features = ["blas"] }
+ndarray-linalg = { version = "0.17", features = ["openblas-static"] }
+ndarray-rand = "0.15"
+blas-src = { version = "0.10", features = ["openblas"] }
+openblas-src = { version = "0.10", features = ["cblas", "static"] }
+rayon = "1.10"
+memmap2 = "0.9"
+rand = "0.8"
+rand_distr = "0.4"
+rand_chacha = "0.3"
+statrs = "0.17"
+anyhow = "1"
+byteorder = "1"
+tempfile = "3"
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3"
