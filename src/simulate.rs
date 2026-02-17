@@ -17,6 +17,10 @@ pub struct SimConfig {
     pub effect_size: f64,
     pub latent_scale: f64,
     pub noise_std: f64,
+    /// Target r² between covariate columns (0.0 = independent).
+    /// Column 0 is drawn iid N(0,1); columns j>0 are generated as
+    /// r*X[:,0] + sqrt(1-r²)*Z_j with Z_j iid N(0,1), giving pairwise r² ≈ this value.
+    pub covariate_r2: f64,
     pub seed: u64,
 }
 
@@ -52,8 +56,20 @@ pub fn simulate(config: &SimConfig) -> SimData {
     let v_scale = config.latent_scale / (k as f64).sqrt();
     let v_true = Array2::from_shape_fn((p, k), |_| rng.sample(normal) * v_scale);
 
-    // Generate X (n × d) — covariates
-    let x = Array2::from_shape_fn((n, d), |_| rng.sample(normal));
+    // Generate X (n × d) — covariates with pairwise correlation ≈ covariate_r2
+    // Column 0: iid N(0,1)
+    // Columns j>0: r*X[:,0] + sqrt(1-r²)*Z_j giving pairwise r² ≈ covariate_r2
+    let mut x = Array2::<f64>::zeros((n, d));
+    for i in 0..n {
+        x[(i, 0)] = rng.sample(normal);
+    }
+    let r = config.covariate_r2.sqrt();
+    let r_orth = (1.0 - config.covariate_r2).sqrt();
+    for j in 1..d {
+        for i in 0..n {
+            x[(i, j)] = r * x[(i, 0)] + r_orth * rng.sample(normal);
+        }
+    }
 
     // Choose causal SNP indices
     let mut all_indices: Vec<usize> = (0..p).collect();
@@ -220,6 +236,9 @@ pub fn write_latent_u(path: &Path, u: &Array2<f64>) -> Result<()> {
 }
 
 /// Write R comparison script for LEA cross-reference.
+///
+/// Generates QQ plots (LEA vs expected, Rust vs expected, Rust vs LEA),
+/// and computes power/recall, FDR, TDR, and F1 at fixed FDR thresholds.
 pub fn write_r_comparison_script(dir: &Path, prefix: &str, k: usize) -> Result<()> {
     let script_path = dir.join("run_lea_comparison.R");
     let mut file = std::fs::File::create(script_path)?;
@@ -227,65 +246,212 @@ pub fn write_r_comparison_script(dir: &Path, prefix: &str, k: usize) -> Result<(
     write!(
         file,
         r#"#!/usr/bin/env Rscript
-# Cross-reference: compare Rust LFMM2 against LEA (Bioconductor) lfmm2()
+# Comprehensive validation: Rust LFMM2 vs LEA (Bioconductor) lfmm2()
+#
+# Produces:
+#   - QQ plots (LEA vs expected, Rust vs expected, Rust vs LEA)
+#   - Power/recall, FDR, TDR, F1 at fixed FDR thresholds (1%, 5%, 10%)
+#   - Spearman rank correlations
 #
 # Usage: cd testdata && Rscript run_lea_comparison.R
 
 library(LEA)
 
 prefix <- "{prefix}"
+K <- {k}
 
-# Read genotype data (PLINK -> lfmm format)
-# LEA expects space-separated genotype matrix, one row per sample
-geno <- read.table(paste0(prefix, ".lfmm"), header=FALSE)
-env <- read.table(paste0(prefix, "_covariates.txt"), header=TRUE)
+# ============================================================
+# 1. Load data
+# ============================================================
+cat("Loading data...\n")
+geno  <- read.table(paste0(prefix, ".lfmm"), header = FALSE)
+env   <- read.table(paste0(prefix, "_covariates.txt"), header = TRUE)
+truth <- read.table(paste0(prefix, "_truth.tsv"), header = TRUE, sep = "\t")
 
-cat("Genotype matrix:", nrow(geno), "samples x", ncol(geno), "SNPs\n")
-cat("Running lfmm2 with K={k}...\n")
+is_causal <- truth$is_causal == 1
+n_samples <- nrow(geno)
+n_snps    <- ncol(geno)
+n_causal  <- sum(is_causal)
+d         <- ncol(env)
 
-# Write temp files in LEA format
+cat(sprintf("  %d samples, %d SNPs, %d causal, %d covariates\n",
+            n_samples, n_snps, n_causal, d))
+
+# ============================================================
+# 2. Run LEA lfmm2
+# ============================================================
+cat(sprintf("Running LEA lfmm2 with K = %d ...\n", K))
 write.lfmm(as.matrix(geno), paste0(prefix, "_lea.lfmm"))
 
 mod <- lfmm2(input = paste0(prefix, "_lea.lfmm"),
-             env = as.matrix(env),
-             K = {k})
+             env   = as.matrix(env),
+             K     = K)
 
 pv <- lfmm2.test(object = mod,
-                  input = paste0(prefix, "_lea.lfmm"),
-                  env = as.matrix(env),
-                  full = TRUE)
+                  input  = paste0(prefix, "_lea.lfmm"),
+                  env    = as.matrix(env),
+                  full   = FALSE)
 
-# Write p-values
-write.table(pv$pvalues, paste0(prefix, "_lea_pvalues.tsv"),
-            sep="\t", row.names=FALSE, col.names=TRUE)
+lea_pv <- as.data.frame(t(pv$pvalues))
+colnames(lea_pv) <- paste0("p_", seq_len(d) - 1)
+write.table(lea_pv, paste0(prefix, "_lea_pvalues.tsv"),
+            sep = "\t", row.names = FALSE, col.names = TRUE)
 
-# Write z-scores
-write.table(pv$zscores, paste0(prefix, "_lea_zscores.tsv"),
-            sep="\t", row.names=FALSE, col.names=TRUE)
+lea_zs <- as.data.frame(t(pv$zscores))
+colnames(lea_zs) <- paste0("z_", seq_len(d) - 1)
+write.table(lea_zs, paste0(prefix, "_lea_zscores.tsv"),
+            sep = "\t", row.names = FALSE, col.names = TRUE)
 
-cat("Done. Output written to:\n")
-cat("  ", paste0(prefix, "_lea_pvalues.tsv"), "\n")
-cat("  ", paste0(prefix, "_lea_zscores.tsv"), "\n")
+cat("LEA results written.\n")
 
-# Quick comparison if Rust results exist
+# ============================================================
+# 3. Load Rust results
+# ============================================================
 rust_pv_file <- paste0(prefix, "_rust_pvalues.tsv")
-if (file.exists(rust_pv_file)) {{
-    rust_pv <- read.table(rust_pv_file, header=TRUE, sep="\t")
-    lea_pv <- pv$pvalues
+if (!file.exists(rust_pv_file)) {{
+    stop(paste("Rust p-values not found:", rust_pv_file,
+               "\nRun the Rust integration test first."))
+}}
+rust_pv <- read.table(rust_pv_file, header = TRUE, sep = "\t")
+cat("Rust results loaded.\n")
 
-    # Rank correlation
-    for (j in 1:ncol(lea_pv)) {{
-        rc <- cor(rank(-log10(rust_pv[,j])), rank(-log10(lea_pv[,j])), method="spearman")
-        cat(sprintf("Covariate %d: Spearman rank correlation of -log10(p) = %.4f\n", j, rc))
+# ============================================================
+# 4. QQ plots
+# ============================================================
+qq_expected <- function(pvals, main, col = "black") {{
+    pvals <- pvals[!is.na(pvals)]
+    n     <- length(pvals)
+    expected <- -log10(rev(1:n / (n + 1)))
+    observed <- sort(-log10(pvals))
+    lim <- max(expected, observed)
+    plot(expected, observed, pch = 20, cex = 0.3, col = col,
+         xlab = expression(-log[10](p[expected])),
+         ylab = expression(-log[10](p[observed])),
+         main = main, xlim = c(0, lim), ylim = c(0, lim))
+    abline(0, 1, col = "red", lty = 2)
+    # GIF (genomic inflation factor) from median chi-sq
+    chisq <- qchisq(pvals, df = 1, lower.tail = FALSE)
+    gif <- median(chisq, na.rm = TRUE) / qchisq(0.5, df = 1)
+    legend("topleft", legend = sprintf("GIF = %.3f", gif), bty = "n", cex = 0.9)
+}}
+
+qq_vs <- function(pvals_x, pvals_y, xlab_text, ylab_text, main) {{
+    x <- -log10(sort(pvals_x))
+    y <- -log10(sort(pvals_y))
+    lim <- max(c(x, y), na.rm = TRUE)
+    plot(x, y, pch = 20, cex = 0.3,
+         xlab = xlab_text, ylab = ylab_text,
+         main = main, xlim = c(0, lim), ylim = c(0, lim))
+    abline(0, 1, col = "red", lty = 2)
+    rc <- cor(x, y, method = "spearman")
+    legend("topleft", legend = sprintf("rho = %.4f", rc), bty = "n", cex = 0.9)
+}}
+
+pdf_file <- paste0(prefix, "_validation_plots.pdf")
+pdf(pdf_file, width = 12, height = 4 * d)
+par(mfrow = c(d, 3), mar = c(4, 4, 3, 1))
+
+for (j in 1:d) {{
+    qq_expected(lea_pv[, j],
+                paste0("LEA QQ - Covariate ", j),
+                col = "steelblue")
+    qq_expected(rust_pv[, j],
+                paste0("Rust QQ - Covariate ", j),
+                col = "darkorange")
+    qq_vs(lea_pv[, j], rust_pv[, j],
+          expression(-log[10](p[LEA])),
+          expression(-log[10](p[Rust])),
+          paste0("Rust vs LEA - Covariate ", j))
+}}
+dev.off()
+cat(sprintf("QQ plots saved to %s\n", pdf_file))
+
+# ============================================================
+# 5. Discovery metrics at fixed FDR thresholds
+# ============================================================
+compute_metrics <- function(pvals, is_causal, fdr_cut) {{
+    qvals      <- p.adjust(pvals, method = "BH")
+    discovered <- qvals < fdr_cut
+    tp  <- sum( discovered &  is_causal)
+    fp  <- sum( discovered & !is_causal)
+    fn_ <- sum(!discovered &  is_causal)
+
+    n_disc <- tp + fp
+    power  <- if (sum(is_causal) > 0) tp / sum(is_causal) else NA   # recall
+    fdr_obs <- if (n_disc > 0)  fp / n_disc            else 0       # FP / (TP+FP)
+    tdr     <- if (n_disc > 0)  tp / n_disc            else NA      # precision = 1-FDR
+    f1      <- if (!is.na(power) && !is.na(tdr) && (power + tdr) > 0)
+                   2 * power * tdr / (power + tdr) else 0
+
+    data.frame(fdr_cut = fdr_cut, n_disc = n_disc,
+               tp = tp, fp = fp, fn_ = fn_,
+               power = power, fdr_obs = fdr_obs, tdr = tdr, f1 = f1)
+}}
+
+fdr_thresholds <- c(0.01, 0.05, 0.10)
+
+cat("\n============================================================\n")
+cat("Power vs. FDR at fixed BH thresholds\n")
+cat("  Power  = TP / (TP + FN)           (recall)\n")
+cat("  TDR    = TP / (TP + FP)           (precision = 1 - FDR)\n")
+cat("  F1     = 2 * Power * TDR / (Power + TDR)\n")
+cat("============================================================\n")
+
+metrics_all <- data.frame()
+
+for (j in 1:d) {{
+    cat(sprintf("\n--- Covariate %d ---\n", j))
+
+    for (method_name in c("Rust", "LEA")) {{
+        pvals <- if (method_name == "Rust") rust_pv[, j] else lea_pv[, j]
+
+        cat(sprintf("\n  %s:\n", method_name))
+        cat(sprintf("  %-10s %7s %5s %5s %5s %8s %8s %8s %8s\n",
+                    "FDR_cut", "n_disc", "TP", "FP", "FN", "Power", "FDR_obs", "TDR", "F1"))
+
+        for (thr in fdr_thresholds) {{
+            m <- compute_metrics(pvals, is_causal, thr)
+            cat(sprintf("  %-10.2f %7d %5d %5d %5d %8.4f %8.4f %8.4f %8.4f\n",
+                        m$fdr_cut, m$n_disc, m$tp, m$fp, m$fn_,
+                        m$power, m$fdr_obs, m$tdr, m$f1))
+            m$method    <- method_name
+            m$covariate <- j
+            metrics_all <- rbind(metrics_all, m)
+        }}
     }}
 }}
+
+# Write metrics table
+write.table(metrics_all,
+            paste0(prefix, "_validation_metrics.tsv"),
+            sep = "\t", row.names = FALSE, col.names = TRUE)
+
+# ============================================================
+# 6. Rank correlations
+# ============================================================
+cat("\n============================================================\n")
+cat("Spearman rank correlations of -log10(p): Rust vs LEA\n")
+cat("============================================================\n")
+for (j in 1:d) {{
+    rc <- cor(rank(-log10(rust_pv[, j])),
+              rank(-log10(lea_pv[, j])),
+              method = "spearman")
+    cat(sprintf("  Covariate %d: rho = %.4f\n", j, rc))
+}}
+
+cat("Sanity check: all(rust_pv == lea_pv):")
+print(table(rust_pv == lea_pv))
+cat("\nhead(rust_pv):\n")
+print(head(rust_pv))
+cat("head(lea_pv):\n")
+print(head(lea_pv))
+
+cat(sprintf("\nAll outputs written with prefix '%s'.\n", prefix))
 "#,
         prefix = prefix,
         k = k,
     )?;
 
-    // Also write the .lfmm format file (space-separated genotype matrix)
-    // This will be called from the test after simulation
     Ok(())
 }
 

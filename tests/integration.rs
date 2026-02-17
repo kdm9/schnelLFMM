@@ -10,7 +10,7 @@ use std::fs;
 use std::path::Path;
 
 /// Tier 1: Quick test — small simulation for basic correctness.
-/// n=200, p=10_000, K=3, d=1, 20 causal SNPs
+/// n=200, p=10_000, K=3, d=2 (r²≈0.3), 20 causal SNPs
 #[test]
 fn test_lfmm2_quick() {
     let sim_config = SimConfig {
@@ -18,10 +18,11 @@ fn test_lfmm2_quick() {
         n_snps: 10_000,
         n_causal: 20,
         k: 3,
-        d: 1,
+        d: 2,
         effect_size: 1.0,
         latent_scale: 1.0,
         noise_std: 1.0,
+        covariate_r2: 0.3,
         seed: 12345,
     };
 
@@ -54,7 +55,7 @@ fn test_lfmm2_quick() {
 }
 
 /// Tier 2: Large simulation for thorough validation.
-/// n=1000, p=1_000_000, K=5, d=1, 100 causal SNPs
+/// n=400, p=100_000, K=5, d=2 (r²≈0.3), 100 causal SNPs
 #[test]
 #[ignore] // Run with: cargo test --release -- --ignored
 fn test_lfmm2_large() {
@@ -63,10 +64,11 @@ fn test_lfmm2_large() {
         n_snps: 100_000,
         n_causal: 100,
         k: 5,
-        d: 1,
+        d: 2,
         effect_size: 1.0,
         latent_scale: 1.0,
         noise_std: 1.0,
+        covariate_r2: 0.3,
         seed: 54321,
     };
 
@@ -122,10 +124,11 @@ fn test_reproducibility() {
         n_snps: 1_000,
         n_causal: 5,
         k: 2,
-        d: 1,
+        d: 2,
         effect_size: 1.0,
         latent_scale: 1.0,
         noise_std: 1.0,
+        covariate_r2: 0.3,
         seed: 99,
     };
 
