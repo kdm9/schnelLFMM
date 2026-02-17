@@ -34,6 +34,7 @@ fn test_lfmm2_quick() {
         n_power_iter: 2,
         seed: 42,
         n_workers: 0,
+        progress: false,
     };
 
     // Simulate
@@ -81,6 +82,7 @@ fn test_lfmm2_large() {
         n_power_iter: 2,
         seed: 42,
         n_workers: 0,
+        progress: false,
     };
 
     // Simulate
@@ -142,6 +144,7 @@ fn test_reproducibility() {
         n_power_iter: 1,
         seed: 42,
         n_workers: 0,
+        progress: false,
     };
 
     let sim = simulate(&sim_config);
@@ -315,6 +318,7 @@ fn test_parallel_matches_sequential() {
         n_power_iter: 2,
         seed: 42,
         n_workers: 0,
+        progress: false,
     };
     let r_seq = fit_lfmm2(&bed, &bed, &sim.x, &config_seq).unwrap();
 

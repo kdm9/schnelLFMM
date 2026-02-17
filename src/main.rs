@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ndarray::Array2;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use lfmm2::bed::BedFile;
@@ -133,6 +133,7 @@ fn main() -> Result<()> {
         n_power_iter: cli.power_iter,
         seed: cli.seed,
         n_workers: cli.threads,
+        progress: std::io::stderr().is_terminal(),
     };
 
     eprintln!(
@@ -146,19 +147,21 @@ fn main() -> Result<()> {
 
     eprintln!("GIF: {:.4}", results.gif);
 
-    // --- Write output files ---
-    let effect_path = format!("{}.effect_sizes.tsv", cli.out);
-    let tstat_path = format!("{}.t_stats.tsv", cli.out);
-    let pval_path = format!("{}.p_values.tsv", cli.out);
+    // --- Write output ---
+    let results_path = format!("{}.tsv", cli.out);
     let summary_path = format!("{}.summary.txt", cli.out);
 
-    eprintln!("Writing output files with prefix '{}'...", cli.out);
+    eprintln!("Writing results to {}...", results_path);
 
-    write_tsv(&effect_path, &results.effect_sizes, &cov_names, "beta")?;
-    write_tsv(&tstat_path, &results.t_stats, &cov_names, "t")?;
-    write_tsv(&pval_path, &results.p_values, &cov_names, "p")?;
+    write_results(
+        &results_path,
+        &bed.bim_records,
+        &results.effect_sizes,
+        &results.t_stats,
+        &results.p_values,
+        &cov_names,
+    )?;
 
-    // Write summary
     {
         let mut f = std::fs::File::create(&summary_path)
             .with_context(|| format!("Failed to create {}", summary_path))?;
@@ -172,10 +175,7 @@ fn main() -> Result<()> {
         writeln!(f, "threads: {}", cli.threads)?;
     }
 
-    eprintln!(
-        "Done. Output: {}, {}, {}, {}",
-        effect_path, tstat_path, pval_path, summary_path
-    );
+    eprintln!("Done. Output: {}, {}", results_path, summary_path);
 
     Ok(())
 }
@@ -343,35 +343,40 @@ fn load_covariates(
     Ok((cov_names, x))
 }
 
-/// Write an Array2<f64> as a TSV file with named column headers.
+/// Write a single results TSV with SNP annotations and per-trait statistics.
 ///
-/// Headers are formatted as "{prefix}_{name}" for each covariate name.
-fn write_tsv(
+/// Columns: chr, pos, snp_id, then for each trait: p_$TRAIT, beta_$TRAIT, t_$TRAIT
+fn write_results(
     path: &str,
-    data: &Array2<f64>,
+    bim: &[lfmm2::bed::BimRecord],
+    effect_sizes: &Array2<f64>,
+    t_stats: &Array2<f64>,
+    p_values: &Array2<f64>,
     cov_names: &[String],
-    prefix: &str,
 ) -> Result<()> {
     let mut f =
         std::fs::File::create(path).with_context(|| format!("Failed to create {}", path))?;
-    let d = data.ncols();
+    let p = bim.len();
+    let d = cov_names.len();
 
-    // Header
-    let header: Vec<String> = cov_names
-        .iter()
-        .map(|name| format!("{}_{}", prefix, name))
-        .collect();
-    // Fallback if names don't match column count (shouldn't happen, but be safe)
-    let header: Vec<String> = if header.len() == d {
-        header
-    } else {
-        (0..d).map(|j| format!("{}_{}", prefix, j)).collect()
-    };
+    // Header: chr, pos, snp_id, then p/beta/t triples per trait
+    let mut header = vec!["chr".to_string(), "pos".to_string(), "snp_id".to_string()];
+    for name in cov_names {
+        header.push(format!("p_{}", name));
+        header.push(format!("beta_{}", name));
+        header.push(format!("t_{}", name));
+    }
     writeln!(f, "{}", header.join("\t"))?;
 
-    // Data
-    for i in 0..data.nrows() {
-        let vals: Vec<String> = (0..d).map(|j| format!("{:.6e}", data[(i, j)])).collect();
+    // Data rows
+    for i in 0..p {
+        let rec = &bim[i];
+        let mut vals = vec![rec.chrom.clone(), rec.pos.to_string(), rec.snp_id.clone()];
+        for j in 0..d {
+            vals.push(format!("{:.6e}", p_values[(i, j)]));
+            vals.push(format!("{:.6e}", effect_sizes[(i, j)]));
+            vals.push(format!("{:.6e}", t_stats[(i, j)]));
+        }
         writeln!(f, "{}", vals.join("\t"))?;
     }
     Ok(())

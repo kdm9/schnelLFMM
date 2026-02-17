@@ -6,6 +6,7 @@ use statrs::distribution::{ContinuousCDF, Normal, StudentsT};
 use crate::bed::{BedFile, SubsetSpec};
 use crate::parallel::{parallel_stream, DisjointRowWriter};
 use crate::precompute::Precomputed;
+use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
 
 /// Results from the LFMM2 association testing pass.
@@ -103,6 +104,9 @@ pub fn test_associations_fused(
 
     // Single fused pass over Y_full
     let subset = SubsetSpec::All;
+    let n_chunks = ((p + chunk_size - 1) / chunk_size) as u64;
+    let pb = make_progress_bar(n_chunks, "Association tests", config.progress);
+
     if config.n_workers > 0 {
         // Pattern A: scatter — each chunk writes to disjoint rows of 3 output arrays
         let wr_effects = DisjointRowWriter::new(&mut effect_sizes);
@@ -143,6 +147,7 @@ pub fn test_associations_fused(
                 wr_tstats.write_rows(start, &local_tstats);
                 wr_pvals.write_rows(start, &local_pvals);
             }
+            pb.inc(1);
         });
     } else {
         for (start, chunk) in y_full.stream_chunks(chunk_size, &subset) {
@@ -172,8 +177,10 @@ pub fn test_associations_fused(
                     raw_p_values[(snp_idx, j)] = p_val;
                 }
             }
+            pb.inc(1);
         }
     }
+    pb.finish_and_clear();
 
     // GIF calibration (genomic inflation factor).
     //

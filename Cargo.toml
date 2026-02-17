@@ -19,6 +19,7 @@ statrs = "0.17"
 anyhow = "1"
 byteorder = "1"
 tempfile = "3"
+indicatif = "0.18.4"
 
 [dev-dependencies]
 approx = "0.5"

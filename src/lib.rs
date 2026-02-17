@@ -1,6 +1,7 @@
 pub mod bed;
 pub mod parallel;
 pub mod precompute;
+pub mod progress;
 pub mod rsvd;
 pub mod simulate;
 pub mod testing;
@@ -36,6 +37,8 @@ pub struct Lfmm2Config {
     /// OPENBLAS_NUM_THREADS=1 (and MKL_NUM_THREADS=1) before any BLAS call
     /// when using n_workers > 0.
     pub n_workers: usize,
+    /// Show progress bars on stderr for streaming passes.
+    pub progress: bool,
 }
 
 impl Default for Lfmm2Config {
@@ -48,6 +51,7 @@ impl Default for Lfmm2Config {
             n_power_iter: 2,
             seed: 42,
             n_workers: 0,
+            progress: false,
         }
     }
 }
@@ -93,8 +97,17 @@ pub fn fit_lfmm2(
     x: &Array2<f64>,
     config: &Lfmm2Config,
 ) -> Result<TestResults> {
+    if config.progress {
+        eprintln!("Precomputing SVD of X...");
+    }
     let pre = precompute(x, config.lambda)?;
     let subset = SubsetSpec::All;
+    if config.progress {
+        eprintln!("Estimating latent factors (RSVD, {} power iterations)...", config.n_power_iter);
+    }
     let u_hat = estimate_factors_streaming(y_est, &subset, &pre, config)?;
+    if config.progress {
+        eprintln!("Testing associations...");
+    }
     test_associations_fused(y_full, x, &u_hat, &pre, config)
 }
