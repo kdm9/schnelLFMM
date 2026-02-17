@@ -48,27 +48,15 @@ pub fn estimate_factors_streaming(
     let mut z = Array2::<f64>::zeros((p_est, l));
     {
         let pb = make_progress_bar(n_chunks, "RSVD sketch", show);
-        if config.n_workers > 0 {
-            let writer = DisjointRowWriter::new(&mut z);
-            parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
-                let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
-                let z_block = chunk.t().dot(&mt_omega);
-                unsafe {
-                    writer.write_rows(block.seq * chunk_size, &z_block);
-                }
-                pb.inc(1);
-            });
-        } else {
-            let mut row_offset = 0;
-            for (_start, chunk) in y_est.stream_chunks(chunk_size, subset) {
-                let chunk_cols = chunk.ncols();
-                let z_block = chunk.t().dot(&mt_omega);
-                z.slice_mut(ndarray::s![row_offset..row_offset + chunk_cols, ..])
-                    .assign(&z_block);
-                row_offset += chunk_cols;
-                pb.inc(1);
+        let writer = DisjointRowWriter::new(&mut z);
+        parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
+            let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
+            let z_block = chunk.t().dot(&mt_omega);
+            unsafe {
+                writer.write_rows(block.seq * chunk_size, &z_block);
             }
-        }
+            pb.inc(1);
+        });
         pb.finish_and_clear();
     }
 
@@ -82,32 +70,19 @@ pub fn estimate_factors_streaming(
         {
             let label = format!("Power iter {}/{} (fwd)", iter + 1, config.n_power_iter);
             let pb = make_progress_bar(n_chunks, &label, show);
-            if config.n_workers > 0 {
-                let acc = Mutex::new(a_qz);
-                parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
-                    let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
-                    let offset = block.seq * chunk_size;
-                    let q_z_block =
-                        q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
-                    let y_qz = chunk.dot(&q_z_block);
-                    let partial = pre.m.dot(&y_qz);
-                    let mut guard = acc.lock().unwrap();
-                    *guard += &partial;
-                    pb.inc(1);
-                });
-                a_qz = acc.into_inner().unwrap();
-            } else {
-                let mut row_offset = 0;
-                for (_start, chunk) in y_est.stream_chunks(chunk_size, subset) {
-                    let chunk_cols = chunk.ncols();
-                    let q_z_block =
-                        q_z.slice(ndarray::s![row_offset..row_offset + chunk_cols, ..]);
-                    let y_qz = chunk.dot(&q_z_block);
-                    a_qz = a_qz + pre.m.dot(&y_qz);
-                    row_offset += chunk_cols;
-                    pb.inc(1);
-                }
-            }
+            let acc = Mutex::new(a_qz);
+            parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
+                let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
+                let offset = block.seq * chunk_size;
+                let q_z_block =
+                    q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
+                let y_qz = chunk.dot(&q_z_block);
+                let partial = pre.m.dot(&y_qz);
+                let mut guard = acc.lock().unwrap();
+                *guard += &partial;
+                pb.inc(1);
+            });
+            a_qz = acc.into_inner().unwrap();
             pb.finish_and_clear();
         }
 
@@ -120,27 +95,15 @@ pub fn estimate_factors_streaming(
         {
             let label = format!("Power iter {}/{} (bwd)", iter + 1, config.n_power_iter);
             let pb = make_progress_bar(n_chunks, &label, show);
-            if config.n_workers > 0 {
-                let writer = DisjointRowWriter::new(&mut z);
-                parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
-                    let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
-                    let z_block = chunk.t().dot(&mt_q);
-                    unsafe {
-                        writer.write_rows(block.seq * chunk_size, &z_block);
-                    }
-                    pb.inc(1);
-                });
-            } else {
-                let mut row_offset = 0;
-                for (_start, chunk) in y_est.stream_chunks(chunk_size, subset) {
-                    let chunk_cols = chunk.ncols();
-                    let z_block = chunk.t().dot(&mt_q);
-                    z.slice_mut(ndarray::s![row_offset..row_offset + chunk_cols, ..])
-                        .assign(&z_block);
-                    row_offset += chunk_cols;
-                    pb.inc(1);
+            let writer = DisjointRowWriter::new(&mut z);
+            parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
+                let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
+                let z_block = chunk.t().dot(&mt_q);
+                unsafe {
+                    writer.write_rows(block.seq * chunk_size, &z_block);
                 }
-            }
+                pb.inc(1);
+            });
             pb.finish_and_clear();
         }
 
@@ -152,32 +115,19 @@ pub fn estimate_factors_streaming(
     let mut b_svd = Array2::<f64>::zeros((n, l));
     {
         let pb = make_progress_bar(n_chunks, "RSVD project", show);
-        if config.n_workers > 0 {
-            let acc = Mutex::new(b_svd);
-            parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
-                let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
-                let offset = block.seq * chunk_size;
-                let q_z_block =
-                    q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
-                let y_qz = chunk.dot(&q_z_block);
-                let partial = pre.m.dot(&y_qz);
-                let mut guard = acc.lock().unwrap();
-                *guard += &partial;
-                pb.inc(1);
-            });
-            b_svd = acc.into_inner().unwrap();
-        } else {
-            let mut row_offset = 0;
-            for (_start, chunk) in y_est.stream_chunks(chunk_size, subset) {
-                let chunk_cols = chunk.ncols();
-                let q_z_block =
-                    q_z.slice(ndarray::s![row_offset..row_offset + chunk_cols, ..]);
-                let y_qz = chunk.dot(&q_z_block);
-                b_svd = b_svd + pre.m.dot(&y_qz);
-                row_offset += chunk_cols;
-                pb.inc(1);
-            }
-        }
+        let acc = Mutex::new(b_svd);
+        parallel_stream(y_est, subset, chunk_size, config.n_workers, |block| {
+            let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
+            let offset = block.seq * chunk_size;
+            let q_z_block =
+                q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
+            let y_qz = chunk.dot(&q_z_block);
+            let partial = pre.m.dot(&y_qz);
+            let mut guard = acc.lock().unwrap();
+            *guard += &partial;
+            pb.inc(1);
+        });
+        b_svd = acc.into_inner().unwrap();
         pb.finish_and_clear();
     }
 

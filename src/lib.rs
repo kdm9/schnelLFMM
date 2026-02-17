@@ -30,12 +30,14 @@ pub struct Lfmm2Config {
     pub seed: u64,
     /// Number of worker threads for parallel chunk processing.
     ///
-    /// - 0 = sequential (BLAS uses all cores for each matmul)
-    /// - T > 0 = T workers with single-threaded BLAS each (set OPENBLAS_NUM_THREADS=1)
+    /// 0 is treated as 1 — all paths use the parallel streaming infrastructure
+    /// (1 decoder thread + n_workers worker threads via crossbeam channels).
     ///
-    /// The CLI sets BLAS thread vars automatically. Library callers should set
-    /// OPENBLAS_NUM_THREADS=1 (and MKL_NUM_THREADS=1) before any BLAS call
-    /// when using n_workers > 0.
+    /// BLAS should always be single-threaded when using this library, since
+    /// the worker pool is the sole source of parallelism. The CLI calls
+    /// `openblas_set_num_threads(1)` automatically. Library callers should
+    /// set `OPENBLAS_NUM_THREADS=1` (and `MKL_NUM_THREADS=1`) or call
+    /// `openblas_set_num_threads(1)` via FFI before invoking `fit_lfmm2`.
     pub n_workers: usize,
     /// Show progress bars on stderr for streaming passes.
     pub progress: bool,

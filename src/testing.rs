@@ -107,8 +107,7 @@ pub fn test_associations_fused(
     let n_chunks = ((p + chunk_size - 1) / chunk_size) as u64;
     let pb = make_progress_bar(n_chunks, "Association tests", config.progress);
 
-    if config.n_workers > 0 {
-        // Pattern A: scatter — each chunk writes to disjoint rows of 3 output arrays
+    {
         let wr_effects = DisjointRowWriter::new(&mut effect_sizes);
         let wr_tstats = DisjointRowWriter::new(&mut t_stats);
         let wr_pvals = DisjointRowWriter::new(&mut raw_p_values);
@@ -149,36 +148,6 @@ pub fn test_associations_fused(
             }
             pb.inc(1);
         });
-    } else {
-        for (start, chunk) in y_full.stream_chunks(chunk_size, &subset) {
-            let chunk_cols = chunk.ncols();
-
-            // Step 3: B = (XtR @ (I - P_U) @ chunk)^T
-            let residual = i_minus_pu.dot(&chunk);
-            let b_chunk = xtr.dot(&residual); // d × chunk_cols
-            effect_sizes
-                .slice_mut(ndarray::s![start..start + chunk_cols, ..])
-                .assign(&b_chunk.t());
-
-            // Step 4: OLS with C = [X | U_hat]
-            let coefs = h.dot(&chunk); // (d+K) × chunk_cols
-            let fitted = c.dot(&coefs); // n × chunk_cols
-            let residuals = &chunk - &fitted; // n × chunk_cols
-
-            for col_in_chunk in 0..chunk_cols {
-                let res_col = residuals.column(col_in_chunk);
-                let rss: f64 = res_col.dot(&res_col);
-                let sigma2 = rss / df;
-
-                let snp_idx = start + col_in_chunk;
-                for j in 0..d {
-                    let (t, p_val) = t_test(coefs[(j, col_in_chunk)], sigma2, ctc_inv_diag[j], df);
-                    t_stats[(snp_idx, j)] = t;
-                    raw_p_values[(snp_idx, j)] = p_val;
-                }
-            }
-            pb.inc(1);
-        }
     }
     pb.finish_and_clear();
 

@@ -109,6 +109,7 @@ pub fn parallel_stream<F>(
 ) where
     F: Fn(&SnpBlock) + Send + Sync,
 {
+    let n_workers = n_workers.max(1);
     let indices = subset_indices(subset, bed.n_snps);
     let n_samples = bed.n_samples;
     let bps = bed.bytes_per_snp();

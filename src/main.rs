@@ -32,7 +32,7 @@ struct Cli {
     #[arg(short = 'o', long, default_value = "lfmm2_out")]
     out: String,
 
-    /// Worker threads (0 = sequential)
+    /// Worker threads (0 is treated as 1)
     #[arg(short = 't', long, default_value_t = default_threads())]
     threads: usize,
 
@@ -71,19 +71,19 @@ fn default_threads() -> usize {
         .unwrap_or(1)
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
+extern "C" {
+    fn openblas_set_num_threads(num_threads: std::ffi::c_int);
+}
 
-    // Configure BLAS threading to complement our own worker pool.
-    //
-    // Parallel mode (--threads T > 0):
-    //   Force BLAS single-threaded so T workers each run independent matmuls.
-    // Sequential mode (--threads 0):
-    //   Let BLAS use all cores for each matmul.
-    if cli.threads > 0 {
-        std::env::set_var("OPENBLAS_NUM_THREADS", "1");
-        std::env::set_var("MKL_NUM_THREADS", "1");
-    }
+fn main() -> Result<()> {
+    // Force BLAS single-threaded: our worker pool is the sole source of parallelism.
+    // set_var as belt-and-suspenders (may not take effect if BLAS is statically linked
+    // and initializes its thread pool before main), plus FFI call for runtime override.
+    std::env::set_var("OPENBLAS_NUM_THREADS", "1");
+    std::env::set_var("MKL_NUM_THREADS", "1");
+    unsafe { openblas_set_num_threads(1); }
+
+    let cli = Cli::parse();
 
     // --- Load genotype data ---
     eprintln!("Loading BED file: {}", cli.bed.display());
