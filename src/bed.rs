@@ -114,6 +114,11 @@ impl BedFile {
         })
     }
 
+    /// Raw mmap bytes after the 3-byte magic header.
+    pub fn mmap_data(&self) -> &[u8] {
+        &self.mmap[3..]
+    }
+
     /// Bytes per SNP in the .bed file (ceil(n_samples / 4))
     pub fn bytes_per_snp(&self) -> usize {
         (self.n_samples + 3) / 4

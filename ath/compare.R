@@ -17,6 +17,7 @@ if (!file.exists(lea_lfmm_file)) {
     col_means = colMeans(Y, na.rm = TRUE)
     na_mask = is.na(Y)
     Y[na_mask] = col_means[col(Y)[na_mask]]
+    table(is.na(Y))
 
     pheno = read.delim("pheno.tsv")
     X = pheno$FT10

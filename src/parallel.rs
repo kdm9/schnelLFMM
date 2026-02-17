@@ -10,15 +10,18 @@ pub struct SnpBlock {
     pub data: Array2<f64>,
     /// Actual number of columns used (last chunk may be smaller than capacity).
     pub n_cols: usize,
-    /// Sequential chunk index (0, 1, 2, ...) assigned by the decoder thread.
+    /// Sequential chunk index (0, 1, 2, ...) assigned by the IO thread.
     pub seq: usize,
+    /// Raw packed bytes copied from mmap by the IO thread.
+    /// Workers decode from this into `data` before calling process_fn.
+    pub raw: Vec<u8>,
 }
 
 /// Allows multiple threads to write to disjoint row ranges of an Array2 without locking.
 ///
 /// Safety invariant: each `seq` value maps to a unique, non-overlapping row range.
 /// This is guaranteed by construction — seq values are assigned sequentially by a single
-/// decoder thread and each maps to `[seq * chunk_size .. seq * chunk_size + n_cols]`.
+/// IO thread and each maps to `[seq * chunk_size .. seq * chunk_size + n_cols]`.
 pub struct DisjointRowWriter {
     ptr: *mut f64,
     n_rows: usize,
@@ -138,14 +141,41 @@ pub fn subset_indices(subset: &SubsetSpec, n_snps: usize) -> Vec<usize> {
     }
 }
 
-/// Stream SNP chunks through a fixed pool of `n_workers + 1` pre-allocated SnpBlock buffers,
-/// with 1 decoder thread and `n_workers` worker threads connected via crossbeam bounded channels.
+/// Copy raw packed bytes for `chunk_indices` from mmap into `dst`.
+///
+/// SNP `i` within the chunk is stored at `dst[i * bps .. (i+1) * bps]`.
+/// For contiguous index ranges (the common case with SubsetSpec::All) this
+/// collapses into a single memcpy.
+fn copy_raw_chunk(mmap_data: &[u8], bps: usize, chunk_indices: &[usize], dst: &mut [u8]) {
+    let n_cols = chunk_indices.len();
+    let contiguous = n_cols > 1
+        && chunk_indices[n_cols - 1] - chunk_indices[0] == n_cols - 1;
+
+    if contiguous || n_cols == 1 {
+        let start = chunk_indices[0] * bps;
+        let len = n_cols * bps;
+        dst[..len].copy_from_slice(&mmap_data[start..start + len]);
+    } else {
+        for (i, &snp_idx) in chunk_indices.iter().enumerate() {
+            let src_start = snp_idx * bps;
+            let dst_start = i * bps;
+            dst[dst_start..dst_start + bps]
+                .copy_from_slice(&mmap_data[src_start..src_start + bps]);
+        }
+    }
+}
+
+/// Stream SNP chunks through a pool of pre-allocated SnpBlock buffers,
+/// with 1 IO thread and `n_workers` worker threads connected via crossbeam channels.
+///
+/// Architecture:
+/// - **IO thread**: copies raw packed bytes from the mmap sequentially into buffers.
+///   This keeps disk reads in order (important for spinning disks and readahead).
+/// - **Worker threads**: decode the raw 2-bit→f64 data, then call `process_fn`.
+///   Decode is CPU-bound and benefits from parallelization across workers.
 ///
 /// Uses `std::thread::scope` so that `process_fn` can borrow from the caller's stack
 /// without requiring `'static` bounds.
-///
-/// The decoder thread reads SNP data into free buffers and sends them to workers.
-/// Workers call `process_fn` on each filled block, then return the block to the free pool.
 pub fn parallel_stream<F>(
     bed: &BedFile,
     subset: &SubsetSpec,
@@ -162,6 +192,11 @@ pub fn parallel_stream<F>(
     let mmap_data = &bed.mmap[3..]; // skip 3-byte magic header
 
     let pool_size = n_workers + 1;
+    let raw_buf_size = chunk_size * bps;
+
+    // Pre-compute local indices [0, 1, ..., chunk_size-1] for decode_bed_chunk_into.
+    // After the IO thread packs raw bytes contiguously, SNP i is at offset i*bps.
+    let local_indices: Vec<usize> = (0..chunk_size).collect();
 
     // Create channels
     let (free_tx, free_rx) = crossbeam_channel::bounded::<SnpBlock>(pool_size);
@@ -174,22 +209,19 @@ pub fn parallel_stream<F>(
                 data: Array2::<f64>::zeros((n_samples, chunk_size)),
                 n_cols: 0,
                 seq: 0,
+                raw: vec![0u8; raw_buf_size],
             })
             .unwrap();
     }
 
     std::thread::scope(|s| {
-        // Decoder thread: reads chunks from mmap, fills blocks, sends to workers
+        // IO thread: copies raw bytes from mmap sequentially, sends to workers
         s.spawn(|| {
             for (seq, chunk_indices) in indices.chunks(chunk_size).enumerate() {
                 let mut block = free_rx.recv().unwrap();
                 let n_cols = chunk_indices.len();
 
-                // Decode into the pre-allocated buffer
-                let out_view = block
-                    .data
-                    .slice_mut(ndarray::s![.., ..n_cols]);
-                decode_bed_chunk_into(mmap_data, bps, n_samples, chunk_indices, out_view);
+                copy_raw_chunk(mmap_data, bps, chunk_indices, &mut block.raw);
 
                 block.n_cols = n_cols;
                 block.seq = seq;
@@ -199,15 +231,26 @@ pub fn parallel_stream<F>(
             drop(filled_tx);
         });
 
-        // Worker threads: receive filled blocks, process, return to free pool
+        // Worker threads: decode raw bytes → f64, then call process_fn
         for worker_id in 0..n_workers {
             let filled_rx = filled_rx.clone();
             let free_tx = free_tx.clone();
             let process_fn = &process_fn;
+            let local_indices = &local_indices;
             s.spawn(move || {
-                while let Ok(block) = filled_rx.recv() {
+                while let Ok(mut block) = filled_rx.recv() {
+                    // Decode: raw packed bytes → centered/scaled f64 matrix
+                    let n_cols = block.n_cols;
+                    let out_view = block.data.slice_mut(ndarray::s![.., ..n_cols]);
+                    decode_bed_chunk_into(
+                        &block.raw,
+                        bps,
+                        n_samples,
+                        &local_indices[..n_cols],
+                        out_view,
+                    );
+
                     process_fn(worker_id, &block);
-                    // Return block to free pool (ignore error if decoder is done)
                     let _ = free_tx.send(block);
                 }
             });

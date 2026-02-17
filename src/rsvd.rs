@@ -155,7 +155,7 @@ pub fn estimate_factors_streaming(
 /// Compute the thin QR factorization and return Q.
 ///
 /// For a matrix A (m × n), returns Q (m × min(m, n)).
-fn qr_q(a: &Array2<f64>) -> Array2<f64> {
+pub fn qr_q(a: &Array2<f64>) -> Array2<f64> {
     let m = a.nrows();
     let n = a.ncols();
     let k = m.min(n);
