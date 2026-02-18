@@ -9,6 +9,7 @@ use ndarray::Array2;
 use ndarray_linalg::SVD;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 /// Tier 1: Quick test — small simulation for basic correctness.
 /// n=200, p=10_000, K=3, d=2 (r²≈0.3), 20 causal SNPs
@@ -171,6 +172,147 @@ fn test_reproducibility() {
         );
     }
     assert!((r1.gif - r2.gif).abs() < 1e-15);
+}
+
+/// Different seeds should produce different but statistically similar results.
+///
+/// "Different" means the p-values are not bitwise identical (the RNG sketch
+/// in RSVD genuinely changes the random projection matrix Omega).
+/// "Similar" means the Spearman rank correlation between the two p-value
+/// vectors is high (> 0.9) — both runs recover approximately the same
+/// signal, just via different random projections.
+#[test]
+fn test_different_seeds_differ() {
+    let sim_config = SimConfig {
+        n_samples: 100,
+        n_snps: 1_000,
+        n_causal: 5,
+        k: 2,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 99,
+    };
+
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+    let base_config = Lfmm2Config {
+        k: 2,
+        lambda: 1e-5,
+        chunk_size: 500,
+        oversampling: 5,
+        n_power_iter: 1,
+        seed: 42,
+        n_workers: 0,
+        progress: false,
+    };
+
+    let r1 = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &base_config, None).unwrap();
+
+    let alt_config = Lfmm2Config {
+        seed: 999,
+        ..base_config
+    };
+    let r2 = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &alt_config, None).unwrap();
+
+    let p = sim_config.n_snps;
+    let d = sim_config.d;
+
+    // 1. Results must NOT be identical — at least some p-values should differ
+    let mut n_differ = 0;
+    let mut max_diff = 0.0f64;
+    for i in 0..p {
+        for j in 0..d {
+            let diff = (r1.p_values[(i, j)] - r2.p_values[(i, j)]).abs();
+            if diff > 1e-15 {
+                n_differ += 1;
+            }
+            max_diff = max_diff.max(diff);
+        }
+    }
+    eprintln!(
+        "Different seeds: {}/{} p-values differ, max_diff={:.2e}",
+        n_differ, p * d, max_diff,
+    );
+    assert!(
+        n_differ > 0,
+        "Different seeds produced identical p-values — RNG seed is not taking effect",
+    );
+
+    // 2. Results should be similar: high Spearman rank correlation per covariate
+    for j in 0..d {
+        let mut v1: Vec<f64> = (0..p).map(|i| r1.p_values[(i, j)]).collect();
+        let mut v2: Vec<f64> = (0..p).map(|i| r2.p_values[(i, j)]).collect();
+        let rho = spearman_rank_corr(&mut v1, &mut v2);
+        eprintln!("  Covariate {}: Spearman rho = {:.4}", j, rho);
+        assert!(
+            rho > 0.9,
+            "Spearman correlation too low for covariate {}: {:.4} (expected > 0.9)",
+            j, rho,
+        );
+    }
+
+    // 3. GIF values should be close but not identical
+    let gif_diff = (r1.gif - r2.gif).abs();
+    eprintln!("  GIF diff: {:.4e} ({:.4} vs {:.4})", gif_diff, r1.gif, r2.gif);
+    assert!(
+        r2.gif > 0.5 && r2.gif < 2.0,
+        "GIF out of range with alt seed: {:.4}",
+        r2.gif,
+    );
+}
+
+/// Compute Spearman rank correlation between two equal-length slices.
+/// Mutates the inputs (for ranking).
+fn spearman_rank_corr(a: &mut [f64], b: &mut [f64]) -> f64 {
+    let n = a.len();
+    assert_eq!(n, b.len());
+
+    let rank_a = ranks(a);
+    let rank_b = ranks(b);
+
+    // Pearson correlation of ranks
+    let mean_a: f64 = rank_a.iter().sum::<f64>() / n as f64;
+    let mean_b: f64 = rank_b.iter().sum::<f64>() / n as f64;
+
+    let mut cov = 0.0;
+    let mut var_a = 0.0;
+    let mut var_b = 0.0;
+    for i in 0..n {
+        let da = rank_a[i] - mean_a;
+        let db = rank_b[i] - mean_b;
+        cov += da * db;
+        var_a += da * da;
+        var_b += db * db;
+    }
+    cov / (var_a * var_b).sqrt()
+}
+
+/// Assign ranks to values (average rank for ties).
+fn ranks(vals: &mut [f64]) -> Vec<f64> {
+    let n = vals.len();
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&i, &j| vals[i].partial_cmp(&vals[j]).unwrap());
+
+    let mut result = vec![0.0; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && vals[idx[j]] == vals[idx[i]] {
+            j += 1;
+        }
+        let avg_rank = (i + j + 1) as f64 / 2.0;
+        for k in i..j {
+            result[idx[k]] = avg_rank;
+        }
+        i = j;
+    }
+    result
 }
 
 fn validate_results(
@@ -692,4 +834,415 @@ fn test_output_config_writes_results() {
 
     // GIF should match the in-memory result
     assert!(results.gif > 0.5 && results.gif < 3.0);
+}
+
+// ---------------------------------------------------------------------------
+// CLI end-to-end tests
+// ---------------------------------------------------------------------------
+
+/// Path to the compiled binary under test.
+fn lfmm2_bin() -> std::path::PathBuf {
+    // cargo test builds binaries into target/debug (or target/release with --release)
+    let mut path = std::env::current_exe()
+        .unwrap()
+        .parent()  // deps/
+        .unwrap()
+        .parent()  // debug/ or release/
+        .unwrap()
+        .to_path_buf();
+    path.push("lfmm2");
+    path
+}
+
+/// Set up a temp directory with simulated PLINK + covariate files for CLI tests.
+/// Returns (tempdir, bed_path, cov_path).
+fn cli_test_fixtures() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let sim_config = SimConfig {
+        n_samples: 50,
+        n_snps: 500,
+        n_causal: 5,
+        k: 2,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 9999,
+    };
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    write_covariates(&dir.path().join("cov.tsv"), &sim.x).unwrap();
+    let bed_path = dir.path().join("sim.bed");
+    let cov_path = dir.path().join("cov.tsv");
+    (dir, bed_path, cov_path)
+}
+
+/// Valid run: basic invocation with required args produces output files.
+#[test]
+fn test_cli_basic_run() {
+    let (dir, bed, cov) = cli_test_fixtures();
+    let out_prefix = dir.path().join("out");
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", cov.to_str().unwrap(),
+            "-k", "2",
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(
+        output.status.success(),
+        "CLI exited with error:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Check that output files exist
+    let tsv_path = dir.path().join("out.tsv");
+    let summary_path = dir.path().join("out.summary.txt");
+    assert!(tsv_path.exists(), "Missing output TSV");
+    assert!(summary_path.exists(), "Missing summary file");
+
+    // TSV should have header + 500 SNP rows
+    let content = fs::read_to_string(&tsv_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 501, "Expected 1 header + 500 data rows");
+
+    // Summary should contain GIF
+    let summary = fs::read_to_string(&summary_path).unwrap();
+    assert!(summary.contains("GIF:"), "Summary missing GIF");
+    assert!(summary.contains("n_samples: 50"), "Summary missing n_samples");
+    assert!(summary.contains("n_snps: 500"), "Summary missing n_snps");
+}
+
+/// Valid run with --est-rate for subset estimation.
+#[test]
+fn test_cli_est_rate() {
+    let (dir, bed, cov) = cli_test_fixtures();
+    let out_prefix = dir.path().join("out_rate");
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", cov.to_str().unwrap(),
+            "-k", "2",
+            "--est-rate", "0.5",
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(
+        output.status.success(),
+        "CLI with --est-rate failed:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Output should still cover all 500 SNPs
+    let tsv_path = dir.path().join("out_rate.tsv");
+    let content = fs::read_to_string(&tsv_path).unwrap();
+    assert_eq!(content.lines().count(), 501);
+}
+
+/// Valid run with optional flags: lambda, chunk-size, seed, power-iter, oversampling.
+#[test]
+fn test_cli_optional_flags() {
+    let (dir, bed, cov) = cli_test_fixtures();
+    let out_prefix = dir.path().join("out_opts");
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", cov.to_str().unwrap(),
+            "-k", "3",
+            "-l", "0.01",
+            "--chunk-size", "100",
+            "--seed", "123",
+            "--power-iter", "1",
+            "--oversampling", "5",
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(
+        output.status.success(),
+        "CLI with optional flags failed:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let summary = fs::read_to_string(dir.path().join("out_opts.summary.txt")).unwrap();
+    assert!(summary.contains("K: 3"));
+    assert!(summary.contains("lambda: 0.01"));
+}
+
+/// Invalid: missing required --bed argument.
+#[test]
+fn test_cli_missing_bed() {
+    let output = Command::new(lfmm2_bin())
+        .args(["-c", "/dev/null", "-k", "2"])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("required") || stderr.contains("--bed"),
+        "Expected error about missing --bed, got: {}",
+        stderr,
+    );
+}
+
+/// Invalid: missing required --cov argument.
+#[test]
+fn test_cli_missing_cov() {
+    let (dir, bed, _cov) = cli_test_fixtures();
+
+    let output = Command::new(lfmm2_bin())
+        .args(["-b", bed.to_str().unwrap(), "-k", "2"])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("required") || stderr.contains("--cov"),
+        "Expected error about missing --cov, got: {}",
+        stderr,
+    );
+    drop(dir);
+}
+
+/// Invalid: missing required -k argument.
+#[test]
+fn test_cli_missing_k() {
+    let (dir, bed, cov) = cli_test_fixtures();
+
+    let output = Command::new(lfmm2_bin())
+        .args(["-b", bed.to_str().unwrap(), "-c", cov.to_str().unwrap()])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    drop(dir);
+}
+
+/// Invalid: nonexistent bed file.
+#[test]
+fn test_cli_nonexistent_bed() {
+    let output = Command::new(lfmm2_bin())
+        .args(["-b", "/tmp/does_not_exist.bed", "-c", "/dev/null", "-k", "2"])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to open") || stderr.contains("No such file"),
+        "Expected file-not-found error, got: {}",
+        stderr,
+    );
+}
+
+/// Invalid: nonexistent covariate file.
+#[test]
+fn test_cli_nonexistent_cov() {
+    let (dir, bed, _cov) = cli_test_fixtures();
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", "/tmp/does_not_exist.tsv",
+            "-k", "2",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to open") || stderr.contains("No such file"),
+        "Expected file-not-found error, got: {}",
+        stderr,
+    );
+    drop(dir);
+}
+
+/// Invalid: covariate file with wrong sample IDs.
+#[test]
+fn test_cli_cov_sample_mismatch() {
+    let (dir, bed, _cov) = cli_test_fixtures();
+
+    // Write a covariate file with wrong sample IDs
+    let bad_cov = dir.path().join("bad_cov.tsv");
+    let mut f = fs::File::create(&bad_cov).unwrap();
+    use std::io::Write;
+    writeln!(f, "sample_id\tenv_0\tenv_1").unwrap();
+    writeln!(f, "WRONG_ID\t0.5\t-0.3").unwrap();
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", bad_cov.to_str().unwrap(),
+            "-k", "2",
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found in covariate file"),
+        "Expected sample mismatch error, got: {}",
+        stderr,
+    );
+}
+
+/// Invalid: covariate file with non-numeric values.
+#[test]
+fn test_cli_cov_non_numeric() {
+    let (dir, bed, _cov) = cli_test_fixtures();
+
+    let bad_cov = dir.path().join("bad_cov.tsv");
+    let mut f = fs::File::create(&bad_cov).unwrap();
+    use std::io::Write;
+    writeln!(f, "sample_id\tenv_0\tenv_1").unwrap();
+    writeln!(f, "IND0\tNOTANUMBER\t0.5").unwrap();
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", bad_cov.to_str().unwrap(),
+            "-k", "2",
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to parse"),
+        "Expected parse error, got: {}",
+        stderr,
+    );
+}
+
+/// Invalid: --est-rate out of range.
+#[test]
+fn test_cli_est_rate_out_of_range() {
+    let (_dir, bed, cov) = cli_test_fixtures();
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", cov.to_str().unwrap(),
+            "-k", "2",
+            "--est-rate", "5.0",
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("est-rate"),
+        "Expected est-rate validation error, got: {}",
+        stderr,
+    );
+}
+
+/// Invalid: covariate file with only a header (no data rows).
+#[test]
+fn test_cli_cov_empty_data() {
+    let (dir, bed, _cov) = cli_test_fixtures();
+
+    let bad_cov = dir.path().join("empty_cov.tsv");
+    let mut f = fs::File::create(&bad_cov).unwrap();
+    use std::io::Write;
+    writeln!(f, "sample_id\tenv_0\tenv_1").unwrap();
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", bad_cov.to_str().unwrap(),
+            "-k", "2",
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no data rows"),
+        "Expected empty data error, got: {}",
+        stderr,
+    );
+}
+
+/// CSV delimiter auto-detection: .csv extension uses comma separator.
+#[test]
+fn test_cli_csv_covariates() {
+    let sim_config = SimConfig {
+        n_samples: 50,
+        n_snps: 500,
+        n_causal: 5,
+        k: 2,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 9999,
+    };
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+
+    // Write a CSV covariate file (comma-separated)
+    let csv_path = dir.path().join("cov.csv");
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&csv_path).unwrap();
+        let d = sim.x.ncols();
+        let header: Vec<String> = (0..d).map(|j| format!("env_{}", j)).collect();
+        writeln!(f, "sample_id,{}", header.join(",")).unwrap();
+        for i in 0..sim.x.nrows() {
+            let vals: Vec<String> = (0..d).map(|j| format!("{:.6}", sim.x[(i, j)])).collect();
+            writeln!(f, "IND{},{}", i, vals.join(",")).unwrap();
+        }
+    }
+
+    let bed = dir.path().join("sim.bed");
+    let out_prefix = dir.path().join("out_csv");
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", csv_path.to_str().unwrap(),
+            "-k", "2",
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(
+        output.status.success(),
+        "CLI with CSV covariates failed:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let tsv_path = dir.path().join("out_csv.tsv");
+    assert_eq!(fs::read_to_string(&tsv_path).unwrap().lines().count(), 501);
 }

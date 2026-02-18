@@ -386,11 +386,51 @@ fn median_sorted(sorted: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_abs_diff_eq;
+    use ndarray::array;
 
     #[test]
     fn test_median() {
         assert!((median_sorted(&[1.0, 2.0, 3.0]) - 2.0).abs() < 1e-10);
         assert!((median_sorted(&[1.0, 2.0, 3.0, 4.0]) - 2.5).abs() < 1e-10);
         assert!((median_sorted(&[5.0]) - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_safe_inv_positive_definite() {
+        // A = [[2, 1], [1, 3]] — symmetric positive definite (eigenvalues ~1.38, 3.62)
+        let a = array![[2.0, 1.0], [1.0, 3.0]];
+        let inv = safe_inv(&a, "test_pd").unwrap();
+
+        // A @ A^{-1} should be I
+        let product = a.dot(&inv);
+        for i in 0..2 {
+            for j in 0..2 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert_abs_diff_eq!(product[(i, j)], expected, epsilon = 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn test_safe_inv_singular() {
+        // Rank-1 matrix: all rows are multiples of [1, 2] → singular
+        let a = array![[1.0, 2.0], [2.0, 4.0]];
+        let inv = safe_inv(&a, "test_singular").unwrap();
+
+        // With regularization (A + εI), the result should be approximately
+        // the pseudoinverse-like solution. Verify that (A + εI) @ inv ≈ I
+        // where ε = 1e-8 * max(diag(A)) = 1e-8 * 4.0
+        let eps = 1e-8 * 4.0;
+        let mut a_reg = a.clone();
+        a_reg[(0, 0)] += eps;
+        a_reg[(1, 1)] += eps;
+        let product = a_reg.dot(&inv);
+        for i in 0..2 {
+            for j in 0..2 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert_abs_diff_eq!(product[(i, j)], expected, epsilon = 1e-6);
+            }
+        }
     }
 }
