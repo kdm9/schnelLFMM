@@ -92,7 +92,7 @@ impl BedFile {
         }
 
         // Validate file size
-        let bytes_per_snp = (n_samples + 3) / 4;
+        let bytes_per_snp = n_samples.div_ceil(4);
         let expected_size = 3 + bytes_per_snp * n_snps;
         if mmap.len() != expected_size {
             bail!(
@@ -121,7 +121,7 @@ impl BedFile {
 
     /// Bytes per SNP in the .bed file (ceil(n_samples / 4))
     pub fn bytes_per_snp(&self) -> usize {
-        (self.n_samples + 3) / 4
+        self.n_samples.div_ceil(4)
     }
 
     /// Total number of SNPs that will be yielded by this subset
@@ -130,7 +130,7 @@ impl BedFile {
             SubsetSpec::All => self.n_snps,
             SubsetSpec::Rate(rate) => {
                 let step = (1.0 / rate).ceil() as usize;
-                (self.n_snps + step - 1) / step
+                self.n_snps.div_ceil(step)
             }
             SubsetSpec::Indices(indices) => indices.len(),
         }
@@ -140,7 +140,7 @@ impl BedFile {
 /// Decode a chunk of SNPs from .bed format into a centered f64 matrix.
 /// Missing values (0b01) are imputed to the per-SNP mean genotype, then centered.
 pub fn decode_bed_chunk(packed: &[u8], n_samples: usize, chunk_size: usize) -> Array2<f64> {
-    let bytes_per_snp = (n_samples + 3) / 4;
+    let bytes_per_snp = n_samples.div_ceil(4);
     let mut out = Array2::<f64>::zeros((n_samples, chunk_size));
 
     for snp in 0..chunk_size {
@@ -228,7 +228,7 @@ pub(crate) fn decode_single_snp(
 pub fn write_bed_file(path: &Path, genotypes: &Array2<u8>) -> Result<()> {
     let n_samples = genotypes.nrows();
     let n_snps = genotypes.ncols();
-    let bytes_per_snp = (n_samples + 3) / 4;
+    let bytes_per_snp = n_samples.div_ceil(4);
 
     let mut file = File::create(path)?;
     file.write_all(&BED_MAGIC)?;

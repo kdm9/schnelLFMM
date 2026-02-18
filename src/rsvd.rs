@@ -31,7 +31,7 @@ pub fn estimate_factors_streaming(
     let l = k + oversample; // sketch dimension
     let p_est = y_est.subset_snp_count(subset);
     let chunk_size = config.chunk_size;
-    let n_chunks = ((p_est + chunk_size - 1) / chunk_size) as u64;
+    let n_chunks = p_est.div_ceil(chunk_size) as u64;
     let show = config.progress;
 
     // Generate random sketch matrix Omega (n × l)

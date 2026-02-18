@@ -122,7 +122,7 @@ pub fn test_associations_fused(
 
     // Single fused pass over Y_full
     let subset = SubsetSpec::All;
-    let n_chunks = (p + chunk_size - 1) / chunk_size;
+    let n_chunks = p.div_ceil(chunk_size);
     let pb = make_progress_bar(n_chunks as u64, "Association tests", config.progress);
 
     {
@@ -376,7 +376,7 @@ fn median_sorted(sorted: &[f64]) -> f64 {
     if n == 0 {
         return 0.0;
     }
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     } else {
         sorted[n / 2]

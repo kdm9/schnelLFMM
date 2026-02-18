@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-use crossbeam_channel;
 use ndarray::Array2;
 use ndarray_linalg::{InverseInto, SVD};
 use rand::SeedableRng;
@@ -123,7 +122,7 @@ fn fs_type(path: &std::path::Path) -> String {
     }
     let label = best.1.to_string();
     if label == "tmpfs" {
-        format!("tmpfs -- IO times will be 0, use --tmpdir /path/on/disk")
+        "tmpfs -- IO times will be 0, use --tmpdir /path/on/disk".to_string()
     } else {
         label
     }
@@ -185,7 +184,6 @@ fn rss_mb() -> f64 {
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             let kb: f64 = rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|s| s.parse().ok())
@@ -510,7 +508,7 @@ fn median_sorted(sorted: &[f64]) -> f64 {
     if n == 0 {
         return 0.0;
     }
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     } else {
         sorted[n / 2]
