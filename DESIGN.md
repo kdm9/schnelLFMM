@@ -309,9 +309,8 @@ Note: if Y_est is an LD-pruned subset (e.g., 1% of SNPs), the first 6 passes rea
 └──────┬───────┬───────┬──────────┬───────────────────┘
        │       │       │          │
   ┌────▼───────▼───────▼──────────▼────────────────┐
-  │  decode_bed_chunk(): 2-bit → f64               │
-  │  impute missing (0b01) → per-SNP mean          │
-  │  center: subtract per-SNP mean                 │
+  │  IO thread: sequential memcpy from mmap        │
+  │  Workers: decode 2-bit → f64 + compute         │
   └────┬───────┬───────┬──────────┬────────────────┘
        │ Pass 1│ 2..2q+1│ Pass 2q+2│ Pass 2q+3
        │sketch │power it│ project  │ B + testing (fused)
@@ -326,23 +325,110 @@ Note: if Y_est is an LD-pruned subset (e.g., 1% of SNPs), the first 6 passes rea
 
 ### Parallel streaming engine
 
-Each pass uses `parallel_stream()`: 1 decoder thread + N worker threads connected
+Each pass uses `parallel_stream()`: 1 IO coordinator thread + N worker threads connected
 via bounded crossbeam channels with a pre-allocated buffer pool.
 
 ```
- Free buffer pool (N+1 pre-allocated SnpBlocks, each n_samples × chunk_size f64)
-        │
- [Decoder thread]  ─fills→  [bounded channel]  ─→  [Worker 0]
-                   ←returns─ [bounded channel]  ←─  [Worker 1]
-                                                 ←─  [Worker N-1]
+                      SnpBlock pool (N+1 pre-allocated blocks)
+                             │
+  ┌──────────────────────────▼──────────────────────────────────┐
+  │                                                             │
+  │  ┌──────────────┐    filled    ┌──────────────────────────┐ │
+  │  │  IO thread   │──────────────▶  Worker 0                │ │
+  │  │              │              │  1. decode raw→f64       │ │
+  │  │  Sequential  │    channel   │  2. process_fn(chunk)    │ │
+  │  │  memcpy from │              ├──────────────────────────┤ │
+  │  │  mmap into   │──────────────▶  Worker 1                │ │
+  │  │  block.raw   │              │  1. decode raw→f64       │ │
+  │  │              │              │  2. process_fn(chunk)    │ │
+  │  │              │    free      ├──────────────────────────┤ │
+  │  │              │◀──────────────  ...                     │ │
+  │  │              │   channel    ├──────────────────────────┤ │
+  │  │              │◀──────────────  Worker N-1              │ │
+  │  └──────────────┘              └──────────────────────────┘ │
+  │                                                             │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-- The decoder reads from the memory-mapped .bed file and decodes 2-bit → f64 into
-  pre-allocated buffers. It is the sole producer.
-- Workers receive filled blocks, perform per-chunk BLAS (single-threaded BLAS per worker,
-  `openblas_set_num_threads(1)`), and return blocks to the free pool.
-- Bounded channels of size N+1 provide natural backpressure.
-- Each worker receives a unique `worker_id` (0..N) from the spawn loop.
+#### IO thread (single, sequential)
+
+The IO thread is the sole producer. It iterates over SNP chunks **in order** and
+copies raw packed bytes from the memory-mapped .bed file into pre-allocated
+`SnpBlock.raw` buffers:
+
+```rust
+for (seq, chunk_indices) in indices.chunks(chunk_size).enumerate() {
+    let mut block = free_rx.recv().unwrap();      // grab a free buffer
+    copy_raw_chunk(mmap_data, bps, chunk_indices, &mut block.raw);
+    block.n_cols = chunk_indices.len();
+    block.seq = seq;
+    filled_tx.send(block).unwrap();               // hand to workers
+}
+```
+
+Sequential reads are critical for performance:
+- The mmap is opened with `MADV_SEQUENTIAL`, so the kernel prefetches ahead.
+- For `SubsetSpec::All` (the common case), chunk indices are contiguous, so
+  `copy_raw_chunk` collapses into a single `memcpy`.
+- For subsetted indices, each SNP is copied individually but source offsets
+  still increase monotonically, preserving readahead benefits.
+- Keeping IO on a single thread avoids out-of-order page faults that would
+  defeat the kernel's sequential readahead heuristic.
+
+The IO thread only touches raw bytes — no decoding. This keeps it fast and
+ensures it stays ahead of the workers on I/O-bound workloads.
+
+#### Worker threads (N parallel, decode + compute)
+
+Each worker receives filled blocks from the IO thread, performs two operations,
+then returns the block to the free pool:
+
+```rust
+while let Ok(mut block) = filled_rx.recv() {
+    // Step 1: Decode raw 2-bit packed bytes → centered, scaled f64
+    decode_bed_chunk_into(&block.raw, bps, n_samples, &local_indices[..n_cols], out_view);
+
+    // Step 2: Per-pass computation (matmul, OLS, t-test, etc.)
+    process_fn(worker_id, &block);
+
+    free_tx.send(block);  // return to pool
+}
+```
+
+**Decode** (`decode_bed_chunk_into`): For each SNP in the chunk, the 2-bit packed
+genotypes are unpacked to f64 values {0, 1, 2, NaN}, missing values imputed to the
+per-SNP mean, centered (subtract mean), and Eigenstrat-scaled (divide by
+`sqrt(2p(1-p))`). Since the IO thread packed raw bytes contiguously into `block.raw`,
+the decode uses sequential local indices `[0, 1, ..., n_cols-1]` — the SNP at
+position `i` in the chunk is at byte offset `i * bytes_per_snp` in `block.raw`.
+
+**Compute** (`process_fn`): The pass-specific closure that operates on the decoded
+f64 data. This is where the bulk of CPU time is spent (BLAS matmuls for RSVD passes,
+OLS regression + t-tests for the association testing pass).
+
+Moving decode to workers (rather than doing it on the IO thread) parallelizes the
+CPU-bound decode work across all N workers. This is especially beneficial when
+decode time is non-trivial relative to compute time.
+
+#### SnpBlock buffer pool
+
+Each `SnpBlock` contains:
+- `raw: Vec<u8>` — raw packed bytes copied from mmap by IO thread (`chunk_size * bytes_per_snp`)
+- `data: Array2<f64>` — pre-allocated decode target (`n_samples × chunk_size`)
+- `n_cols: usize` — actual columns used (last chunk may be smaller)
+- `seq: usize` — sequential chunk index assigned by IO thread
+
+The pool contains `N+1` blocks (one per worker + one in flight on the IO thread).
+Blocks circulate through: free pool → IO thread → filled channel → worker → free pool.
+Bounded channels provide natural backpressure — if workers are slow, the IO thread
+blocks on `free_rx.recv()` rather than buffering unboundedly.
+
+#### BLAS threading
+
+All BLAS operations (OpenBLAS/MKL) are forced single-threaded via
+`openblas_set_num_threads(1)`. The worker pool is the sole source of parallelism.
+This avoids nested parallelism (N workers × M BLAS threads) which would cause
+thread oversubscription and cache thrashing.
 
 ### Two write patterns
 
@@ -480,17 +566,19 @@ fn decode_bed_chunk(
 
 **Performance notes on decoding**:
 - The inner loop is trivially vectorizable with SIMD (lookup table on 8 genotypes at a time).
-- Decode cost is negligible vs. the BLAS matmul that follows (~0.1% of chunk time).
 - Missing rate in typical GWAS data is <1%, so branch misprediction is minimal.
-- Optional: apply unit-variance scaling by `1/sqrt(2*p*(1-p))` where p = mean/2 (allele freq),
-  as done in EIGENSTRAT-style analyses. The paper uses different scaling for GEA vs. EWAS.
+- Decode is parallelized across worker threads (each worker decodes its own chunk before
+  computing). This avoids a single-threaded decode bottleneck when chunk compute time is small.
+- Eigenstrat unit-variance scaling by `1/sqrt(2*p*(1-p))` where p = mean/2 (allele freq)
+  is applied during decode, preventing high-frequency SNPs from dominating PCA/SVD.
 
 ### File layout
 
 **Single PLINK .bed file** (standard): SNP-major layout, memory-mapped via
 `memmap2`. Chunk offset = `3 + chunk_start * bytes_per_snp` (3-byte .bed magic
-header). One dedicated decoder thread reads sequentially from the mmap, which
-plays well with the OS readahead on any filesystem (local NVMe, RAID HDD, NFS).
+header). A dedicated IO coordinator thread copies raw bytes sequentially from the
+mmap, which plays well with the OS readahead on any filesystem (local NVMe, RAID
+HDD, NFS). Worker threads then decode and process each chunk in parallel.
 
 Estimation subsets are supported via:
 - `--est-bed`: separate LD-pruned .bed file
@@ -515,8 +603,8 @@ Total I/O: ~2.7 TB
 At 3 GB/s NVMe: ~15 minutes
 ```
 
-- Decode overhead (2-bit → f64 + impute + center) is <1% of total time per chunk.
-- BLAS matmul on the decoded f64 chunk dominates compute.
+- Decode (2-bit → f64 + impute + center + Eigenstrat scale) runs on worker threads in
+  parallel, overlapped with IO. BLAS matmul on the decoded f64 chunk dominates compute.
 - Column-chunk size is tunable: larger = better BLAS throughput, smaller = less RAM.
   At chunk_size=1M SNPs: f64 chunk = n × 1M × 8 bytes = 80 GB (too large).
   At chunk_size=100k SNPs: f64 chunk = n × 100k × 8 = 8 GB (reasonable).
