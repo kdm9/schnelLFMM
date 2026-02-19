@@ -1,7 +1,7 @@
 use ndarray::Array2;
 use std::cell::UnsafeCell;
 
-use crate::bed::{decode_bed_chunk_into, BedFile, SubsetSpec};
+use crate::bed::{decode_bed_chunk_into, BedFile, SnpNorm, SubsetSpec};
 
 /// A pre-allocated buffer for a chunk of decoded SNP data.
 pub struct SnpBlock {
@@ -181,13 +181,16 @@ pub fn parallel_stream<F>(
     subset: &SubsetSpec,
     chunk_size: usize,
     n_workers: usize,
+    norm: SnpNorm,
     process_fn: F,
 ) where
     F: Fn(usize, &SnpBlock) + Send + Sync,
 {
     let n_workers = n_workers.max(1);
     let indices = subset_indices(subset, bed.n_snps);
-    let n_samples = bed.n_samples;
+    let n_output_samples = bed.n_samples;
+    let n_physical_samples = bed.n_physical_samples;
+    let sample_keep = bed.sample_keep.as_deref();
     let bps = bed.bytes_per_snp();
     let mmap_data = &bed.mmap[3..]; // skip 3-byte magic header
 
@@ -206,7 +209,7 @@ pub fn parallel_stream<F>(
     for _ in 0..pool_size {
         free_tx
             .send(SnpBlock {
-                data: Array2::<f64>::zeros((n_samples, chunk_size)),
+                data: Array2::<f64>::zeros((n_output_samples, chunk_size)),
                 n_cols: 0,
                 seq: 0,
                 raw: vec![0u8; raw_buf_size],
@@ -245,9 +248,11 @@ pub fn parallel_stream<F>(
                     decode_bed_chunk_into(
                         &block.raw,
                         bps,
-                        n_samples,
+                        n_physical_samples,
                         &local_indices[..n_cols],
                         out_view,
+                        norm,
+                        sample_keep,
                     );
 
                     process_fn(worker_id, &block);

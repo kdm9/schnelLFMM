@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use lfmm2::bed::{decode_bed_chunk_into, BedFile, SubsetSpec};
+use lfmm2::bed::{decode_bed_chunk_into, BedFile, SnpNorm, SubsetSpec};
 use lfmm2::parallel::{
     subset_indices, DisjointRowWriter, PerWorkerAccumulator, SnpBlock,
 };
@@ -386,6 +386,7 @@ fn profiled_stream<F>(
     subset: &SubsetSpec,
     chunk_size: usize,
     n_workers: usize,
+    norm: SnpNorm,
     stats: &StreamStats,
     process_fn: F,
 ) where
@@ -464,6 +465,8 @@ fn profiled_stream<F>(
                         n_samples,
                         &local_indices[..n_cols],
                         out_view,
+                        norm,
+                        None,
                     );
                     stats.add_decode_ns(t_dec.elapsed().as_nanos() as u64);
 
@@ -628,7 +631,7 @@ fn main() -> Result<()> {
     {
         let ss = StreamStats::new("Sketch", n_workers);
         let writer = DisjointRowWriter::new(&mut z);
-        profiled_stream(&bed, &subset, chunk_size, n_workers, &ss, |_wid, block| {
+        profiled_stream(&bed, &subset, chunk_size, n_workers, SnpNorm::Eigenstrat, &ss, |_wid, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let z_block = chunk.t().dot(&mt_omega);
             unsafe { writer.write_rows(block.seq * chunk_size, &z_block); }
@@ -655,7 +658,7 @@ fn main() -> Result<()> {
             let label = format!("Power {} fwd", iter + 1);
             let ss = StreamStats::new(&label, n_workers);
             let acc = PerWorkerAccumulator::new(n_workers, (n, l));
-            profiled_stream(&bed, &subset, chunk_size, n_workers, &ss, |wid, block| {
+            profiled_stream(&bed, &subset, chunk_size, n_workers, SnpNorm::Eigenstrat, &ss, |wid, block| {
                 let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
                 let offset = block.seq * chunk_size;
                 let q_z_block = q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
@@ -689,7 +692,7 @@ fn main() -> Result<()> {
             let label = format!("Power {} bwd", iter + 1);
             let ss = StreamStats::new(&label, n_workers);
             let writer = DisjointRowWriter::new(&mut z);
-            profiled_stream(&bed, &subset, chunk_size, n_workers, &ss, |_wid, block| {
+            profiled_stream(&bed, &subset, chunk_size, n_workers, SnpNorm::Eigenstrat, &ss, |_wid, block| {
                 let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
                 let z_block = chunk.t().dot(&mt_q);
                 unsafe { writer.write_rows(block.seq * chunk_size, &z_block); }
@@ -714,7 +717,7 @@ fn main() -> Result<()> {
     {
         let ss = StreamStats::new("Final project", n_workers);
         let acc = PerWorkerAccumulator::new(n_workers, (n, l));
-        profiled_stream(&bed, &subset, chunk_size, n_workers, &ss, |wid, block| {
+        profiled_stream(&bed, &subset, chunk_size, n_workers, SnpNorm::Eigenstrat, &ss, |wid, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let offset = block.seq * chunk_size;
             let q_z_block = q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
@@ -780,7 +783,7 @@ fn main() -> Result<()> {
         let ss = StreamStats::new("Assoc test", n_workers);
         let wr_effects = DisjointRowWriter::new(&mut effect_sizes);
         let wr_tstats = DisjointRowWriter::new(&mut t_stats);
-        profiled_stream(&bed, &SubsetSpec::All, chunk_size, n_workers, &ss, |_wid, block| {
+        profiled_stream(&bed, &SubsetSpec::All, chunk_size, n_workers, SnpNorm::Eigenstrat, &ss, |_wid, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let chunk_cols = block.n_cols;
             let start = block.seq * chunk_size;

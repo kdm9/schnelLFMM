@@ -4,7 +4,7 @@ use lfmm2::simulate::{
     simulate, write_covariates, write_ground_truth, write_latent_u, write_lfmm_format,
     write_plink, write_r_comparison_script, SimConfig,
 };
-use lfmm2::{fit_lfmm2, Lfmm2Config, OutputConfig};
+use lfmm2::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
 use ndarray::Array2;
 use ndarray_linalg::SVD;
 use std::fs;
@@ -37,6 +37,7 @@ fn test_lfmm2_quick() {
         seed: 42,
         n_workers: 0,
         progress: false,
+        norm: SnpNorm::Eigenstrat,
     };
 
     // Simulate
@@ -85,6 +86,7 @@ fn test_lfmm2_large() {
         seed: 42,
         n_workers: 0,
         progress: false,
+        norm: SnpNorm::Eigenstrat,
     };
 
     // Simulate
@@ -147,6 +149,7 @@ fn test_reproducibility() {
         seed: 42,
         n_workers: 0,
         progress: false,
+        norm: SnpNorm::Eigenstrat,
     };
 
     let sim = simulate(&sim_config);
@@ -210,6 +213,7 @@ fn test_different_seeds_differ() {
         seed: 42,
         n_workers: 0,
         progress: false,
+        norm: SnpNorm::Eigenstrat,
     };
 
     let r1 = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &base_config, None).unwrap();
@@ -462,6 +466,7 @@ fn test_parallel_matches_sequential() {
         seed: 42,
         n_workers: 0,
         progress: false,
+        norm: SnpNorm::Eigenstrat,
     };
     let r_seq = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_seq, None).unwrap();
 
@@ -648,6 +653,7 @@ fn test_subset_rate_end_to_end() {
         seed: 42,
         n_workers: 0,
         progress: false,
+        norm: SnpNorm::Eigenstrat,
     };
 
     let sim = simulate(&sim_config);
@@ -707,6 +713,7 @@ fn test_subset_indices_end_to_end() {
         seed: 42,
         n_workers: 0,
         progress: false,
+        norm: SnpNorm::Eigenstrat,
     };
 
     let sim = simulate(&sim_config);
@@ -771,6 +778,7 @@ fn test_output_config_writes_results() {
         seed: 42,
         n_workers: 0,
         progress: false,
+        norm: SnpNorm::Eigenstrat,
     };
 
     let sim = simulate(&sim_config);
@@ -1245,4 +1253,491 @@ fn test_cli_csv_covariates() {
 
     let tsv_path = dir.path().join("out_csv.tsv");
     assert_eq!(fs::read_to_string(&tsv_path).unwrap().lines().count(), 501);
+}
+
+// ---------------------------------------------------------------------------
+// SNP normalization mode tests
+// ---------------------------------------------------------------------------
+
+/// End-to-end: all 3 normalization modes produce valid results on the same simulation,
+/// and the modes produce different (but correlated) p-values.
+#[test]
+fn test_normalization_modes_end_to_end() {
+    let sim_config = SimConfig {
+        n_samples: 200,
+        n_snps: 10_000,
+        n_causal: 20,
+        k: 3,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 77700,
+    };
+
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+    let modes = [SnpNorm::CenterOnly, SnpNorm::Eigenstrat, SnpNorm::Hwe];
+    let mut results = Vec::new();
+
+    for &mode in &modes {
+        let config = Lfmm2Config {
+            k: 3,
+            lambda: 1e-5,
+            chunk_size: 2_000,
+            oversampling: 10,
+            n_power_iter: 2,
+            seed: 42,
+            n_workers: 0,
+            progress: false,
+            norm: mode,
+        };
+        let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
+
+        // Each mode should produce a valid GIF
+        assert!(
+            r.gif > 0.3 && r.gif < 5.0,
+            "GIF out of range for {:?}: {:.4}",
+            mode,
+            r.gif,
+        );
+        // Output dimensions must match
+        assert_eq!(r.p_values.nrows(), sim_config.n_snps);
+        assert_eq!(r.p_values.ncols(), sim_config.d);
+
+        results.push(r);
+    }
+
+    // Modes should produce different results
+    let p = sim_config.n_snps;
+    for i in 0..modes.len() {
+        for j in (i + 1)..modes.len() {
+            let mut n_differ = 0;
+            for snp in 0..p {
+                if (results[i].p_values[(snp, 0)] - results[j].p_values[(snp, 0)]).abs() > 1e-10 {
+                    n_differ += 1;
+                }
+            }
+            assert!(
+                n_differ > 0,
+                "Modes {:?} and {:?} produced identical p-values",
+                modes[i],
+                modes[j],
+            );
+        }
+    }
+
+    // High Spearman correlation between modes (all should recover similar signal)
+    for i in 0..modes.len() {
+        for j in (i + 1)..modes.len() {
+            let mut v1: Vec<f64> = (0..p).map(|s| results[i].p_values[(s, 0)]).collect();
+            let mut v2: Vec<f64> = (0..p).map(|s| results[j].p_values[(s, 0)]).collect();
+            let rho = spearman_rank_corr(&mut v1, &mut v2);
+            eprintln!(
+                "Spearman({:?}, {:?}) = {:.4}",
+                modes[i], modes[j], rho,
+            );
+            assert!(
+                rho > 0.8,
+                "Low correlation between {:?} and {:?}: {:.4}",
+                modes[i],
+                modes[j],
+                rho,
+            );
+        }
+    }
+}
+
+/// CLI: --norm flag accepts all 3 valid values.
+#[test]
+fn test_cli_norm_flag() {
+    let (dir, bed, cov) = cli_test_fixtures();
+
+    for mode in &["center-only", "eigenstrat", "hwe"] {
+        let out_prefix = dir.path().join(format!("out_{}", mode));
+        let output = Command::new(lfmm2_bin())
+            .args([
+                "-b", bed.to_str().unwrap(),
+                "-c", cov.to_str().unwrap(),
+                "-k", "2",
+                "--norm", mode,
+                "-o", out_prefix.to_str().unwrap(),
+                "-t", "1",
+            ])
+            .output()
+            .expect("failed to execute lfmm2 binary");
+
+        assert!(
+            output.status.success(),
+            "CLI with --norm {} failed:\nstderr: {}",
+            mode,
+            String::from_utf8_lossy(&output.stderr),
+        );
+
+        let tsv_path = std::path::PathBuf::from(format!("{}.tsv", out_prefix.display()));
+        assert!(tsv_path.exists(), "Missing output TSV for --norm {}", mode);
+    }
+}
+
+/// CLI: --norm with an invalid value should fail.
+#[test]
+fn test_cli_norm_invalid() {
+    let (dir, bed, cov) = cli_test_fixtures();
+    let out_prefix = dir.path().join("out_bad");
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", cov.to_str().unwrap(),
+            "-k", "2",
+            "--norm", "garbage",
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(
+        !output.status.success(),
+        "CLI should fail with --norm garbage",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid value") || stderr.contains("possible values"),
+        "Expected clap validation error, got: {}",
+        stderr,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --intersect-samples tests
+// ---------------------------------------------------------------------------
+
+/// Helper: write a covariate file with the given sample IDs and values.
+fn write_cov_file(path: &Path, sample_ids: &[&str], n_covs: usize, seed: u64) {
+    use std::io::Write;
+    let mut f = fs::File::create(path).unwrap();
+    let header: Vec<String> = (0..n_covs).map(|j| format!("env_{}", j)).collect();
+    writeln!(f, "sample_id\t{}", header.join("\t")).unwrap();
+    for (i, id) in sample_ids.iter().enumerate() {
+        let vals: Vec<String> = (0..n_covs)
+            .map(|j| format!("{:.6}", ((seed as f64 + i as f64 + j as f64) * 0.1).sin()))
+            .collect();
+        writeln!(f, "{}\t{}", id, vals.join("\t")).unwrap();
+    }
+}
+
+/// --intersect-samples with covariate file containing a subset of FAM samples
+/// plus extra samples not in FAM. Should succeed and output correct dimensions.
+#[test]
+fn test_cli_intersect_samples() {
+    let sim_config = SimConfig {
+        n_samples: 50,
+        n_snps: 500,
+        n_causal: 5,
+        k: 2,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 9999,
+    };
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+
+    // Write a covariate file with only 30 of the 50 FAM samples + 5 extra
+    let mut cov_ids: Vec<String> = (0..30).map(|i| format!("IND{}", i)).collect();
+    cov_ids.extend((100..105).map(|i| format!("EXTRA{}", i)));
+    let cov_strs: Vec<&str> = cov_ids.iter().map(|s| s.as_str()).collect();
+    let cov_path = dir.path().join("partial_cov.tsv");
+    write_cov_file(&cov_path, &cov_strs, 2, 42);
+
+    let bed_path = dir.path().join("sim.bed");
+    let out_prefix = dir.path().join("out_intersect");
+
+    // Without --intersect-samples: should fail
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed_path.to_str().unwrap(),
+            "-c", cov_path.to_str().unwrap(),
+            "-k", "2",
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+    assert!(
+        !output.status.success(),
+        "Should fail without --intersect-samples:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // With --intersect-samples: should succeed
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed_path.to_str().unwrap(),
+            "-c", cov_path.to_str().unwrap(),
+            "-k", "2",
+            "--intersect-samples",
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+    assert!(
+        output.status.success(),
+        "Should succeed with --intersect-samples:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Output should still cover all 500 SNPs
+    let tsv_path = dir.path().join("out_intersect.tsv");
+    let content = fs::read_to_string(&tsv_path).unwrap();
+    assert_eq!(content.lines().count(), 501, "Expected header + 500 SNP rows");
+
+    // Summary should reflect 30 samples (the intersection)
+    let summary = fs::read_to_string(dir.path().join("out_intersect.summary.txt")).unwrap();
+    assert!(summary.contains("n_samples: 30"), "Expected 30 samples, got:\n{}", summary);
+}
+
+/// --intersect-samples with completely disjoint samples should error.
+#[test]
+fn test_cli_intersect_samples_no_overlap() {
+    let (dir, bed, _cov) = cli_test_fixtures();
+
+    let cov_path = dir.path().join("disjoint_cov.tsv");
+    write_cov_file(&cov_path, &["NOPE1", "NOPE2", "NOPE3"], 2, 42);
+
+    let out_prefix = dir.path().join("out_disjoint");
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", cov_path.to_str().unwrap(),
+            "-k", "2",
+            "--intersect-samples",
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No samples in common"),
+        "Expected 'No samples in common' error, got: {}",
+        stderr,
+    );
+}
+
+/// est-bed with same samples but different order should work (auto-reorder).
+#[test]
+fn test_cli_est_bed_sample_identity() {
+    let sim_config = SimConfig {
+        n_samples: 50,
+        n_snps: 500,
+        n_causal: 5,
+        k: 2,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 9999,
+    };
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    write_covariates(&dir.path().join("cov.tsv"), &sim.x).unwrap();
+
+    // Create est-bed with reversed sample order
+    let est_dir = dir.path().join("est");
+    fs::create_dir_all(&est_dir).unwrap();
+
+    // Reverse the genotype rows and fam records for the est-bed
+    let n = sim_config.n_samples;
+    let p = sim_config.n_snps;
+    let rev_order: Vec<usize> = (0..n).rev().collect();
+    let mut rev_geno = Array2::<u8>::zeros((n, p));
+    for (new_row, &old_row) in rev_order.iter().enumerate() {
+        for snp in 0..p {
+            rev_geno[(new_row, snp)] = sim.genotypes[(old_row, snp)];
+        }
+    }
+    lfmm2::bed::write_bed_file(&est_dir.join("est.bed"), &rev_geno).unwrap();
+
+    // Write reversed .fam
+    let rev_fam: Vec<lfmm2::bed::FamRecord> = rev_order.iter().map(|&i| {
+        lfmm2::bed::FamRecord {
+            fid: format!("FAM{}", i),
+            iid: format!("IND{}", i),
+            father: "0".to_string(),
+            mother: "0".to_string(),
+            sex: 0,
+            pheno: "-9".to_string(),
+        }
+    }).collect();
+    lfmm2::bed::write_fam(&est_dir.join("est.fam"), &rev_fam).unwrap();
+
+    // Write .bim (just copy the main bim records)
+    let main_bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+    lfmm2::bed::write_bim(&est_dir.join("est.bim"), &main_bed.bim_records).unwrap();
+
+    let bed_path = dir.path().join("sim.bed");
+    let cov_path = dir.path().join("cov.tsv");
+    let out_prefix = dir.path().join("out_est_reorder");
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed_path.to_str().unwrap(),
+            "-c", cov_path.to_str().unwrap(),
+            "-k", "2",
+            "--est-bed", est_dir.join("est.bed").to_str().unwrap(),
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(
+        output.status.success(),
+        "est-bed with reordered samples should succeed:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let tsv_path = dir.path().join("out_est_reorder.tsv");
+    assert_eq!(fs::read_to_string(&tsv_path).unwrap().lines().count(), 501);
+}
+
+/// est-bed with completely different sample IIDs should error.
+#[test]
+fn test_cli_est_bed_sample_mismatch() {
+    let sim_config = SimConfig {
+        n_samples: 50,
+        n_snps: 500,
+        n_causal: 5,
+        k: 2,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 9999,
+    };
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    write_covariates(&dir.path().join("cov.tsv"), &sim.x).unwrap();
+
+    // Create est-bed with wrong sample IDs
+    let est_dir = dir.path().join("est_bad");
+    fs::create_dir_all(&est_dir).unwrap();
+
+    lfmm2::bed::write_bed_file(&est_dir.join("est.bed"), &sim.genotypes).unwrap();
+
+    let wrong_fam: Vec<lfmm2::bed::FamRecord> = (0..sim_config.n_samples).map(|i| {
+        lfmm2::bed::FamRecord {
+            fid: format!("WRONG{}", i),
+            iid: format!("WRONG{}", i),
+            father: "0".to_string(),
+            mother: "0".to_string(),
+            sex: 0,
+            pheno: "-9".to_string(),
+        }
+    }).collect();
+    lfmm2::bed::write_fam(&est_dir.join("est.fam"), &wrong_fam).unwrap();
+
+    let main_bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+    lfmm2::bed::write_bim(&est_dir.join("est.bim"), &main_bed.bim_records).unwrap();
+
+    let bed_path = dir.path().join("sim.bed");
+    let cov_path = dir.path().join("cov.tsv");
+    let out_prefix = dir.path().join("out_est_bad");
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed_path.to_str().unwrap(),
+            "-c", cov_path.to_str().unwrap(),
+            "-k", "2",
+            "--est-bed", est_dir.join("est.bed").to_str().unwrap(),
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("est-bed is missing"),
+        "Expected 'est-bed is missing' error, got: {}",
+        stderr,
+    );
+}
+
+/// --intersect-samples with est-bed: both main and est-bed should be subsetted.
+#[test]
+fn test_cli_intersect_with_est_bed() {
+    let sim_config = SimConfig {
+        n_samples: 50,
+        n_snps: 500,
+        n_causal: 5,
+        k: 2,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 9999,
+    };
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+
+    // Covariate file with only first 30 samples
+    let cov_ids: Vec<String> = (0..30).map(|i| format!("IND{}", i)).collect();
+    let cov_strs: Vec<&str> = cov_ids.iter().map(|s| s.as_str()).collect();
+    let cov_path = dir.path().join("partial_cov.tsv");
+    write_cov_file(&cov_path, &cov_strs, 2, 42);
+
+    // est-bed with all 50 samples (should be subsetted to match main after intersection)
+    let est_dir = dir.path().join("est");
+    fs::create_dir_all(&est_dir).unwrap();
+    write_plink(&est_dir, "est", &sim).unwrap();
+
+    let bed_path = dir.path().join("sim.bed");
+    let out_prefix = dir.path().join("out_intersect_est");
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed_path.to_str().unwrap(),
+            "-c", cov_path.to_str().unwrap(),
+            "-k", "2",
+            "--intersect-samples",
+            "--est-bed", est_dir.join("est.bed").to_str().unwrap(),
+            "-o", out_prefix.to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(
+        output.status.success(),
+        "Should succeed with --intersect-samples + --est-bed:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Output should cover all 500 SNPs
+    let tsv_path = dir.path().join("out_intersect_est.tsv");
+    assert_eq!(fs::read_to_string(&tsv_path).unwrap().lines().count(), 501);
+
+    // Summary should reflect 30 samples
+    let summary = fs::read_to_string(dir.path().join("out_intersect_est.summary.txt")).unwrap();
+    assert!(summary.contains("n_samples: 30"), "Expected 30 samples, got:\n{}", summary);
 }

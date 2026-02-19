@@ -26,6 +26,7 @@ plink1.9 --bfile 1k1g_intersect --out 1k1g_intersect_ldprune --extract 1k1g_inte
 plink1.9 --recode ped --out 1k1g_intersect_ldprune --bfile 1k1g_intersect_ldprune
 
 cargo build --release --bin lfmm2
+time ../target/release/lfmm2 --bed 1k1g_intersect_ldprune.bed --cov pheno.tsv -k 1 --out ath_ft10_rs_k1 -t 12
 time ../target/release/lfmm2 --bed 1k1g_intersect_ldprune.bed --cov pheno.tsv -k 5 --out ath_ft10_rs_k5 -t 12
 time ../target/release/lfmm2 --bed 1k1g_intersect_ldprune.bed --cov pheno.tsv -k 20 --out ath_ft10_rs_k20 -t 12
 time ../target/release/lfmm2 --bed 1k1g_intersect_ldprune.bed --cov pheno.tsv -k 12 --out ath_ft10_rs_k12 -t 12

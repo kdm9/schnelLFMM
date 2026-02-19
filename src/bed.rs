@@ -15,6 +15,18 @@ const BED_MAGIC: [u8; 3] = [0x6C, 0x1B, 0x01];
 /// 0b11 = hom alt  -> 2.0
 const DECODE_TABLE: [f64; 4] = [0.0, f64::NAN, 1.0, 2.0];
 
+/// SNP normalization mode applied after centering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum SnpNorm {
+    /// Center only — subtract mean, no variance scaling.
+    CenterOnly,
+    /// Eigenstrat — divide by sqrt(2pq) for approximately unit variance under HWE.
+    #[default]
+    Eigenstrat,
+    /// HWE — multiply by sqrt(2pq) so Var(g) = 2pq exactly.
+    Hwe,
+}
+
 #[derive(Debug, Clone)]
 pub struct BimRecord {
     pub chrom: String,
@@ -53,6 +65,13 @@ pub struct BedFile {
     pub bim_records: Vec<BimRecord>,
     pub fam_records: Vec<FamRecord>,
     pub(crate) mmap: Mmap,
+    /// Original .fam sample count (for reading packed bytes from .bed).
+    /// After `subset_samples()`, `n_samples` shrinks but the on-disk encoding
+    /// is still based on `n_physical_samples`.
+    pub n_physical_samples: usize,
+    /// When set, only these physical-sample indices are decoded/output.
+    /// Indices are into the original .fam order (before subsetting).
+    pub sample_keep: Option<Vec<usize>>,
 }
 
 impl BedFile {
@@ -106,11 +125,13 @@ impl BedFile {
 
         Ok(BedFile {
             bed_path,
+            n_physical_samples: n_samples,
             n_samples,
             n_snps,
             bim_records,
             fam_records,
             mmap,
+            sample_keep: None,
         })
     }
 
@@ -119,9 +140,23 @@ impl BedFile {
         &self.mmap[3..]
     }
 
-    /// Bytes per SNP in the .bed file (ceil(n_samples / 4))
+    /// Bytes per SNP in the .bed file (ceil(n_physical_samples / 4)).
+    /// Uses the physical (on-disk) sample count, not the post-subsetting count.
     pub fn bytes_per_snp(&self) -> usize {
-        self.n_samples.div_ceil(4)
+        self.n_physical_samples.div_ceil(4)
+    }
+
+    /// Subset this BedFile to keep only the given physical-sample indices.
+    ///
+    /// `indices` are positions in the original .fam order. After calling this:
+    /// - `n_samples` = `indices.len()`
+    /// - `fam_records` is reordered to match `indices`
+    /// - `sample_keep` is set for decode functions
+    /// - `n_physical_samples` and `bytes_per_snp()` remain unchanged
+    pub fn subset_samples(&mut self, indices: Vec<usize>) {
+        self.fam_records = indices.iter().map(|&i| self.fam_records[i].clone()).collect();
+        self.n_samples = indices.len();
+        self.sample_keep = Some(indices);
     }
 
     /// Total number of SNPs that will be yielded by this subset
@@ -139,13 +174,25 @@ impl BedFile {
 
 /// Decode a chunk of SNPs from .bed format into a centered f64 matrix.
 /// Missing values (0b01) are imputed to the per-SNP mean genotype, then centered.
-pub fn decode_bed_chunk(packed: &[u8], n_samples: usize, chunk_size: usize) -> Array2<f64> {
-    let bytes_per_snp = n_samples.div_ceil(4);
-    let mut out = Array2::<f64>::zeros((n_samples, chunk_size));
+///
+/// - `n_physical_samples`: the on-disk sample count (determines bytes per SNP)
+/// - `n_output_samples`: rows in the output matrix (equals `n_physical_samples` when
+///   `sample_keep` is `None`, or `sample_keep.len()` otherwise)
+/// - `sample_keep`: if `Some`, only these physical-sample indices are decoded
+pub fn decode_bed_chunk(
+    packed: &[u8],
+    n_physical_samples: usize,
+    n_output_samples: usize,
+    chunk_size: usize,
+    norm: SnpNorm,
+    sample_keep: Option<&[usize]>,
+) -> Array2<f64> {
+    let bytes_per_snp = n_physical_samples.div_ceil(4);
+    let mut out = Array2::<f64>::zeros((n_output_samples, chunk_size));
 
     for snp in 0..chunk_size {
         let snp_bytes = &packed[snp * bytes_per_snp..(snp + 1) * bytes_per_snp];
-        decode_single_snp(snp_bytes, n_samples, out.column_mut(snp));
+        decode_single_snp(snp_bytes, n_physical_samples, out.column_mut(snp), norm, sample_keep);
     }
     out
 }
@@ -153,73 +200,123 @@ pub fn decode_bed_chunk(packed: &[u8], n_samples: usize, chunk_size: usize) -> A
 /// Decode specific SNPs from mmap data into a pre-allocated output matrix.
 ///
 /// - `mmap_data`: mmap bytes after the 3-byte header
-/// - `bps`: bytes per SNP
-/// - `n_samples`: number of samples
+/// - `bps`: bytes per SNP (based on physical sample count)
+/// - `n_physical_samples`: on-disk sample count
 /// - `snp_indices`: which SNPs to decode (column indices in the .bed file)
-/// - `out`: pre-allocated output slice (n_samples × snp_indices.len())
+/// - `out`: pre-allocated output (n_output_samples × snp_indices.len())
+/// - `sample_keep`: if `Some`, only these physical-sample indices are decoded
 pub fn decode_bed_chunk_into(
     mmap_data: &[u8],
     bps: usize,
-    n_samples: usize,
+    n_physical_samples: usize,
     snp_indices: &[usize],
     mut out: ndarray::ArrayViewMut2<f64>,
+    norm: SnpNorm,
+    sample_keep: Option<&[usize]>,
 ) {
     for (col, &snp_idx) in snp_indices.iter().enumerate() {
         let snp_bytes = &mmap_data[snp_idx * bps..(snp_idx + 1) * bps];
-        decode_single_snp(snp_bytes, n_samples, out.column_mut(col));
+        decode_single_snp(snp_bytes, n_physical_samples, out.column_mut(col), norm, sample_keep);
     }
 }
 
-/// Decode a single SNP column, impute missing to mean, center, and standardize.
+/// Decode a single SNP column, impute missing to mean, center, and optionally scale.
 ///
 /// After decoding 2-bit genotypes to {0, 1, 2}, this function:
 /// 1. Computes the per-SNP mean (excluding missing values)
 /// 2. Imputes missing values to the mean (centered = 0)
 /// 3. Centers all values by subtracting the mean
-/// 4. Applies Eigenstrat-style variance standardization: divides by sqrt(2p(1-p))
-///    where p = mean/2 is the allele frequency. This gives each SNP unit variance
-///    under Hardy-Weinberg equilibrium, preventing high-frequency SNPs from
-///    dominating the PCA/SVD.
+/// 4. Applies normalization according to `norm`:
+///    - `CenterOnly`: no scaling (scale = 1.0)
+///    - `Eigenstrat`: divides by sqrt(2pq) for approx unit variance under HWE
+///    - `Hwe`: multiplies by sqrt(2pq) so Var(g) = 2pq exactly
 ///
 /// Monomorphic SNPs (p=0 or p=1) have zero variance and are left as all zeros.
+///
+/// When `sample_keep` is `Some`, only those physical-sample indices are decoded
+/// into `col` (which has length `sample_keep.len()`). Mean/variance statistics
+/// are computed over the kept samples only.
 pub(crate) fn decode_single_snp(
     snp_bytes: &[u8],
-    n_samples: usize,
+    n_physical_samples: usize,
     mut col: ndarray::ArrayViewMut1<f64>,
+    norm: SnpNorm,
+    sample_keep: Option<&[usize]>,
 ) {
-    // Pass 1: decode and compute mean (excluding missing)
-    let mut sum = 0.0f64;
-    let mut n_valid = 0u32;
+    if let Some(keep) = sample_keep {
+        // Subsetting path: decode only kept samples
+        let mut sum = 0.0f64;
+        let mut n_valid = 0u32;
 
-    for sample in 0..n_samples {
-        let byte = snp_bytes[sample / 4];
-        let code = (byte >> (2 * (sample % 4))) & 0x03;
-        let val = DECODE_TABLE[code as usize];
-        col[sample] = val;
-        if !val.is_nan() {
-            sum += val;
-            n_valid += 1;
+        // Pass 1: decode kept samples and compute mean
+        for (out_idx, &phys_idx) in keep.iter().enumerate() {
+            debug_assert!(phys_idx < n_physical_samples);
+            let byte = snp_bytes[phys_idx / 4];
+            let code = (byte >> (2 * (phys_idx % 4))) & 0x03;
+            let val = DECODE_TABLE[code as usize];
+            col[out_idx] = val;
+            if !val.is_nan() {
+                sum += val;
+                n_valid += 1;
+            }
+        }
+
+        let mean = if n_valid > 0 { sum / n_valid as f64 } else { 0.0 };
+        let scale = compute_scale(mean, norm);
+
+        // Pass 2: impute, center, scale
+        for out_idx in 0..keep.len() {
+            if col[out_idx].is_nan() {
+                col[out_idx] = 0.0;
+            } else {
+                col[out_idx] = (col[out_idx] - mean) * scale;
+            }
+        }
+    } else {
+        // Original fast path: all samples
+        let n_samples = n_physical_samples;
+        let mut sum = 0.0f64;
+        let mut n_valid = 0u32;
+
+        for sample in 0..n_samples {
+            let byte = snp_bytes[sample / 4];
+            let code = (byte >> (2 * (sample % 4))) & 0x03;
+            let val = DECODE_TABLE[code as usize];
+            col[sample] = val;
+            if !val.is_nan() {
+                sum += val;
+                n_valid += 1;
+            }
+        }
+
+        let mean = if n_valid > 0 { sum / n_valid as f64 } else { 0.0 };
+        let scale = compute_scale(mean, norm);
+
+        for sample in 0..n_samples {
+            if col[sample].is_nan() {
+                col[sample] = 0.0;
+            } else {
+                col[sample] = (col[sample] - mean) * scale;
+            }
         }
     }
+}
 
-    let mean = if n_valid > 0 {
-        sum / n_valid as f64
-    } else {
-        0.0
-    };
-
-    // Eigenstrat scaling factor: 1 / sqrt(2p(1-p)) where p = mean/2
+/// Compute the normalization scale factor from the SNP mean.
+fn compute_scale(mean: f64, norm: SnpNorm) -> f64 {
     let p = mean / 2.0;
-    let denom = (2.0 * p * (1.0 - p)).sqrt();
-    // For monomorphic SNPs (p=0 or p=1), denom=0; leave as all zeros.
-    let scale = if denom > 1e-10 { 1.0 / denom } else { 0.0 };
-
-    // Pass 2: impute missing -> mean, center, and standardize
-    for sample in 0..n_samples {
-        if col[sample].is_nan() {
-            col[sample] = 0.0; // missing -> mean, centered = 0, scaled = 0
-        } else {
-            col[sample] = (col[sample] - mean) * scale;
+    let twopq = 2.0 * p * (1.0 - p);
+    match norm {
+        SnpNorm::CenterOnly => {
+            if twopq < 1e-20 { 0.0 } else { 1.0 }
+        }
+        SnpNorm::Eigenstrat => {
+            let denom = twopq.sqrt();
+            if denom > 1e-10 { 1.0 / denom } else { 0.0 }
+        }
+        SnpNorm::Hwe => {
+            let s = twopq.sqrt();
+            if s < 1e-10 { 0.0 } else { s }
         }
     }
 }
@@ -366,7 +463,7 @@ mod tests {
         assert_eq!(data[0..3], BED_MAGIC);
 
         let packed = &data[3..];
-        let decoded = decode_bed_chunk(packed, n, p);
+        let decoded = decode_bed_chunk(packed, n, n, p, SnpNorm::Eigenstrat, None);
 
         // Verify decoded values are centered and Eigenstrat-scaled
         for snp in 0..p {
@@ -396,7 +493,7 @@ mod tests {
         // 4 samples = 1 byte per SNP
         let packed = vec![0b11_10_01_00u8];
 
-        let decoded = decode_bed_chunk(&packed, n, 1);
+        let decoded = decode_bed_chunk(&packed, n, n, 1, SnpNorm::Eigenstrat, None);
 
         // Mean of non-missing = (0 + 1 + 2) / 3 = 1.0
         // Allele freq p = 0.5, 2p(1-p) = 0.5, scale = 1/sqrt(0.5) = sqrt(2)
@@ -406,5 +503,40 @@ mod tests {
         assert!((decoded[(1, 0)] - 0.0).abs() < 1e-10); // imputed to mean, centered = 0
         assert!((decoded[(2, 0)] - 0.0).abs() < 1e-10);
         assert!((decoded[(3, 0)] - s).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_normalization_modes() {
+        // SNP: sample0=0, sample1=1, sample2=2 (no missing)
+        // 3 samples = 1 byte per SNP
+        // 0b00=0, 0b10=1, 0b11=2 → byte = 0b_00_11_10_00 = 0xE8... no wait:
+        // sample0 bits [1:0]=00 (0), sample1 bits [3:2]=10 (1), sample2 bits [5:4]=11 (2)
+        // byte = 0b__11_10_00 = 0x38
+        let packed = vec![0b_11_10_00u8];
+        let n = 3;
+
+        // mean = (0+1+2)/3 = 1.0, p = 0.5, 2pq = 0.5
+        let mean = 1.0_f64;
+        let twopq = 0.5_f64;
+
+        // CenterOnly: centered values, scale=1
+        let dec = decode_bed_chunk(&packed, n, n, 1, SnpNorm::CenterOnly, None);
+        assert!((dec[(0, 0)] - (0.0 - mean)).abs() < 1e-10);
+        assert!((dec[(1, 0)] - (1.0 - mean)).abs() < 1e-10);
+        assert!((dec[(2, 0)] - (2.0 - mean)).abs() < 1e-10);
+
+        // Eigenstrat: (g - mean) / sqrt(2pq)
+        let dec = decode_bed_chunk(&packed, n, n, 1, SnpNorm::Eigenstrat, None);
+        let s = 1.0 / twopq.sqrt();
+        assert!((dec[(0, 0)] - (0.0 - mean) * s).abs() < 1e-10);
+        assert!((dec[(1, 0)] - (1.0 - mean) * s).abs() < 1e-10);
+        assert!((dec[(2, 0)] - (2.0 - mean) * s).abs() < 1e-10);
+
+        // HWE: (g - mean) * sqrt(2pq)
+        let dec = decode_bed_chunk(&packed, n, n, 1, SnpNorm::Hwe, None);
+        let s = twopq.sqrt();
+        assert!((dec[(0, 0)] - (0.0 - mean) * s).abs() < 1e-10);
+        assert!((dec[(1, 0)] - (1.0 - mean) * s).abs() < 1e-10);
+        assert!((dec[(2, 0)] - (2.0 - mean) * s).abs() < 1e-10);
     }
 }

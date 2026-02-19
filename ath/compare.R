@@ -1,7 +1,7 @@
 library(tidyverse)
 library(rhdf5)
 library(LEA)
-LFMM_K = 12
+LFMM_K = 1
 
 # --- LEA LFMM2 ---
 lea_lfmm_file = sprintf("lea_lfmm2_k%d.tsv", LFMM_K)
@@ -31,6 +31,9 @@ if (!file.exists(lea_lfmm_file)) {
     message("  lfmm2.test")
     pv = lfmm2.test(mod, Y, X, full = F)$pvalues
     # pv is n_snps x 1 matrix
+
+    message("  lfmm2 GIF")
+    median(qchisq(pv, df=1, lower.tail=FALSE)) / qchisq(0.5, df=1)
 
     bim = read.delim("1k1g_intersect_ldprune.bim", header = FALSE,
                       col.names = c("chr", "snp_id", "cm", "pos", "a1", "a2"))
@@ -66,11 +69,10 @@ all_results = lfmmooc |>
     left_join(
         lea_results |> transmute(chrom, pos, score_lea=-log10(p_lea)),
         by=join_by(chrom, pos),
-
     ) |> glimpse()
 
 sig = log10(nrow(all_results))
-sig = 4
+sig = 3
 all_results |>
     pivot_longer(starts_with("score_")) |>
     ggplot(aes(x=pos, y=value, colour=name, alpha=value<sig)) +

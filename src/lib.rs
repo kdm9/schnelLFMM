@@ -10,6 +10,7 @@ use anyhow::Result;
 use ndarray::Array2;
 
 use bed::{BedFile, SubsetSpec};
+pub use bed::SnpNorm;
 use precompute::precompute;
 use rsvd::estimate_factors_streaming;
 use testing::{test_associations_fused, TestResults};
@@ -42,6 +43,8 @@ pub struct Lfmm2Config {
     pub n_workers: usize,
     /// Show progress bars on stderr for streaming passes.
     pub progress: bool,
+    /// SNP normalization mode.
+    pub norm: SnpNorm,
 }
 
 impl Default for Lfmm2Config {
@@ -55,6 +58,7 @@ impl Default for Lfmm2Config {
             seed: 42,
             n_workers: 0,
             progress: false,
+            norm: SnpNorm::default(),
         }
     }
 }
