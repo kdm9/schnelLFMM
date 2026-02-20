@@ -1,10 +1,10 @@
-use schnellfmm::bed::{BedFile, SubsetSpec};
-use schnellfmm::parallel::subset_indices;
-use schnellfmm::simulate::{
+use schnelfmm::bed::{BedFile, SubsetSpec};
+use schnelfmm::parallel::subset_indices;
+use schnelfmm::simulate::{
     simulate, write_covariates, write_ground_truth, write_latent_u, write_lfmm_format,
     write_plink, write_r_comparison_script, SimConfig,
 };
-use schnellfmm::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
+use schnelfmm::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
 use ndarray::Array2;
 use ndarray_linalg::SVD;
 use std::fs;
@@ -320,8 +320,8 @@ fn ranks(vals: &mut [f64]) -> Vec<f64> {
 }
 
 fn validate_results(
-    results: &schnellfmm::testing::TestResults,
-    sim: &schnellfmm::simulate::SimData,
+    results: &schnelfmm::testing::TestResults,
+    sim: &schnelfmm::simulate::SimData,
     _config: &Lfmm2Config,
 ) {
     let p = sim.genotypes.ncols();
@@ -513,7 +513,7 @@ fn test_parallel_matches_sequential() {
     );
 }
 
-fn write_rust_results(dir: &Path, results: &schnellfmm::testing::TestResults) {
+fn write_rust_results(dir: &Path, results: &schnelfmm::testing::TestResults) {
     use std::io::Write;
 
     let p = results.p_values.nrows();
@@ -1584,11 +1584,11 @@ fn test_cli_est_bed_sample_identity() {
             rev_geno[(new_row, snp)] = sim.genotypes[(old_row, snp)];
         }
     }
-    schnellfmm::bed::write_bed_file(&est_dir.join("est.bed"), &rev_geno).unwrap();
+    schnelfmm::bed::write_bed_file(&est_dir.join("est.bed"), &rev_geno).unwrap();
 
     // Write reversed .fam
-    let rev_fam: Vec<schnellfmm::bed::FamRecord> = rev_order.iter().map(|&i| {
-        schnellfmm::bed::FamRecord {
+    let rev_fam: Vec<schnelfmm::bed::FamRecord> = rev_order.iter().map(|&i| {
+        schnelfmm::bed::FamRecord {
             fid: format!("FAM{}", i),
             iid: format!("IND{}", i),
             father: "0".to_string(),
@@ -1597,11 +1597,11 @@ fn test_cli_est_bed_sample_identity() {
             pheno: "-9".to_string(),
         }
     }).collect();
-    schnellfmm::bed::write_fam(&est_dir.join("est.fam"), &rev_fam).unwrap();
+    schnelfmm::bed::write_fam(&est_dir.join("est.fam"), &rev_fam).unwrap();
 
     // Write .bim (just copy the main bim records)
     let main_bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
-    schnellfmm::bed::write_bim(&est_dir.join("est.bim"), &main_bed.bim_records).unwrap();
+    schnelfmm::bed::write_bim(&est_dir.join("est.bim"), &main_bed.bim_records).unwrap();
 
     let bed_path = dir.path().join("sim.bed");
     let cov_path = dir.path().join("cov.tsv");
@@ -1653,10 +1653,10 @@ fn test_cli_est_bed_sample_mismatch() {
     let est_dir = dir.path().join("est_bad");
     fs::create_dir_all(&est_dir).unwrap();
 
-    schnellfmm::bed::write_bed_file(&est_dir.join("est.bed"), &sim.genotypes).unwrap();
+    schnelfmm::bed::write_bed_file(&est_dir.join("est.bed"), &sim.genotypes).unwrap();
 
-    let wrong_fam: Vec<schnellfmm::bed::FamRecord> = (0..sim_config.n_samples).map(|i| {
-        schnellfmm::bed::FamRecord {
+    let wrong_fam: Vec<schnelfmm::bed::FamRecord> = (0..sim_config.n_samples).map(|i| {
+        schnelfmm::bed::FamRecord {
             fid: format!("WRONG{}", i),
             iid: format!("WRONG{}", i),
             father: "0".to_string(),
@@ -1665,10 +1665,10 @@ fn test_cli_est_bed_sample_mismatch() {
             pheno: "-9".to_string(),
         }
     }).collect();
-    schnellfmm::bed::write_fam(&est_dir.join("est.fam"), &wrong_fam).unwrap();
+    schnelfmm::bed::write_fam(&est_dir.join("est.fam"), &wrong_fam).unwrap();
 
     let main_bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
-    schnellfmm::bed::write_bim(&est_dir.join("est.bim"), &main_bed.bim_records).unwrap();
+    schnelfmm::bed::write_bim(&est_dir.join("est.bim"), &main_bed.bim_records).unwrap();
 
     let bed_path = dir.path().join("sim.bed");
     let cov_path = dir.path().join("cov.tsv");
@@ -2148,11 +2148,11 @@ fn test_variance_decomposition_with_noise() {
 
     // Write noisy PLINK files (reuse .bim and .fam from original)
     let dir_noisy = tempfile::tempdir().unwrap();
-    schnellfmm::bed::write_bed_file(&dir_noisy.path().join("sim.bed"), &noisy_geno).unwrap();
+    schnelfmm::bed::write_bed_file(&dir_noisy.path().join("sim.bed"), &noisy_geno).unwrap();
     let bim_records = bed_orig.bim_records.clone();
     let fam_records = bed_orig.fam_records.clone();
-    schnellfmm::bed::write_bim(&dir_noisy.path().join("sim.bim"), &bim_records).unwrap();
-    schnellfmm::bed::write_fam(&dir_noisy.path().join("sim.fam"), &fam_records).unwrap();
+    schnelfmm::bed::write_bim(&dir_noisy.path().join("sim.bim"), &bim_records).unwrap();
+    schnelfmm::bed::write_fam(&dir_noisy.path().join("sim.fam"), &fam_records).unwrap();
 
     let bed_noisy = BedFile::open(dir_noisy.path().join("sim.bed")).unwrap();
     let r_noisy = fit_lfmm2(&bed_noisy, &SubsetSpec::All, &bed_noisy, &sim.x, &config, None).unwrap();

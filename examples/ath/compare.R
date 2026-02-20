@@ -1,7 +1,8 @@
 library(tidyverse)
 library(rhdf5)
 library(LEA)
-LFMM_K = 1
+LFMM_K = as.integer(commandArgs(trailingOnly=T))
+stopifnot(LFMM_K %in% 1:30)
 
 # --- LEA LFMM2 ---
 lea_lfmm_file = sprintf("lea_lfmm2_k%d.tsv", LFMM_K)
@@ -23,7 +24,7 @@ if (!file.exists(lea_lfmm_file)) {
     Y[na_mask] = col_means[col(Y)[na_mask]]
     table(is.na(Y))
 
-    pheno = read.delim("pheno.tsv")
+    pheno = read.delim("pheno_intersect.tsv")
     X = pheno$FT10
 
     message("  lfmm2")
