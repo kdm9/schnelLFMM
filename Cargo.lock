@@ -528,29 +528,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
-name = "lfmm2"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "approx",
- "blas-src",
- "byteorder",
- "clap",
- "crossbeam-channel",
- "indicatif",
- "memmap2",
- "ndarray",
- "ndarray-linalg",
- "ndarray-rand",
- "openblas-src",
- "rand",
- "rand_chacha",
- "rand_distr",
- "statrs",
- "tempfile",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.182"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1034,6 +1011,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "891d81b926048e76efe18581bf793546b4c0eaf8448d72be8de2bbee5fd166e1"
 dependencies = [
  "windows-sys",
+]
+
+[[package]]
+name = "schnellfmm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "blas-src",
+ "byteorder",
+ "clap",
+ "crossbeam-channel",
+ "indicatif",
+ "memmap2",
+ "ndarray",
+ "ndarray-linalg",
+ "ndarray-rand",
+ "openblas-src",
+ "rand",
+ "rand_chacha",
+ "rand_distr",
+ "statrs",
+ "tempfile",
 ]
 
 [[package]]

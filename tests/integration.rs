@@ -1,10 +1,10 @@
-use lfmm2::bed::{BedFile, SubsetSpec};
-use lfmm2::parallel::subset_indices;
-use lfmm2::simulate::{
+use schnellfmm::bed::{BedFile, SubsetSpec};
+use schnellfmm::parallel::subset_indices;
+use schnellfmm::simulate::{
     simulate, write_covariates, write_ground_truth, write_latent_u, write_lfmm_format,
     write_plink, write_r_comparison_script, SimConfig,
 };
-use lfmm2::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
+use schnellfmm::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
 use ndarray::Array2;
 use ndarray_linalg::SVD;
 use std::fs;
@@ -320,8 +320,8 @@ fn ranks(vals: &mut [f64]) -> Vec<f64> {
 }
 
 fn validate_results(
-    results: &lfmm2::testing::TestResults,
-    sim: &lfmm2::simulate::SimData,
+    results: &schnellfmm::testing::TestResults,
+    sim: &schnellfmm::simulate::SimData,
     _config: &Lfmm2Config,
 ) {
     let p = sim.genotypes.ncols();
@@ -513,7 +513,7 @@ fn test_parallel_matches_sequential() {
     );
 }
 
-fn write_rust_results(dir: &Path, results: &lfmm2::testing::TestResults) {
+fn write_rust_results(dir: &Path, results: &schnellfmm::testing::TestResults) {
     use std::io::Write;
 
     let p = results.p_values.nrows();
@@ -813,21 +813,29 @@ fn test_output_config_writes_results() {
         lines.len(),
     );
 
-    // Header structure: chr, pos, snp_id, then 3 columns per covariate
+    // Header structure: chr, pos, snp_id, 3 columns per covariate, then r2_cov/r2_latent/r2_resid
+    let n_expected_cols = 3 + 3 * sim_config.d + 3;
     let header_fields: Vec<&str> = lines[0].split('\t').collect();
-    assert_eq!(header_fields.len(), 3 + 3 * sim_config.d);
+    assert_eq!(header_fields.len(), n_expected_cols);
     assert_eq!(header_fields[0], "chr");
     assert_eq!(header_fields[1], "pos");
     assert_eq!(header_fields[2], "snp_id");
     assert_eq!(header_fields[3], "p_cov_0");
     assert_eq!(header_fields[4], "beta_cov_0");
     assert_eq!(header_fields[5], "t_cov_0");
+    // Variance decomposition columns at the end
+    let r2_start = 3 + 3 * sim_config.d;
+    assert_eq!(header_fields[r2_start], "r2_cov");
+    assert_eq!(header_fields[r2_start + 1], "r2_latent");
+    assert_eq!(header_fields[r2_start + 2], "r2_resid");
 
     // Data row structure
     let data_fields: Vec<&str> = lines[1].split('\t').collect();
-    assert_eq!(data_fields.len(), 3 + 3 * sim_config.d);
+    assert_eq!(data_fields.len(), n_expected_cols);
 
     // All p-values in the file should be parseable and in [0, 1]
+    // R² values should be parseable and in [0, ∞) (r2_cov + r2_latent may slightly exceed 1
+    // due to X-U correlation, but each component should be non-negative)
     for line in &lines[1..] {
         let fields: Vec<&str> = line.split('\t').collect();
         for j in 0..sim_config.d {
@@ -838,6 +846,12 @@ fn test_output_config_writes_results() {
                 p_val,
             );
         }
+        let rc: f64 = fields[r2_start].parse().unwrap();
+        let rl: f64 = fields[r2_start + 1].parse().unwrap();
+        let rr: f64 = fields[r2_start + 2].parse().unwrap();
+        assert!(rc >= 0.0, "r2_cov negative: {}", rc);
+        assert!(rl >= 0.0, "r2_latent negative: {}", rl);
+        assert!(rr >= 0.0, "r2_resid negative: {}", rr);
     }
 
     // GIF should match the in-memory result
@@ -1570,11 +1584,11 @@ fn test_cli_est_bed_sample_identity() {
             rev_geno[(new_row, snp)] = sim.genotypes[(old_row, snp)];
         }
     }
-    lfmm2::bed::write_bed_file(&est_dir.join("est.bed"), &rev_geno).unwrap();
+    schnellfmm::bed::write_bed_file(&est_dir.join("est.bed"), &rev_geno).unwrap();
 
     // Write reversed .fam
-    let rev_fam: Vec<lfmm2::bed::FamRecord> = rev_order.iter().map(|&i| {
-        lfmm2::bed::FamRecord {
+    let rev_fam: Vec<schnellfmm::bed::FamRecord> = rev_order.iter().map(|&i| {
+        schnellfmm::bed::FamRecord {
             fid: format!("FAM{}", i),
             iid: format!("IND{}", i),
             father: "0".to_string(),
@@ -1583,11 +1597,11 @@ fn test_cli_est_bed_sample_identity() {
             pheno: "-9".to_string(),
         }
     }).collect();
-    lfmm2::bed::write_fam(&est_dir.join("est.fam"), &rev_fam).unwrap();
+    schnellfmm::bed::write_fam(&est_dir.join("est.fam"), &rev_fam).unwrap();
 
     // Write .bim (just copy the main bim records)
     let main_bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
-    lfmm2::bed::write_bim(&est_dir.join("est.bim"), &main_bed.bim_records).unwrap();
+    schnellfmm::bed::write_bim(&est_dir.join("est.bim"), &main_bed.bim_records).unwrap();
 
     let bed_path = dir.path().join("sim.bed");
     let cov_path = dir.path().join("cov.tsv");
@@ -1639,10 +1653,10 @@ fn test_cli_est_bed_sample_mismatch() {
     let est_dir = dir.path().join("est_bad");
     fs::create_dir_all(&est_dir).unwrap();
 
-    lfmm2::bed::write_bed_file(&est_dir.join("est.bed"), &sim.genotypes).unwrap();
+    schnellfmm::bed::write_bed_file(&est_dir.join("est.bed"), &sim.genotypes).unwrap();
 
-    let wrong_fam: Vec<lfmm2::bed::FamRecord> = (0..sim_config.n_samples).map(|i| {
-        lfmm2::bed::FamRecord {
+    let wrong_fam: Vec<schnellfmm::bed::FamRecord> = (0..sim_config.n_samples).map(|i| {
+        schnellfmm::bed::FamRecord {
             fid: format!("WRONG{}", i),
             iid: format!("WRONG{}", i),
             father: "0".to_string(),
@@ -1651,10 +1665,10 @@ fn test_cli_est_bed_sample_mismatch() {
             pheno: "-9".to_string(),
         }
     }).collect();
-    lfmm2::bed::write_fam(&est_dir.join("est.fam"), &wrong_fam).unwrap();
+    schnellfmm::bed::write_fam(&est_dir.join("est.fam"), &wrong_fam).unwrap();
 
     let main_bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
-    lfmm2::bed::write_bim(&est_dir.join("est.bim"), &main_bed.bim_records).unwrap();
+    schnellfmm::bed::write_bim(&est_dir.join("est.bim"), &main_bed.bim_records).unwrap();
 
     let bed_path = dir.path().join("sim.bed");
     let cov_path = dir.path().join("cov.tsv");
@@ -1740,4 +1754,429 @@ fn test_cli_intersect_with_est_bed() {
     // Summary should reflect 30 samples
     let summary = fs::read_to_string(dir.path().join("out_intersect_est.summary.txt")).unwrap();
     assert!(summary.contains("n_samples: 30"), "Expected 30 samples, got:\n{}", summary);
+}
+
+// ---------------------------------------------------------------------------
+// K-sensitivity test
+// ---------------------------------------------------------------------------
+
+/// Test that the LFMM2 K parameter is effective:
+/// - Simulate data with K_true ∈ {1, 2, 3, 4} latent factors
+/// - Run LFMM2 with K ∈ {1, 2, ..., 8} for each simulation
+/// - Under-specification (K < K_true) should push GIF further from 1.0
+/// - Over-specification is expected to be mostly harmless (flat GIF landscape)
+/// - P-values should differ across K values
+///
+/// The key property: GIF at K=K_true should be closer to 1 than at any
+/// severely under-specified K (K = 1 when K_true ≥ 3).
+#[test]
+fn test_k_sensitivity() {
+    let k_trues = [1, 2, 3, 4];
+    let k_range: Vec<usize> = (1..=8).collect();
+
+    for &k_true in &k_trues {
+        let sim_config = SimConfig {
+            n_samples: 300,
+            n_snps: 5_000,
+            n_causal: 20,
+            k: k_true,
+            d: 1,
+            effect_size: 1.0,
+            latent_scale: 1.5,
+            noise_std: 1.0,
+            covariate_r2: 0.0,
+            seed: 42000 + k_true as u64,
+        };
+
+        let sim = simulate(&sim_config);
+        let dir = tempfile::tempdir().unwrap();
+        write_plink(dir.path(), "sim", &sim).unwrap();
+        let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+        let mut gif_for_k = Vec::new();
+        let mut pval_vecs: Vec<Vec<f64>> = Vec::new();
+
+        for &k_run in &k_range {
+            let config = Lfmm2Config {
+                k: k_run,
+                lambda: 1e-5,
+                chunk_size: 2_000,
+                oversampling: 10,
+                n_power_iter: 2,
+                seed: 42,
+                n_workers: 0,
+                progress: false,
+                norm: SnpNorm::Eigenstrat,
+            };
+            let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
+            gif_for_k.push(r.gif);
+            pval_vecs.push((0..sim_config.n_snps).map(|i| r.p_values[(i, 0)]).collect());
+        }
+
+        // Log all GIF values for this K_true
+        eprintln!("K_true = {}", k_true);
+        for (i, &k_run) in k_range.iter().enumerate() {
+            eprintln!("  K_run={}: GIF={:.4}", k_run, gif_for_k[i]);
+        }
+
+        // 1. GIF at K=K_true should be reasonable (close to 1).
+        let gif_correct = gif_for_k[k_true - 1];
+        let dist_correct = (gif_correct - 1.0).abs();
+        eprintln!("  |GIF(K={})-1| = {:.4}", k_true, dist_correct);
+        assert!(
+            dist_correct < 0.15,
+            "K_true={}: GIF at correct K should be near 1, got {:.4} (|GIF-1|={:.4})",
+            k_true, gif_correct, dist_correct,
+        );
+
+        // 2. Under-specification (K < K_true) should push GIF further from 1
+        //    than the correct K. Check K=1 when K_true ≥ 3 (strong under-spec).
+        if k_true >= 3 {
+            let gif_under = gif_for_k[0]; // K=1
+            let dist_under = (gif_under - 1.0).abs();
+            eprintln!(
+                "  Under-spec: |GIF(K=1)-1|={:.4} vs |GIF(K={})-1|={:.4}",
+                dist_under, k_true, dist_correct,
+            );
+            assert!(
+                dist_under > dist_correct,
+                "K_true={}: severely under-specified K=1 should have |GIF-1| > K={}, \
+                 but got {:.4} vs {:.4}",
+                k_true, k_true, dist_under, dist_correct,
+            );
+        }
+
+        // 3. Over-specification should not dramatically worsen GIF.
+        //    GIF at K_true+2 should still be close to 1.
+        if k_true + 2 <= *k_range.last().unwrap() {
+            let gif_over = gif_for_k[k_true + 1]; // K = K_true + 2
+            let dist_over = (gif_over - 1.0).abs();
+            eprintln!(
+                "  Over-spec: |GIF(K={})-1|={:.4}",
+                k_true + 2, dist_over,
+            );
+            assert!(
+                dist_over < 0.15,
+                "K_true={}: moderately over-specified K={} should keep GIF near 1, got {:.4}",
+                k_true, k_true + 2, gif_over,
+            );
+        }
+
+        // 4. P-values should differ across K values — each K gives a different result.
+        for i in 0..k_range.len() {
+            for j in (i + 1)..k_range.len() {
+                let mut n_differ = 0;
+                for s in 0..sim_config.n_snps {
+                    if (pval_vecs[i][s] - pval_vecs[j][s]).abs() > 1e-10 {
+                        n_differ += 1;
+                    }
+                }
+                assert!(
+                    n_differ > 0,
+                    "K_true={}: K={} and K={} produced identical p-values",
+                    k_true, k_range[i], k_range[j],
+                );
+            }
+        }
+    }
+}
+
+/// Test that per-SNP variance decomposition is sensible.
+/// Latent factors should explain more variance than covariates for null SNPs,
+/// and the r² values should be non-negative with r2_resid close to 1 for most SNPs.
+#[test]
+fn test_variance_decomposition() {
+    let sim_config = SimConfig {
+        n_samples: 200,
+        n_snps: 5_000,
+        n_causal: 20,
+        k: 3,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 77700,
+    };
+
+    let sim = simulate(&sim_config);
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim).unwrap();
+    let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+    let config = Lfmm2Config {
+        k: 3,
+        lambda: 1e-5,
+        chunk_size: 2_000,
+        oversampling: 10,
+        n_power_iter: 2,
+        seed: 42,
+        n_workers: 0,
+        progress: false,
+        norm: SnpNorm::Eigenstrat,
+    };
+
+    let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
+    let p = sim_config.n_snps;
+
+    // All r² values should be non-negative
+    for i in 0..p {
+        assert!(r.r2_cov[i] >= 0.0, "r2_cov[{}] negative: {}", i, r.r2_cov[i]);
+        assert!(r.r2_latent[i] >= 0.0, "r2_latent[{}] negative: {}", i, r.r2_latent[i]);
+        assert!(r.r2_resid[i] >= 0.0, "r2_resid[{}] negative: {}", i, r.r2_resid[i]);
+    }
+
+    // Residual R² should be < 1 for most SNPs (the model explains something)
+    let mean_r2_resid: f64 = r.r2_resid.iter().sum::<f64>() / p as f64;
+    let mean_r2_latent: f64 = r.r2_latent.iter().sum::<f64>() / p as f64;
+    let mean_r2_cov: f64 = r.r2_cov.iter().sum::<f64>() / p as f64;
+
+    eprintln!("Variance decomposition (means across {} SNPs):", p);
+    eprintln!("  r2_cov:    {:.4}", mean_r2_cov);
+    eprintln!("  r2_latent: {:.4}", mean_r2_latent);
+    eprintln!("  r2_resid:  {:.4}", mean_r2_resid);
+
+    // Latent factors (with K=3) should explain meaningful variance
+    assert!(
+        mean_r2_latent > 0.01,
+        "Mean r2_latent too low: {:.4} (expected latent factors to explain some variance)",
+        mean_r2_latent,
+    );
+
+    // Most variance should be residual (genetic noise dominates)
+    assert!(
+        mean_r2_resid > 0.5,
+        "Mean r2_resid unexpectedly low: {:.4}",
+        mean_r2_resid,
+    );
+
+    // Causal SNPs should have higher r2_cov than null SNPs (on average)
+    let causal_r2_cov: f64 = sim.causal_indices.iter()
+        .map(|&i| r.r2_cov[i])
+        .sum::<f64>() / sim.causal_indices.len() as f64;
+    let null_count = p - sim.causal_indices.len();
+    let null_r2_cov: f64 = (0..p)
+        .filter(|i| !sim.causal_indices.contains(i))
+        .map(|i| r.r2_cov[i])
+        .sum::<f64>() / null_count as f64;
+
+    eprintln!("  Causal mean r2_cov: {:.4}", causal_r2_cov);
+    eprintln!("  Null mean r2_cov:   {:.4}", null_r2_cov);
+    assert!(
+        causal_r2_cov > null_r2_cov,
+        "Causal SNPs should have higher r2_cov than null SNPs: {:.4} vs {:.4}",
+        causal_r2_cov, null_r2_cov,
+    );
+}
+
+/// Test that per-SNP variance decomposition responds correctly to varying
+/// levels of population structure.
+///
+/// In the LFMM2 generative model, genotypes are sampled as
+///   g_ij ~ Binomial(2, inv_logit(base + UV + XB))
+/// where UV is the population structure term. Higher `latent_scale`
+/// increases the UV contribution, making genotypes more structured.
+/// The Binomial sampling provides irreducible stochastic noise.
+///
+/// We compare three simulations (same seed, same base allele frequencies):
+///   1. Weak population structure (latent_scale=0.3): mostly Binomial noise
+///   2. Medium population structure (latent_scale=1.0): moderate UV signal
+///   3. Strong population structure (latent_scale=2.5): UV dominates
+///
+/// Expected behavior:
+///   - r2_latent should increase as latent_scale increases
+///   - r2_resid should decrease as latent_scale increases (signal absorbs variance)
+#[test]
+fn test_variance_decomposition_signal_levels() {
+    let latent_scales = [0.3, 1.0, 2.5];
+    let mut mean_r2_latents = Vec::new();
+    let mut mean_r2_resids = Vec::new();
+
+    let lfmm_config = Lfmm2Config {
+        k: 3,
+        lambda: 1e-5,
+        chunk_size: 2_000,
+        oversampling: 10,
+        n_power_iter: 2,
+        seed: 42,
+        n_workers: 0,
+        progress: false,
+        norm: SnpNorm::Eigenstrat,
+    };
+
+    for &ls in &latent_scales {
+        let sim_config = SimConfig {
+            n_samples: 200,
+            n_snps: 5_000,
+            n_causal: 20,
+            k: 3,
+            d: 1,
+            effect_size: 1.0,
+            latent_scale: ls,
+            noise_std: 1.0,
+            covariate_r2: 0.0,
+            seed: 88800,
+        };
+
+        let sim = simulate(&sim_config);
+        let dir = tempfile::tempdir().unwrap();
+        write_plink(dir.path(), "sim", &sim).unwrap();
+        let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+        let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &lfmm_config, None).unwrap();
+        let p = sim_config.n_snps;
+
+        let mean_latent: f64 = r.r2_latent.iter().sum::<f64>() / p as f64;
+        let mean_resid: f64 = r.r2_resid.iter().sum::<f64>() / p as f64;
+
+        eprintln!(
+            "latent_scale={:.1}: mean r2_latent={:.4}, mean r2_resid={:.4}",
+            ls, mean_latent, mean_resid,
+        );
+
+        mean_r2_latents.push(mean_latent);
+        mean_r2_resids.push(mean_resid);
+    }
+
+    // r2_latent should monotonically increase with latent_scale
+    for i in 1..latent_scales.len() {
+        assert!(
+            mean_r2_latents[i] > mean_r2_latents[i - 1],
+            "r2_latent should increase with latent_scale: \
+             ls={:.1} gave {:.4}, ls={:.1} gave {:.4}",
+            latent_scales[i - 1], mean_r2_latents[i - 1],
+            latent_scales[i], mean_r2_latents[i],
+        );
+    }
+
+    // r2_resid should monotonically decrease with latent_scale
+    // (more signal → less residual fraction)
+    for i in 1..latent_scales.len() {
+        assert!(
+            mean_r2_resids[i] < mean_r2_resids[i - 1],
+            "r2_resid should decrease with latent_scale: \
+             ls={:.1} gave {:.4}, ls={:.1} gave {:.4}",
+            latent_scales[i - 1], mean_r2_resids[i - 1],
+            latent_scales[i], mean_r2_resids[i],
+        );
+    }
+
+    // Sanity: with strong population structure, latent should explain > 5%
+    assert!(
+        mean_r2_latents[2] > 0.05,
+        "Strong latent (ls=2.5) should explain > 5%% of variance, got {:.4}",
+        mean_r2_latents[2],
+    );
+
+    // Sanity: with weak population structure, residual should dominate (> 90%)
+    assert!(
+        mean_r2_resids[0] > 0.90,
+        "Weak latent (ls=0.3) should have > 90%% residual variance, got {:.4}",
+        mean_r2_resids[0],
+    );
+}
+
+/// Test that adding random noise to genotypes increases residual variance.
+///
+/// Takes a base simulation and creates two PLINK datasets:
+///   1. Original genotypes
+///   2. Genotypes with random bit flips (0→1, 1→0/2, 2→1) at a 10% rate,
+///      simulating measurement noise or genotyping errors
+///
+/// The noisy version should have higher r2_resid since the added noise is
+/// uncorrelated with both X and U.
+#[test]
+fn test_variance_decomposition_with_noise() {
+    use rand::prelude::*;
+    use rand_chacha::ChaCha8Rng;
+
+    let sim_config = SimConfig {
+        n_samples: 200,
+        n_snps: 5_000,
+        n_causal: 20,
+        k: 3,
+        d: 1,
+        effect_size: 1.0,
+        latent_scale: 1.5,
+        noise_std: 1.0,
+        covariate_r2: 0.0,
+        seed: 99900,
+    };
+
+    let sim = simulate(&sim_config);
+
+    // --- Run on original genotypes ---
+    let dir_orig = tempfile::tempdir().unwrap();
+    write_plink(dir_orig.path(), "sim", &sim).unwrap();
+    let bed_orig = BedFile::open(dir_orig.path().join("sim.bed")).unwrap();
+
+    let config = Lfmm2Config {
+        k: 3,
+        lambda: 1e-5,
+        chunk_size: 2_000,
+        oversampling: 10,
+        n_power_iter: 2,
+        seed: 42,
+        n_workers: 0,
+        progress: false,
+        norm: SnpNorm::Eigenstrat,
+    };
+
+    let r_orig = fit_lfmm2(&bed_orig, &SubsetSpec::All, &bed_orig, &sim.x, &config, None).unwrap();
+
+    // --- Create noisy genotypes: random bit flips at 10% rate ---
+    let n = sim_config.n_samples;
+    let p = sim_config.n_snps;
+    let mut noisy_geno = sim.genotypes.clone();
+    let mut rng = ChaCha8Rng::seed_from_u64(12345);
+    let flip_rate = 0.10;
+
+    for i in 0..n {
+        for j in 0..p {
+            if rng.gen::<f64>() < flip_rate {
+                // Flip towards a random different genotype
+                let current = noisy_geno[(i, j)];
+                noisy_geno[(i, j)] = match current {
+                    0 => if rng.gen_bool(0.5) { 1 } else { 2 },
+                    1 => if rng.gen_bool(0.5) { 0 } else { 2 },
+                    2 => if rng.gen_bool(0.5) { 0 } else { 1 },
+                    _ => current,
+                };
+            }
+        }
+    }
+
+    // Write noisy PLINK files (reuse .bim and .fam from original)
+    let dir_noisy = tempfile::tempdir().unwrap();
+    schnellfmm::bed::write_bed_file(&dir_noisy.path().join("sim.bed"), &noisy_geno).unwrap();
+    let bim_records = bed_orig.bim_records.clone();
+    let fam_records = bed_orig.fam_records.clone();
+    schnellfmm::bed::write_bim(&dir_noisy.path().join("sim.bim"), &bim_records).unwrap();
+    schnellfmm::bed::write_fam(&dir_noisy.path().join("sim.fam"), &fam_records).unwrap();
+
+    let bed_noisy = BedFile::open(dir_noisy.path().join("sim.bed")).unwrap();
+    let r_noisy = fit_lfmm2(&bed_noisy, &SubsetSpec::All, &bed_noisy, &sim.x, &config, None).unwrap();
+
+    let mean_resid_orig: f64 = r_orig.r2_resid.iter().sum::<f64>() / p as f64;
+    let mean_resid_noisy: f64 = r_noisy.r2_resid.iter().sum::<f64>() / p as f64;
+    let mean_latent_orig: f64 = r_orig.r2_latent.iter().sum::<f64>() / p as f64;
+    let mean_latent_noisy: f64 = r_noisy.r2_latent.iter().sum::<f64>() / p as f64;
+
+    eprintln!("Original:  r2_resid={:.4}, r2_latent={:.4}", mean_resid_orig, mean_latent_orig);
+    eprintln!("Noisy:     r2_resid={:.4}, r2_latent={:.4}", mean_resid_noisy, mean_latent_noisy);
+
+    // Adding random noise should increase residual variance fraction
+    assert!(
+        mean_resid_noisy > mean_resid_orig,
+        "Adding random noise should increase r2_resid: original={:.4}, noisy={:.4}",
+        mean_resid_orig, mean_resid_noisy,
+    );
+
+    // Adding random noise should decrease latent variance fraction
+    // (noise dilutes the population structure signal)
+    assert!(
+        mean_latent_noisy < mean_latent_orig,
+        "Adding random noise should decrease r2_latent: original={:.4}, noisy={:.4}",
+        mean_latent_orig, mean_latent_noisy,
+    );
 }

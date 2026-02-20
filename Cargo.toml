@@ -1,7 +1,10 @@
 [package]
-name = "lfmm2"
+name = "schnellfmm"
 version = "0.1.0"
 edition = "2021"
+
+[features]
+profiling = []
 
 [dependencies]
 ndarray = { version = "0.16", features = ["blas"] }

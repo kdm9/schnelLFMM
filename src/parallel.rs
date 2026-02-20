@@ -84,6 +84,42 @@ impl DisjointRowWriter {
     }
 }
 
+/// Allows multiple threads to write to disjoint ranges of a `Vec<f64>` without locking.
+///
+/// Safety invariant: each (start, len) pair maps to a unique, non-overlapping range.
+pub struct DisjointSliceWriter {
+    ptr: *mut f64,
+    len: usize,
+}
+
+unsafe impl Send for DisjointSliceWriter {}
+unsafe impl Sync for DisjointSliceWriter {}
+
+impl DisjointSliceWriter {
+    /// Create a writer over a mutable `Vec<f64>`.
+    pub fn new(slice: &mut [f64]) -> Self {
+        DisjointSliceWriter {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+        }
+    }
+
+    /// Write `src` into `[start .. start + src.len()]`.
+    ///
+    /// # Safety
+    /// Caller must ensure no two threads write to overlapping ranges.
+    pub unsafe fn write_slice(&self, start: usize, src: &[f64]) {
+        debug_assert!(
+            start + src.len() <= self.len,
+            "write_slice: start={} + len={} > capacity={}",
+            start,
+            src.len(),
+            self.len,
+        );
+        std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(start), src.len());
+    }
+}
+
 /// Lock-free per-worker accumulator for forward passes that sum partial results.
 ///
 /// Each worker thread writes exclusively to its own buffer (indexed by worker_id).

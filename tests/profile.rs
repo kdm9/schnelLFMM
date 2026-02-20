@@ -1,77 +1,22 @@
+#![cfg(feature = "profiling")]
+
 use anyhow::Result;
-use clap::Parser;
 use ndarray::Array2;
 use ndarray_linalg::{InverseInto, SVD};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Normal};
 use statrs::distribution::{ContinuousCDF, StudentsT};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use lfmm2::bed::{decode_bed_chunk_into, BedFile, SnpNorm, SubsetSpec};
-use lfmm2::parallel::{
+use schnellfmm::bed::{decode_bed_chunk_into, BedFile, SnpNorm, SubsetSpec};
+use schnellfmm::parallel::{
     subset_indices, DisjointRowWriter, PerWorkerAccumulator, SnpBlock,
 };
-use lfmm2::precompute::precompute;
-use lfmm2::rsvd::qr_q;
-use lfmm2::simulate::{simulate, write_plink, SimConfig};
-
-#[derive(Parser)]
-#[command(name = "lfmm2-profile", about = "Profile LFMM2 pipeline phases")]
-struct Cli {
-    /// Number of samples
-    #[arg(long, default_value = "500")]
-    n: usize,
-
-    /// Number of SNPs
-    #[arg(long, default_value = "50000")]
-    p: usize,
-
-    /// Number of latent factors
-    #[arg(long, default_value = "5")]
-    k: usize,
-
-    /// Number of covariates
-    #[arg(long, default_value = "2")]
-    d: usize,
-
-    /// Worker threads
-    #[arg(long, default_value_t = default_threads())]
-    threads: usize,
-
-    /// SNPs per chunk
-    #[arg(long, default_value = "10000")]
-    chunk_size: usize,
-
-    /// RSVD oversampling
-    #[arg(long, default_value = "10")]
-    oversampling: usize,
-
-    /// RSVD power iterations
-    #[arg(long, default_value = "2")]
-    power_iter: usize,
-
-    /// RNG seed
-    #[arg(long, default_value = "42")]
-    seed: u64,
-
-    /// Ridge penalty
-    #[arg(long, default_value = "1e-5")]
-    lambda: f64,
-
-    /// Directory for temporary PLINK files. Use a real (non-tmpfs) filesystem
-    /// to get meaningful IO measurements. Defaults to current working directory.
-    #[arg(long)]
-    tmpdir: Option<PathBuf>,
-}
-
-fn default_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(1))
-        .unwrap_or(1)
-}
+use schnellfmm::precompute::precompute;
+use schnellfmm::rsvd::qr_q;
+use schnellfmm::simulate::{simulate, write_plink, SimConfig};
 
 extern "C" {
     fn openblas_set_num_threads(num_threads: std::ffi::c_int);
@@ -122,7 +67,7 @@ fn fs_type(path: &std::path::Path) -> String {
     }
     let label = best.1.to_string();
     if label == "tmpfs" {
-        "tmpfs -- IO times will be 0, use --tmpdir /path/on/disk".to_string()
+        "tmpfs -- IO times will be 0, use a real disk path".to_string()
     } else {
         label
     }
@@ -523,26 +468,38 @@ fn safe_inv(a: &Array2<f64>) -> Result<Array2<f64>> {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Profile test
 // ---------------------------------------------------------------------------
 
-fn main() -> Result<()> {
+/// Runs the full LFMM2 pipeline with timing instrumentation.
+///
+/// Uses default profiling parameters (n=500, p=50_000, K=5, d=2).
+/// Gated behind the `profiling` feature and marked `#[ignore]` so it
+/// doesn't run in normal `cargo test`; invoke with:
+///
+///   cargo test --features profiling --test profile -- --ignored --nocapture
+#[test]
+#[ignore]
+fn profile_pipeline() -> Result<()> {
+    // Default parameters (matching the former CLI defaults)
+    let n = 500_usize;
+    let p = 50_000_usize;
+    let k = 5_usize;
+    let d = 2_usize;
+    let chunk_size = 10_000_usize;
+    let n_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(1))
+        .unwrap_or(1)
+        .max(1);
+    let oversampling = 10_usize;
+    let l = k + oversampling;
+    let n_power_iter = 2_usize;
+    let seed = 42_u64;
+    let lambda = 1e-5_f64;
+
     std::env::set_var("OPENBLAS_NUM_THREADS", "1");
     std::env::set_var("MKL_NUM_THREADS", "1");
     unsafe { openblas_set_num_threads(1); }
-
-    let cli = Cli::parse();
-    let n = cli.n;
-    let p = cli.p;
-    let k = cli.k;
-    let d = cli.d;
-    let chunk_size = cli.chunk_size;
-    let n_workers = cli.threads.max(1);
-    let oversampling = cli.oversampling;
-    let l = k + oversampling;
-    let n_power_iter = cli.power_iter;
-    let seed = cli.seed;
-    let lambda = cli.lambda;
 
     eprintln!(
         "LFMM2 Profile: n={}, p={}, K={}, d={}, threads={}, chunk_size={}",
@@ -579,14 +536,9 @@ fn main() -> Result<()> {
     // Phase 1b: Write PLINK + drop page cache + open BED
     // -----------------------------------------------------------------------
     let ph = Phase::start("Data: write PLINK");
-    let tmp_dir = match &cli.tmpdir {
-        Some(dir) => tempfile::Builder::new()
-            .prefix(".lfmm2_profile_")
-            .tempdir_in(dir)?,
-        None => tempfile::Builder::new()
-            .prefix(".lfmm2_profile_")
-            .tempdir_in(".")?,
-    };
+    let tmp_dir = tempfile::Builder::new()
+        .prefix(".lfmm2_profile_")
+        .tempdir_in(".")?;
     eprintln!("  tmpdir: {} ({})",
         tmp_dir.path().display(),
         fs_type(tmp_dir.path()),
@@ -639,7 +591,7 @@ fn main() -> Result<()> {
         phases.push(PhaseResult {
             name: "RSVD: sketch pass".to_string(),
             wall_secs: ss.wall_secs,
-            cpu_secs: 0.0, // filled from stream stats
+            cpu_secs: 0.0,
             rss_mb: rss_mb(),
         });
         stream_stats.push(ss);
@@ -826,8 +778,7 @@ fn main() -> Result<()> {
     // 4c: GIF calibration
     let ph = Phase::start("Assoc: GIF calibration");
     let normal = statrs::distribution::Normal::new(0.0, 1.0).unwrap();
-    let mut _p_values = Array2::<f64>::zeros((p, d));
-    let mut _avg_gif = 0.0;
+    let mut avg_gif = 0.0;
 
     for j in 0..d {
         let t_col = t_stats.column(j);
@@ -835,15 +786,15 @@ fn main() -> Result<()> {
         z_sq.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median_z_sq = median_sorted(&z_sq);
         let gif = if median_z_sq < 1e-10 { 1.0 } else { median_z_sq / 0.4549 };
-        _avg_gif += gif;
+        avg_gif += gif;
         let gif_sqrt = gif.sqrt();
         for i in 0..p {
             let z = t_stats[(i, j)];
             let z_cal = z / gif_sqrt;
-            _p_values[(i, j)] = 2.0 * normal.cdf(-z_cal.abs());
+            let _ = 2.0 * normal.cdf(-z_cal.abs());
         }
     }
-    _avg_gif /= d as f64;
+    avg_gif /= d as f64;
     phases.push(ph.stop());
 
     // -----------------------------------------------------------------------
@@ -926,7 +877,10 @@ fn main() -> Result<()> {
     }
 
     eprintln!();
-    eprintln!("GIF: {:.4}", _avg_gif);
+    eprintln!("GIF: {:.4}", avg_gif);
+
+    // Smoke-check: GIF should be in a reasonable range
+    assert!(avg_gif > 0.0, "GIF should be positive");
 
     Ok(())
 }

@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use crate::bed::{BedFile, BimRecord, SubsetSpec};
-use crate::parallel::{parallel_stream, DisjointRowWriter};
+use crate::parallel::{parallel_stream, DisjointRowWriter, DisjointSliceWriter};
 use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
@@ -34,6 +34,12 @@ pub struct TestResults {
     pub p_values: Array2<f64>,
     /// Genomic inflation factor
     pub gif: f64,
+    /// Per-SNP proportion of variance explained by covariates X: length p
+    pub r2_cov: Vec<f64>,
+    /// Per-SNP proportion of variance explained by latent factors U: length p
+    pub r2_latent: Vec<f64>,
+    /// Per-SNP residual proportion of variance: length p
+    pub r2_resid: Vec<f64>,
 }
 
 /// Perform Steps 3-4 fused in a single pass over Y_full.
@@ -106,6 +112,9 @@ pub fn test_associations_fused(
     // Allocate output arrays
     let mut effect_sizes = Array2::<f64>::zeros((p, d));
     let mut t_stats = Array2::<f64>::zeros((p, d));
+    let mut r2_cov = vec![0.0f64; p];
+    let mut r2_latent = vec![0.0f64; p];
+    let mut r2_resid = vec![0.0f64; p];
 
     // Create temp dir for chunk files if writing output
     let chunk_dir = if output.is_some() {
@@ -128,6 +137,9 @@ pub fn test_associations_fused(
     {
         let wr_effects = DisjointRowWriter::new(&mut effect_sizes);
         let wr_tstats = DisjointRowWriter::new(&mut t_stats);
+        let wr_r2_cov = DisjointSliceWriter::new(&mut r2_cov);
+        let wr_r2_latent = DisjointSliceWriter::new(&mut r2_latent);
+        let wr_r2_resid = DisjointSliceWriter::new(&mut r2_resid);
         parallel_stream(y_full, &subset, chunk_size, config.n_workers, config.norm, |_worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let chunk_cols = block.n_cols;
@@ -143,9 +155,19 @@ pub fn test_associations_fused(
             let fitted = c.dot(&coefs); // n × chunk_cols
             let residuals = &chunk - &fitted; // n × chunk_cols
 
+            // Variance decomposition: split fitted into covariate and latent parts.
+            // fitted_x = X @ coefs[0..d, :], fitted_u = fitted - fitted_x
+            let coefs_x = coefs.slice(ndarray::s![..d, ..]);
+            let fitted_x = x.dot(&coefs_x); // n × chunk_cols
+            // fitted_u = fitted - fitted_x (avoids a second matmul)
+
             let mut local_tstats = Array2::<f64>::zeros((chunk_cols, d));
+            let mut local_r2_cov = vec![0.0f64; chunk_cols];
+            let mut local_r2_latent = vec![0.0f64; chunk_cols];
+            let mut local_r2_resid = vec![0.0f64; chunk_cols];
 
             for col_in_chunk in 0..chunk_cols {
+                let y_col = chunk.column(col_in_chunk);
                 let res_col = residuals.column(col_in_chunk);
                 let rss: f64 = res_col.dot(&res_col);
                 let sigma2 = rss / df;
@@ -154,17 +176,37 @@ pub fn test_associations_fused(
                     let (t, _) = t_test(coefs[(j, col_in_chunk)], sigma2, ctc_inv_diag[j], df);
                     local_tstats[(col_in_chunk, j)] = t;
                 }
+
+                // Variance decomposition
+                let tss: f64 = y_col.dot(&y_col);
+                if tss > 1e-300 {
+                    let fx_col = fitted_x.column(col_in_chunk);
+                    let ss_cov: f64 = fx_col.dot(&fx_col);
+                    // fitted_u = fitted - fitted_x for this column
+                    let fu_col = &fitted.column(col_in_chunk) - &fx_col;
+                    let ss_latent: f64 = fu_col.dot(&fu_col);
+                    local_r2_cov[col_in_chunk] = ss_cov / tss;
+                    local_r2_latent[col_in_chunk] = ss_latent / tss;
+                    local_r2_resid[col_in_chunk] = rss / tss;
+                }
+                // else: monomorphic SNP, all zeros → leave r2 as 0.0
             }
 
             unsafe {
                 wr_effects.write_rows(start, &b_chunk_t);
                 wr_tstats.write_rows(start, &local_tstats);
+                wr_r2_cov.write_slice(start, &local_r2_cov);
+                wr_r2_latent.write_slice(start, &local_r2_latent);
+                wr_r2_resid.write_slice(start, &local_r2_resid);
             }
 
             // Write chunk TSV fragment if output configured
             if let Some(ref dir) = chunk_dir {
                 let bim_slice = &output.unwrap().bim[start..start + chunk_cols];
-                write_chunk_tsv(dir.path(), block.seq, bim_slice, &b_chunk_t, &local_tstats, d)
+                write_chunk_tsv(
+                    dir.path(), block.seq, bim_slice, &b_chunk_t, &local_tstats,
+                    &local_r2_cov, &local_r2_latent, &local_r2_resid, d,
+                )
                     .expect("failed to write chunk file");
             }
 
@@ -227,18 +269,24 @@ pub fn test_associations_fused(
         t_stats,
         p_values,
         gif: avg_gif,
+        r2_cov,
+        r2_latent,
+        r2_resid,
     })
 }
 
-/// Write a chunk's effect sizes and t-statistics as a TSV fragment (no header).
+/// Write a chunk's effect sizes, t-statistics, and variance decomposition as a TSV fragment.
 ///
-/// Format: `chr\tpos\tsnp_id\tbeta_0\tt_0\tbeta_1\tt_1\t...`
+/// Format: `chr\tpos\tsnp_id\tbeta_0\tt_0\t...\tr2_cov\tr2_latent\tr2_resid`
 fn write_chunk_tsv(
     dir: &Path,
     seq: usize,
     bim: &[BimRecord],
     betas: &Array2<f64>,
     tstats: &Array2<f64>,
+    r2_cov: &[f64],
+    r2_latent: &[f64],
+    r2_resid: &[f64],
     d: usize,
 ) -> Result<()> {
     let path = dir.join(format!("chunk_{:06}.tsv", seq));
@@ -249,6 +297,7 @@ fn write_chunk_tsv(
         for j in 0..d {
             write!(f, "\t{:.6e}\t{:.6e}", betas[(i, j)], tstats[(i, j)])?;
         }
+        write!(f, "\t{:.6e}\t{:.6e}\t{:.6e}", r2_cov[i], r2_latent[i], r2_resid[i])?;
         writeln!(f)?;
     }
     Ok(())
@@ -275,14 +324,17 @@ fn coalesce_output(
             .with_context(|| format!("Failed to create {}", output_path.display()))?,
     );
 
-    // Header: chr, pos, snp_id, then per-covariate p/beta/t triples
+    // Header: chr, pos, snp_id, per-covariate p/beta/t triples, then variance decomposition
     write!(out, "chr\tpos\tsnp_id")?;
     for name in cov_names {
         write!(out, "\tp_{}\tbeta_{}\tt_{}", name, name, name)?;
     }
+    write!(out, "\tr2_cov\tr2_latent\tr2_resid")?;
     writeln!(out)?;
 
     // Concatenate chunk files in sequence order, inserting calibrated p-values
+    // Chunk format: chr, pos, snp_id, [beta_j, t_j]*d, r2_cov, r2_latent, r2_resid
+    let r2_offset = 3 + d * 2; // index of r2_cov in chunk fields
     for seq in 0..n_chunks {
         let chunk_path = chunk_dir.join(format!("chunk_{:06}.tsv", seq));
         let f = std::fs::File::open(&chunk_path)
@@ -294,7 +346,6 @@ fn coalesce_output(
                 continue;
             }
             let fields: Vec<&str> = line.split('\t').collect();
-            // Chunk format: chr, pos, snp_id, beta_0, t_0, beta_1, t_1, ...
             write!(out, "{}\t{}\t{}", fields[0], fields[1], fields[2])?;
             for j in 0..d {
                 let beta_str = fields[3 + j * 2];
@@ -304,6 +355,8 @@ fn coalesce_output(
                 let p_cal = 2.0 * normal.cdf(-z_cal.abs());
                 write!(out, "\t{:.6e}\t{}\t{}", p_cal, beta_str, t_str)?;
             }
+            // Variance decomposition columns (pass through from chunk)
+            write!(out, "\t{}\t{}\t{}", fields[r2_offset], fields[r2_offset + 1], fields[r2_offset + 2])?;
             writeln!(out)?;
         }
     }
