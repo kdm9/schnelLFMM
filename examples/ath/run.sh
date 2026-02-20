@@ -38,5 +38,13 @@ plink1.9 --bfile 1k1g_intersect --out 1k1g_intersect_ldprune --extract 1k1g_inte
 plink1.9 --recode ped --out 1k1g_intersect_ldprune --bfile 1k1g_intersect_ldprune
 
 cargo build --release --bin schnelfmm
-time ../../target/release/schnelfmm --bed 1k1g_intersect_ldprune.bed --cov pheno_intersect.tsv -k $LFMM_K --out ath_ft10_rs_k$LFMM_K -t 12
+
+../../target/release/schnelfmm  --help
+time ../../target/release/schnelfmm \
+    --bed 1k1g_intersect_ldprune.bed \
+    --cov pheno_intersect.tsv \
+    -k $LFMM_K \
+    --out ath_ft10_rs_k$LFMM_K \
+    -t 12 \
+    --norm center-only
 time Rscript compare.R $LFMM_K

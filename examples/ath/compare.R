@@ -1,3 +1,6 @@
+#' ---
+#' title: Arabidopsis flowering time GWAS comparison (LEA vs schneLFMM)
+#' ---
 library(tidyverse)
 library(rhdf5)
 library(LEA)
@@ -81,31 +84,4 @@ all_results |>
         scale_alpha_manual(values=c(1, 0.1)) +
         facet_grid(name~chrom, space="free_x", scale="free_x") +
         theme_bw()
-
-all_results |>
-    pivot_longer(starts_with("score_")) |>
-    filter(chrom=="chr1", pos < 25e6, pos > 24e6) |>
-    ggplot(aes(x=pos, y=value, colour=name, alpha=value<sig)) +
-        geom_point() +
-        scale_alpha_manual(values=c(1, 0.8)) +
-        facet_grid(name~chrom, space="free_x", scale="free_x") +
-        theme_bw()
-
-
-all_results |>
-    pivot_longer(starts_with("score_")) |>
-    filter(chrom=="chr5", pos >= 17e6, pos <= 19e6) |>
-    ggplot(aes(x=pos, y=value, colour=name, alpha=value<sig)) +
-        geom_point() +
-        scale_alpha_manual(values=c(1, 0.8)) +
-        facet_grid(name~chrom, space="free_x", scale="free_x") +
-        theme_bw()
-
-all_results |>
-    pivot_longer(starts_with("score_")) |>
-    filter(chrom=="chr5", pos >= 17e6, pos <= 19e6) |>
-    ggplot(aes(x=pos, y=value, colour=name, alpha=value<sig)) +
-        geom_point() +
-        scale_alpha_manual(values=c(1, 0.8)) +
-        facet_grid(name~chrom, space="free_x", scale="free_x") +
-        theme_bw()
+ggsave("res_full_manhattan.png", width=12, height=8, dpi=600)
