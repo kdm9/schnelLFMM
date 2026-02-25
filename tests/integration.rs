@@ -880,7 +880,7 @@ fn lfmm2_bin() -> std::path::PathBuf {
         .parent()  // debug/ or release/
         .unwrap()
         .to_path_buf();
-    path.push("lfmm2");
+    path.push("schnellfmm");
     path
 }
 
