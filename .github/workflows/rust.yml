@@ -35,6 +35,11 @@ jobs:
       run: sudo apt-get update && sudo apt-get install -y gfortran libopenblas-dev
 
     - name: Build
+      env:
+        # Pin OpenBLAS (compiled from source by openblas-src) to a stable
+        # x86-64-v3 baseline (AVX2/FMA) so the binary works on all current
+        # GitHub runners regardless of exact CPU model.
+        OPENBLAS_TARGET: HASWELL
       run: cargo build --verbose --release
 
     - name: Run tests
