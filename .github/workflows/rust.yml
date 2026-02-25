@@ -99,7 +99,7 @@ jobs:
       uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust }}
-        targets: x86_64-apple-darwin,aarch64-apple-darwin
+        targets: aarch64-apple-darwin
 
     - name: Cache cargo
       uses: Swatinem/rust-cache@v2
@@ -116,62 +116,64 @@ jobs:
     - name: Build (arm64)
       run: cargo build --verbose --release --target aarch64-apple-darwin
 
-    - name: Build (x86_64)
-      run: cargo build --verbose --release --target x86_64-apple-darwin
+    #- name: Build (x86_64)
+    #  run: cargo build --verbose --release --target x86_64-apple-darwin
 
     - name: Run tests
       run: cargo test --verbose --release
 
-    - name: Create universal binary
-      if: matrix.rust == 'stable'
-      run: |
-        lipo -create \
-          target/aarch64-apple-darwin/release/schnellfmm \
-          target/x86_64-apple-darwin/release/schnellfmm \
-          -output schnellfmm-universal
+    #- name: Create universal binary
+    #  if: matrix.rust == 'stable'
+    #  run: |
+    #    lipo -create \
+    #      target/aarch64-apple-darwin/release/schnellfmm \
+    #      target/x86_64-apple-darwin/release/schnellfmm \
+    #      -output schnellfmm-universal
 
     - name: Upload binary
       if: matrix.rust == 'stable'
       uses: actions/upload-artifact@v4
       with:
         name: schnellfmm-macos-universal
-        path: schnellfmm-universal
+        #path: schnellfmm-universal
+        path: target/aarch64-apple-darwin/release/schnellfmm
 
-  build-windows:
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: [stable, nightly]
-
-    runs-on: windows-latest
-
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ matrix.rust }}
-
-    - name: Cache cargo
-      uses: Swatinem/rust-cache@v2
-      with:
-        key: windows-x86_64-${{ matrix.rust }}
-
-    - name: Install dependencies
-      run: |
-        vcpkg install openblas:x64-windows
-        echo "OPENBLAS_DIR=C:\vcpkg\installed\x64-windows" >> $env:GITHUB_ENV
-
-    - name: Build
-      run: cargo build --verbose --release
-
-    - name: Run tests
-      run: cargo test --verbose --release
-
-    - name: Upload binary
-      if: matrix.rust == 'stable'
-      uses: actions/upload-artifact@v4
-      with:
-        name: schnellfmm-windows-x86_64
-        path: target/release/schnellfmm.exe
+# Simply doesn't work with openblas-src, see https://github.com/blas-lapack-rs/openblas-src/issues/131
+#  build-windows:
+#    strategy:
+#      fail-fast: false
+#      matrix:
+#        rust: [stable, nightly]
+#
+#    runs-on: windows-latest
+#
+#    steps:
+#    - uses: actions/checkout@v4
+#
+#    - name: Install Rust toolchain
+#      uses: dtolnay/rust-toolchain@master
+#      with:
+#        toolchain: ${{ matrix.rust }}
+#
+#    - name: Cache cargo
+#      uses: Swatinem/rust-cache@v2
+#      with:
+#        key: windows-x86_64-${{ matrix.rust }}
+#
+#    - name: Install dependencies
+#      run: |
+#        vcpkg install openblas:x64-windows
+#        echo "OPENBLAS_DIR=C:\vcpkg\installed\x64-windows" >> $env:GITHUB_ENV
+#
+#    - name: Build
+#      run: cargo build --verbose --release
+#
+#    - name: Run tests
+#      run: cargo test --verbose --release
+#
+#    - name: Upload binary
+#      if: matrix.rust == 'stable'
+#      uses: actions/upload-artifact@v4
+#      with:
+#        name: schnellfmm-windows-x86_64
+#        path: target/release/schnellfmm.exe
