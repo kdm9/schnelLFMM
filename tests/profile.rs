@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use schnelfmm::bed::{decode_bed_chunk_into, BedFile, SnpNorm, SubsetSpec};
+use std::sync::Mutex;
+
 use schnelfmm::parallel::{
-    subset_indices, DisjointRowWriter, PerWorkerAccumulator, SnpBlock,
+    subset_indices, PerWorkerAccumulator, SnpBlock,
 };
 use schnelfmm::precompute::precompute;
 use schnelfmm::rsvd::qr_q;
@@ -582,11 +584,14 @@ fn profile_pipeline() -> Result<()> {
     let mut z = Array2::<f64>::zeros((p_est, l));
     {
         let ss = StreamStats::new("Sketch", n_workers);
-        let writer = DisjointRowWriter::new(&mut z);
+        let z_mutex = Mutex::new(&mut z);
         profiled_stream(&bed, &subset, chunk_size, n_workers, SnpNorm::Eigenstrat, &ss, |_wid, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let z_block = chunk.t().dot(&mt_omega);
-            unsafe { writer.write_rows(block.seq * chunk_size, &z_block); }
+            let start = block.seq * chunk_size;
+            z_mutex.lock().unwrap()
+                .slice_mut(ndarray::s![start..start + z_block.nrows(), ..])
+                .assign(&z_block);
         });
         phases.push(PhaseResult {
             name: "RSVD: sketch pass".to_string(),
@@ -616,7 +621,7 @@ fn profile_pipeline() -> Result<()> {
                 let q_z_block = q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
                 let y_qz = chunk.dot(&q_z_block);
                 let partial = pre.m.dot(&y_qz);
-                unsafe { *acc.get_mut(wid) += &partial; }
+                *acc.get_mut(wid) += &partial;
             });
             a_qz = acc.sum();
             phases.push(PhaseResult {
@@ -643,11 +648,14 @@ fn profile_pipeline() -> Result<()> {
         {
             let label = format!("Power {} bwd", iter + 1);
             let ss = StreamStats::new(&label, n_workers);
-            let writer = DisjointRowWriter::new(&mut z);
+            let z_mutex = Mutex::new(&mut z);
             profiled_stream(&bed, &subset, chunk_size, n_workers, SnpNorm::Eigenstrat, &ss, |_wid, block| {
                 let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
                 let z_block = chunk.t().dot(&mt_q);
-                unsafe { writer.write_rows(block.seq * chunk_size, &z_block); }
+                let start = block.seq * chunk_size;
+                z_mutex.lock().unwrap()
+                    .slice_mut(ndarray::s![start..start + z_block.nrows(), ..])
+                    .assign(&z_block);
             });
             phases.push(PhaseResult {
                 name: format!("RSVD: power {} bwd", iter + 1),
@@ -675,7 +683,7 @@ fn profile_pipeline() -> Result<()> {
             let q_z_block = q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
             let y_qz = chunk.dot(&q_z_block);
             let partial = pre.m.dot(&y_qz);
-            unsafe { *acc.get_mut(wid) += &partial; }
+            *acc.get_mut(wid) += &partial;
         });
         b_svd = acc.sum();
         phases.push(PhaseResult {
@@ -733,8 +741,8 @@ fn profile_pipeline() -> Result<()> {
     let mut t_stats = Array2::<f64>::zeros((p, d));
     {
         let ss = StreamStats::new("Assoc test", n_workers);
-        let wr_effects = DisjointRowWriter::new(&mut effect_sizes);
-        let wr_tstats = DisjointRowWriter::new(&mut t_stats);
+        let mtx_effects = Mutex::new(&mut effect_sizes);
+        let mtx_tstats = Mutex::new(&mut t_stats);
         profiled_stream(&bed, &SubsetSpec::All, chunk_size, n_workers, SnpNorm::Eigenstrat, &ss, |_wid, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let chunk_cols = block.n_cols;
@@ -761,10 +769,12 @@ fn profile_pipeline() -> Result<()> {
                 }
             }
 
-            unsafe {
-                wr_effects.write_rows(start, &b_chunk_t);
-                wr_tstats.write_rows(start, &local_tstats);
-            }
+            mtx_effects.lock().unwrap()
+                .slice_mut(ndarray::s![start..start + chunk_cols, ..])
+                .assign(&b_chunk_t);
+            mtx_tstats.lock().unwrap()
+                .slice_mut(ndarray::s![start..start + chunk_cols, ..])
+                .assign(&local_tstats);
         });
         phases.push(PhaseResult {
             name: "Assoc: streaming pass".to_string(),

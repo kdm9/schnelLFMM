@@ -308,6 +308,7 @@ fn compute_scale(mean: f64, norm: SnpNorm) -> f64 {
     let twopq = 2.0 * p * (1.0 - p);
     match norm {
         SnpNorm::CenterOnly => {
+            // Invariant sites have zero variance, set all values to zero (in case all are 2)
             if twopq < 1e-20 { 0.0 } else { 1.0 }
         }
         SnpNorm::Eigenstrat => {

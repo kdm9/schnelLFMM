@@ -1,5 +1,5 @@
 use ndarray::Array2;
-use std::cell::UnsafeCell;
+use std::sync::Mutex;
 
 use crate::bed::{decode_bed_chunk_into, BedFile, SnpNorm, SubsetSpec};
 
@@ -17,137 +17,28 @@ pub struct SnpBlock {
     pub raw: Vec<u8>,
 }
 
-/// Allows multiple threads to write to disjoint row ranges of an Array2 without locking.
+/// Per-worker accumulator for forward passes that sum partial results.
 ///
-/// Safety invariant: each `seq` value maps to a unique, non-overlapping row range.
-/// This is guaranteed by construction — seq values are assigned sequentially by a single
-/// IO thread and each maps to `[seq * chunk_size .. seq * chunk_size + n_cols]`.
-pub struct DisjointRowWriter {
-    ptr: *mut f64,
-    n_rows: usize,
-    n_cols: usize,
-}
-
-unsafe impl Send for DisjointRowWriter {}
-unsafe impl Sync for DisjointRowWriter {}
-
-impl DisjointRowWriter {
-    /// Create a writer over a mutable Array2 in standard (row-major) layout.
-    ///
-    /// The array must remain valid and not be accessed mutably elsewhere
-    /// for the lifetime of this writer.
-    pub fn new(arr: &mut Array2<f64>) -> Self {
-        assert!(arr.is_standard_layout(), "Array must be row-major (standard layout)");
-        DisjointRowWriter {
-            ptr: arr.as_mut_ptr(),
-            n_rows: arr.nrows(),
-            n_cols: arr.ncols(),
-        }
-    }
-
-    /// Write `src` into rows `[row_start .. row_start + src.nrows()]`.
-    ///
-    /// # Safety
-    /// Caller must ensure no two threads write to overlapping row ranges.
-    pub unsafe fn write_rows(&self, row_start: usize, src: &Array2<f64>) {
-        let src_rows = src.nrows();
-        let src_cols = src.ncols();
-        assert!(
-            row_start + src_rows <= self.n_rows,
-            "write_rows: row_start={} + src_rows={} > n_rows={}",
-            row_start,
-            src_rows,
-            self.n_rows
-        );
-        assert_eq!(
-            src_cols, self.n_cols,
-            "write_rows: src_cols={} != n_cols={}",
-            src_cols, self.n_cols
-        );
-
-        if src.is_standard_layout() {
-            // Fast path: bulk copy
-            std::ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                self.ptr.add(row_start * self.n_cols),
-                src_rows * src_cols,
-            );
-        } else {
-            // Slow path: row-by-row
-            for r in 0..src_rows {
-                for c in 0..src_cols {
-                    let dst = self.ptr.add((row_start + r) * self.n_cols + c);
-                    *dst = src[(r, c)];
-                }
-            }
-        }
-    }
-}
-
-/// Allows multiple threads to write to disjoint ranges of a `Vec<f64>` without locking.
-///
-/// Safety invariant: each (start, len) pair maps to a unique, non-overlapping range.
-pub struct DisjointSliceWriter {
-    ptr: *mut f64,
-    len: usize,
-}
-
-unsafe impl Send for DisjointSliceWriter {}
-unsafe impl Sync for DisjointSliceWriter {}
-
-impl DisjointSliceWriter {
-    /// Create a writer over a mutable `Vec<f64>`.
-    pub fn new(slice: &mut [f64]) -> Self {
-        DisjointSliceWriter {
-            ptr: slice.as_mut_ptr(),
-            len: slice.len(),
-        }
-    }
-
-    /// Write `src` into `[start .. start + src.len()]`.
-    ///
-    /// # Safety
-    /// Caller must ensure no two threads write to overlapping ranges.
-    pub unsafe fn write_slice(&self, start: usize, src: &[f64]) {
-        debug_assert!(
-            start + src.len() <= self.len,
-            "write_slice: start={} + len={} > capacity={}",
-            start,
-            src.len(),
-            self.len,
-        );
-        std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(start), src.len());
-    }
-}
-
-/// Lock-free per-worker accumulator for forward passes that sum partial results.
-///
-/// Each worker thread writes exclusively to its own buffer (indexed by worker_id).
+/// Each worker thread locks its own buffer (indexed by worker_id) before writing.
 /// After all workers finish, call `.sum()` to merge all buffers.
-///
-/// Safety invariant: each worker_id must be used by exactly one thread at a time.
-/// This is guaranteed by `parallel_stream`, which assigns unique indices to workers.
 pub struct PerWorkerAccumulator {
-    buffers: Vec<UnsafeCell<Array2<f64>>>,
+    buffers: Vec<Mutex<Array2<f64>>>,
 }
-
-unsafe impl Sync for PerWorkerAccumulator {}
 
 impl PerWorkerAccumulator {
     /// Create `n_workers` zero-initialized accumulators of the given shape.
     pub fn new(n_workers: usize, shape: (usize, usize)) -> Self {
         let buffers = (0..n_workers)
-            .map(|_| UnsafeCell::new(Array2::<f64>::zeros(shape)))
+            .map(|_| Mutex::new(Array2::<f64>::zeros(shape)))
             .collect();
         PerWorkerAccumulator { buffers }
     }
 
     /// Get a mutable reference to the buffer for `worker_id`.
     ///
-    /// # Safety
-    /// Caller must ensure no two threads access the same `worker_id` concurrently.
-    pub unsafe fn get_mut(&self, worker_id: usize) -> &mut Array2<f64> {
-        &mut *self.buffers[worker_id].get()
+    /// Returns a `MutexGuard` that dereferences to `&mut Array2<f64>`.
+    pub fn get_mut(&self, worker_id: usize) -> std::sync::MutexGuard<'_, Array2<f64>> {
+        self.buffers[worker_id].lock().unwrap()
     }
 
     /// Consume the accumulator and return the element-wise sum of all buffers.
@@ -155,7 +46,7 @@ impl PerWorkerAccumulator {
         let mut buffers: Vec<Array2<f64>> = self
             .buffers
             .into_iter()
-            .map(|cell| cell.into_inner())
+            .map(|m| m.into_inner().unwrap())
             .collect();
         let mut total = buffers.pop().expect("PerWorkerAccumulator must have >= 1 buffer");
         for buf in buffers {
@@ -297,4 +188,116 @@ pub fn parallel_stream<F>(
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    use std::sync::Mutex;
+
+    #[test]
+    fn test_mutex_row_write_basic() {
+        let mut arr = Array2::<f64>::zeros((4, 3));
+        let mtx = Mutex::new(&mut arr);
+
+        // Write to rows 1..3
+        let src = Array2::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        {
+            let mut guard = mtx.lock().unwrap();
+            guard.slice_mut(ndarray::s![1..3, ..]).assign(&src);
+        }
+
+        assert_eq!(arr[(0, 0)], 0.0);
+        assert_eq!(arr[(1, 0)], 1.0);
+        assert_eq!(arr[(1, 2)], 3.0);
+        assert_eq!(arr[(2, 0)], 4.0);
+        assert_eq!(arr[(2, 2)], 6.0);
+        assert_eq!(arr[(3, 0)], 0.0);
+    }
+
+    #[test]
+    fn test_mutex_row_write_multithreaded() {
+        let n_threads = 4;
+        let rows_per_thread = 10;
+        let cols = 5;
+        let total_rows = n_threads * rows_per_thread;
+        let mut arr = Array2::<f64>::zeros((total_rows, cols));
+
+        {
+            let mtx = Mutex::new(&mut arr);
+            std::thread::scope(|s| {
+                for t in 0..n_threads {
+                    let mtx = &mtx;
+                    s.spawn(move || {
+                        let start = t * rows_per_thread;
+                        let block = Array2::from_shape_fn(
+                            (rows_per_thread, cols),
+                            |(r, c)| ((start + r) * cols + c) as f64,
+                        );
+                        let mut guard = mtx.lock().unwrap();
+                        guard
+                            .slice_mut(ndarray::s![start..start + rows_per_thread, ..])
+                            .assign(&block);
+                    });
+                }
+            });
+        }
+
+        for r in 0..total_rows {
+            for c in 0..cols {
+                assert_eq!(arr[(r, c)], (r * cols + c) as f64);
+            }
+        }
+    }
+
+    #[test]
+    fn test_mutex_slice_write_multithreaded() {
+        let n_threads = 4;
+        let elems_per_thread = 10;
+        let total = n_threads * elems_per_thread;
+        let mut data = vec![0.0f64; total];
+
+        {
+            let mtx = Mutex::new(&mut data[..]);
+            std::thread::scope(|s| {
+                for t in 0..n_threads {
+                    let mtx = &mtx;
+                    s.spawn(move || {
+                        let start = t * elems_per_thread;
+                        let values: Vec<f64> =
+                            (start..start + elems_per_thread).map(|i| i as f64).collect();
+                        let mut guard = mtx.lock().unwrap();
+                        guard[start..start + elems_per_thread].copy_from_slice(&values);
+                    });
+                }
+            });
+        }
+
+        for i in 0..total {
+            assert_eq!(data[i], i as f64);
+        }
+    }
+
+    #[test]
+    fn test_per_worker_accumulator() {
+        let n_workers = 4;
+        let shape = (3, 2);
+        let acc = PerWorkerAccumulator::new(n_workers, shape);
+
+        std::thread::scope(|s| {
+            for w in 0..n_workers {
+                let acc = &acc;
+                s.spawn(move || {
+                    let mut guard = acc.get_mut(w);
+                    *guard += &Array2::from_elem(shape, (w + 1) as f64);
+                });
+            }
+        });
+
+        let result = acc.sum();
+        // Sum of 1+2+3+4 = 10, each element should be 10.0
+        let expected = Array2::from_elem(shape, 10.0);
+        assert_eq!(result, expected);
+    }
 }

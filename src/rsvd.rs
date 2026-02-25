@@ -4,9 +4,10 @@ use ndarray_linalg::SVD;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Normal};
+use std::sync::Mutex;
 
 use crate::bed::{BedFile, SubsetSpec};
-use crate::parallel::{parallel_stream, DisjointRowWriter, PerWorkerAccumulator};
+use crate::parallel::{parallel_stream, PerWorkerAccumulator};
 use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
@@ -47,13 +48,14 @@ pub fn estimate_factors_streaming(
     let mut z = Array2::<f64>::zeros((p_est, l));
     {
         let pb = make_progress_bar(n_chunks, "RSVD sketch", show);
-        let writer = DisjointRowWriter::new(&mut z);
+        let z_mutex = Mutex::new(&mut z);
         parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, |_worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let z_block = chunk.t().dot(&mt_omega);
-            unsafe {
-                writer.write_rows(block.seq * chunk_size, &z_block);
-            }
+            let start = block.seq * chunk_size;
+            z_mutex.lock().unwrap()
+                .slice_mut(ndarray::s![start..start + z_block.nrows(), ..])
+                .assign(&z_block);
             pb.inc(1);
         });
         pb.finish_and_clear();
@@ -78,7 +80,7 @@ pub fn estimate_factors_streaming(
                     q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
                 let y_qz = chunk.dot(&q_z_block);
                 let partial = pre.m.dot(&y_qz);
-                unsafe { *acc.get_mut(worker_id) += &partial; }
+                *acc.get_mut(worker_id) += &partial;
                 pb.inc(1);
             });
             a_qz = acc.sum();
@@ -94,13 +96,14 @@ pub fn estimate_factors_streaming(
         {
             let label = format!("Power iter {}/{} (bwd)", iter + 1, config.n_power_iter);
             let pb = make_progress_bar(n_chunks, &label, show);
-            let writer = DisjointRowWriter::new(&mut z);
+            let z_mutex = Mutex::new(&mut z);
             parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, |_worker_id, block| {
                 let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
                 let z_block = chunk.t().dot(&mt_q);
-                unsafe {
-                    writer.write_rows(block.seq * chunk_size, &z_block);
-                }
+                let start = block.seq * chunk_size;
+                z_mutex.lock().unwrap()
+                    .slice_mut(ndarray::s![start..start + z_block.nrows(), ..])
+                    .assign(&z_block);
                 pb.inc(1);
             });
             pb.finish_and_clear();
@@ -123,7 +126,7 @@ pub fn estimate_factors_streaming(
                 q_z.slice(ndarray::s![offset..offset + block.n_cols, ..]);
             let y_qz = chunk.dot(&q_z_block);
             let partial = pre.m.dot(&y_qz);
-            unsafe { *acc.get_mut(worker_id) += &partial; }
+            *acc.get_mut(worker_id) += &partial;
             pb.inc(1);
         });
         b_svd = acc.sum();

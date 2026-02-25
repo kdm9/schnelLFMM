@@ -5,8 +5,10 @@ use statrs::distribution::{ContinuousCDF, Normal, StudentsT};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
+use std::sync::Mutex;
+
 use crate::bed::{BedFile, BimRecord, SubsetSpec};
-use crate::parallel::{parallel_stream, DisjointRowWriter, DisjointSliceWriter};
+use crate::parallel::parallel_stream;
 use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
@@ -117,8 +119,8 @@ pub fn test_associations_fused(
     let mut r2_resid = vec![0.0f64; p];
 
     // Create temp dir for chunk files if writing output
-    let chunk_dir = if output.is_some() {
-        let parent = output.unwrap().path.parent().unwrap_or(Path::new("."));
+    let chunk_dir = if let Some(out) = output {
+        let parent = out.path.parent().unwrap_or(Path::new("."));
         Some(
             tempfile::Builder::new()
                 .prefix(".lfmm2_chunks_")
@@ -135,11 +137,11 @@ pub fn test_associations_fused(
     let pb = make_progress_bar(n_chunks as u64, "Association tests", config.progress);
 
     {
-        let wr_effects = DisjointRowWriter::new(&mut effect_sizes);
-        let wr_tstats = DisjointRowWriter::new(&mut t_stats);
-        let wr_r2_cov = DisjointSliceWriter::new(&mut r2_cov);
-        let wr_r2_latent = DisjointSliceWriter::new(&mut r2_latent);
-        let wr_r2_resid = DisjointSliceWriter::new(&mut r2_resid);
+        let mtx_effects = Mutex::new(&mut effect_sizes);
+        let mtx_tstats = Mutex::new(&mut t_stats);
+        let mtx_r2_cov = Mutex::new(&mut r2_cov[..]);
+        let mtx_r2_latent = Mutex::new(&mut r2_latent[..]);
+        let mtx_r2_resid = Mutex::new(&mut r2_resid[..]);
         parallel_stream(y_full, &subset, chunk_size, config.n_workers, config.norm, |_worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let chunk_cols = block.n_cols;
@@ -192,13 +194,18 @@ pub fn test_associations_fused(
                 // else: monomorphic SNP, all zeros → leave r2 as 0.0
             }
 
-            unsafe {
-                wr_effects.write_rows(start, &b_chunk_t);
-                wr_tstats.write_rows(start, &local_tstats);
-                wr_r2_cov.write_slice(start, &local_r2_cov);
-                wr_r2_latent.write_slice(start, &local_r2_latent);
-                wr_r2_resid.write_slice(start, &local_r2_resid);
-            }
+            mtx_effects.lock().unwrap()
+                .slice_mut(ndarray::s![start..start + chunk_cols, ..])
+                .assign(&b_chunk_t);
+            mtx_tstats.lock().unwrap()
+                .slice_mut(ndarray::s![start..start + chunk_cols, ..])
+                .assign(&local_tstats);
+            mtx_r2_cov.lock().unwrap()[start..start + chunk_cols]
+                .copy_from_slice(&local_r2_cov);
+            mtx_r2_latent.lock().unwrap()[start..start + chunk_cols]
+                .copy_from_slice(&local_r2_latent);
+            mtx_r2_resid.lock().unwrap()[start..start + chunk_cols]
+                .copy_from_slice(&local_r2_resid);
 
             // Write chunk TSV fragment if output configured
             if let Some(ref dir) = chunk_dir {
