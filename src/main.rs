@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use schnelfmm::bed::{BedFile, SubsetSpec};
-use schnelfmm::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
+use schnellfmm::bed::{BedFile, SubsetSpec};
+use schnellfmm::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
 
 #[derive(Parser)]
 #[command(name = "lfmm2", about = "Latent Factor Mixed Model v2 — GWAS with latent confounders")]
@@ -294,7 +294,7 @@ fn guess_delimiter(path: &Path) -> char {
 /// `kept_fam_indices` contains the original .fam row indices of the kept samples.
 fn load_covariates(
     path: &Path,
-    fam: &[schnelfmm::bed::FamRecord],
+    fam: &[schnellfmm::bed::FamRecord],
     intersect: bool,
     verbose: bool,
 ) -> Result<(Vec<String>, Array2<f64>, Vec<usize>)> {

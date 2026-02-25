@@ -10,15 +10,15 @@ use statrs::distribution::{ContinuousCDF, StudentsT};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use schnelfmm::bed::{decode_bed_chunk_into, BedFile, SnpNorm, SubsetSpec};
+use schnellfmm::bed::{decode_bed_chunk_into, BedFile, SnpNorm, SubsetSpec};
 use std::sync::Mutex;
 
-use schnelfmm::parallel::{
+use schnellfmm::parallel::{
     subset_indices, PerWorkerAccumulator, SnpBlock,
 };
-use schnelfmm::precompute::precompute;
-use schnelfmm::rsvd::qr_q;
-use schnelfmm::simulate::{simulate, write_plink, SimConfig};
+use schnellfmm::precompute::precompute;
+use schnellfmm::rsvd::qr_q;
+use schnellfmm::simulate::{simulate, write_plink, SimConfig};
 
 extern "C" {
     fn openblas_set_num_threads(num_threads: std::ffi::c_int);

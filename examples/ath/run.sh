@@ -1,4 +1,4 @@
-LFMM_K=12
+LFMM_K=20
 if [ ! -f 261.hdf5 ]
 then
     wget -O 261.hdf5 https://aragwas.1001genomes.org/api/studies/261/download/
@@ -37,10 +37,8 @@ plink1.9 --bfile 1k1g --out 1k1g_intersect --keep intersection.fam --indep-pairw
 plink1.9 --bfile 1k1g_intersect --out 1k1g_intersect_ldprune --extract 1k1g_intersect.prune.in --make-bed
 plink1.9 --recode ped --out 1k1g_intersect_ldprune --bfile 1k1g_intersect_ldprune
 
-cargo build --release --bin schnelfmm
-
-../../target/release/schnelfmm  --help
-time ../../target/release/schnelfmm \
+cargo build --release --bin schnellfmm
+time ../../target/release/schnellfmm \
     --bed 1k1g_intersect_ldprune.bed \
     --cov pheno_intersect.tsv \
     -k $LFMM_K \
