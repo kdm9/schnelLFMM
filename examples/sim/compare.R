@@ -3,12 +3,14 @@ library(tidyverse)
 sim = read_tsv("massive_causal.tsv") |>
     glimpse()
 
-gwas = read_tsv("massive_gwas.tsv") |>
-    pivot_longer(-c(chr:snp_id), names_to=c("metric", "trait"), names_sep="_") |>
+gwas = read_tsv("out_massive_k20.tsv") |>
+    glimpse()
+gwas2 = gwas |>
+    pivot_longer(-c(chr:snp_id, starts_with("r2_")), names_to=c("metric", "trait"), names_pattern="(p|beta|t)_(.+)") |>
     pivot_wider(names_from="metric") |>
     glimpse()
 
-res = gwas |>
+res = gwas2 |>
     inner_join(sim, by=join_by(trait, chr, pos==position, snp_id)) |>
     glimpse()
 
