@@ -7,7 +7,7 @@ pub mod simulate;
 pub mod testing;
 
 use anyhow::Result;
-use ndarray::Array2;
+use ndarray::{Array2, Axis};
 
 use bed::{BedFile, SubsetSpec};
 pub use bed::SnpNorm;
@@ -45,6 +45,8 @@ pub struct Lfmm2Config {
     pub progress: bool,
     /// SNP normalization mode.
     pub norm: SnpNorm,
+    /// Whether to scale (divide by std-dev) covariate columns after centering.
+    pub scale_cov: bool,
 }
 
 impl Default for Lfmm2Config {
@@ -59,8 +61,28 @@ impl Default for Lfmm2Config {
             n_workers: 0,
             progress: false,
             norm: SnpNorm::default(),
+            scale_cov: false,
         }
     }
+}
+
+/// Center columns of X (subtract column means). If `scale` is true, also
+/// divide each column by its standard deviation (like R's `scale()`).
+pub fn center_covariates(x: &Array2<f64>, scale: bool) -> Array2<f64> {
+    let n = x.nrows() as f64;
+    let means = x.mean_axis(Axis(0)).unwrap();
+    let mut xs = x - &means.insert_axis(Axis(0));
+    if scale {
+        for j in 0..xs.ncols() {
+            let col = xs.column(j);
+            let var = col.dot(&col) / (n - 1.0);
+            let sd = var.sqrt();
+            if sd > 1e-14 {
+                xs.column_mut(j).mapv_inplace(|v| v / sd);
+            }
+        }
+    }
+    xs
 }
 
 /// Estimate latent factors U_hat from (possibly LD-pruned) Y_est.
@@ -69,13 +91,16 @@ impl Default for Lfmm2Config {
 /// 1. Precompute SVD of X, D_λ, M, ridge_inv
 /// 2. Randomized SVD of M @ Y_est via streaming
 /// 3. Recover U_hat = Q @ D_λ_inv @ U_small[:, :K]
+///
+/// X is centered (and optionally scaled) before use.
 pub fn estimate_factors(
     y_est: &BedFile,
     subset: &SubsetSpec,
     x: &Array2<f64>,
     config: &Lfmm2Config,
 ) -> Result<Array2<f64>> {
-    let pre = precompute(x, config.lambda)?;
+    let xs = center_covariates(x, config.scale_cov);
+    let pre = precompute(&xs, config.lambda)?;
     estimate_factors_streaming(y_est, subset, &pre, config)
 }
 
@@ -83,6 +108,8 @@ pub fn estimate_factors(
 ///
 /// Computes effect sizes (B) and per-locus t-tests in a single fused pass.
 /// Returns TestResults with calibrated p-values (GIF correction).
+///
+/// X is centered (and optionally scaled) before use.
 pub fn test_associations(
     y_full: &BedFile,
     x: &Array2<f64>,
@@ -90,8 +117,9 @@ pub fn test_associations(
     config: &Lfmm2Config,
     output: Option<&OutputConfig>,
 ) -> Result<TestResults> {
-    let pre = precompute(x, config.lambda)?;
-    test_associations_fused(y_full, x, u_hat, &pre, config, output)
+    let xs = center_covariates(x, config.scale_cov);
+    let pre = precompute(&xs, config.lambda)?;
+    test_associations_fused(y_full, &xs, u_hat, &pre, config, output)
 }
 
 /// Full LFMM2 pipeline: estimate latent factors + test associations.
@@ -99,7 +127,7 @@ pub fn test_associations(
 /// - y_est: BedFile for factor estimation (may be LD-pruned or the same as y_full)
 /// - est_subset: which SNPs from y_est to use (All, Rate, or Indices)
 /// - y_full: All SNPs for testing (Steps 3-4)
-/// - x: Covariate matrix (n × d)
+/// - x: Covariate matrix (n × d) — centered (and optionally scaled) internally
 pub fn fit_lfmm2(
     y_est: &BedFile,
     est_subset: &SubsetSpec,
@@ -108,10 +136,11 @@ pub fn fit_lfmm2(
     config: &Lfmm2Config,
     output: Option<&OutputConfig>,
 ) -> Result<TestResults> {
+    let xs = center_covariates(x, config.scale_cov);
     if config.progress {
         eprintln!("Precomputing SVD of X...");
     }
-    let pre = precompute(x, config.lambda)?;
+    let pre = precompute(&xs, config.lambda)?;
     if config.progress {
         let p_est = y_est.subset_snp_count(est_subset);
         eprintln!(
@@ -123,5 +152,5 @@ pub fn fit_lfmm2(
     if config.progress {
         eprintln!("Testing associations...");
     }
-    test_associations_fused(y_full, x, &u_hat, &pre, config, output)
+    test_associations_fused(y_full, &xs, &u_hat, &pre, config, output)
 }

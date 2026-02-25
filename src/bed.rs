@@ -48,6 +48,7 @@ pub struct FamRecord {
 }
 
 /// Subset specification for estimation
+#[derive(Debug, Clone)]
 pub enum SubsetSpec {
     /// Use all SNPs
     All,
@@ -265,13 +266,7 @@ pub(crate) fn decode_single_snp(
         let scale = compute_scale(mean, norm);
 
         // Pass 2: impute, center, scale
-        for out_idx in 0..keep.len() {
-            if col[out_idx].is_nan() {
-                col[out_idx] = 0.0;
-            } else {
-                col[out_idx] = (col[out_idx] - mean) * scale;
-            }
-        }
+        col.mapv_inplace(|v| if v.is_nan() { 0.0 } else { (v - mean) * scale });
     } else {
         // Original fast path: all samples
         let n_samples = n_physical_samples;
@@ -292,13 +287,7 @@ pub(crate) fn decode_single_snp(
         let mean = if n_valid > 0 { sum / n_valid as f64 } else { 0.0 };
         let scale = compute_scale(mean, norm);
 
-        for sample in 0..n_samples {
-            if col[sample].is_nan() {
-                col[sample] = 0.0;
-            } else {
-                col[sample] = (col[sample] - mean) * scale;
-            }
-        }
+        col.mapv_inplace(|v| if v.is_nan() { 0.0 } else { (v - mean) * scale });
     }
 }
 
@@ -397,7 +386,8 @@ fn parse_fam(path: &Path) -> Result<Vec<FamRecord>> {
             iid: fields[1].to_string(),
             father: fields[2].to_string(),
             mother: fields[3].to_string(),
-            sex: fields[4].parse().unwrap_or(0),
+            sex: fields[4].parse()
+                .with_context(|| format!("FAM line {}: invalid sex '{}'", i + 1, fields[4]))?,
             pheno: fields[5].to_string(),
         });
     }
@@ -418,8 +408,10 @@ fn parse_bim(path: &Path) -> Result<Vec<BimRecord>> {
         records.push(BimRecord {
             chrom: fields[0].to_string(),
             snp_id: fields[1].to_string(),
-            cm: fields[2].parse().unwrap_or(0.0),
-            pos: fields[3].parse().unwrap_or(0),
+            cm: fields[2].parse()
+                .with_context(|| format!("BIM line {}: invalid cM '{}'", i + 1, fields[2]))?,
+            pos: fields[3].parse()
+                .with_context(|| format!("BIM line {}: invalid position '{}'", i + 1, fields[3]))?,
             allele1: fields[4].to_string(),
             allele2: fields[5].to_string(),
         });

@@ -9,9 +9,9 @@ use ndarray_linalg::{InverseInto, SVD};
 pub struct Precomputed {
     /// Q from full SVD of X: n × n orthogonal matrix
     pub q_full: Array2<f64>,
-    /// D_λ diagonal: d_λ[j] = λ/(λ+σ_j²) for j<d, 1.0 for j≥d
+    /// D_λ diagonal: d_λ\[j\] = sqrt(λ/(λ+σ_j²)) for j<d, 1.0 for j≥d
     pub d_lambda: Array1<f64>,
-    /// D_λ^{-1} diagonal
+    /// D_λ^{-1} diagonal: d_λ_inv\[j\] = sqrt((λ+σ_j²)/λ) for j<d, 1.0 for j≥d
     pub d_lambda_inv: Array1<f64>,
     /// M = D_λ @ Q^T: n × n
     pub m: Array2<f64>,
@@ -23,7 +23,7 @@ pub struct Precomputed {
 ///
 /// Given X (n × d) and ridge penalty λ:
 /// 1. SVD of X: X = Q Σ R^T
-/// 2. D_λ = diag([λ/(λ+σ_j²) for j in 0..d] ++ [1.0; n-d])
+/// 2. D_λ = diag(\[sqrt(λ/(λ+σ_j²)) for j in 0..d\] ++ \[1.0; n-d\])
 /// 3. M = D_λ @ Q^T
 /// 4. ridge_inv = (X^T X + λI)^{-1}
 pub fn precompute(x: &Array2<f64>, lambda: f64) -> Result<Precomputed> {
@@ -47,10 +47,11 @@ pub fn precompute(x: &Array2<f64>, lambda: f64) -> Result<Precomputed> {
     let sigma = s; // singular values, length min(n, d)
 
     // Build D_λ diagonal (length n)
+    // Uses sqrt to match LEA: d_λ[j] = sqrt(λ / (λ + σ_j²))
     let mut d_lambda = Array1::<f64>::ones(n);
     for j in 0..sigma.len().min(d) {
         let s2 = sigma[j] * sigma[j];
-        d_lambda[j] = lambda / (lambda + s2);
+        d_lambda[j] = (lambda / (lambda + s2)).sqrt();
     }
 
     // D_λ^{-1}
@@ -58,22 +59,16 @@ pub fn precompute(x: &Array2<f64>, lambda: f64) -> Result<Precomputed> {
 
     // M = D_λ @ Q^T
     // D_λ is diagonal, so M[i, j] = d_lambda[i] * Q^T[i, j] = d_lambda[i] * Q[j, i]
-    let qt = q_full.t();
-    let m = {
-        let mut m = qt.to_owned();
-        for i in 0..n {
-            let scale = d_lambda[i];
-            m.row_mut(i).mapv_inplace(|v| v * scale);
-        }
-        m
-    };
+    let d_col = d_lambda.view().insert_axis(ndarray::Axis(1)); // (n,) → (n, 1)
+    let m = &d_col * &q_full.t();
 
     // ridge_inv = (X^T X + λ I_d)^{-1}
-    let xtx = x.t().dot(x);
-    let mut xtx_ridge = xtx;
+    // Calcuate Xt X into mutable nxn, then add ridge to diag.
+    let mut xtx_ridge =  x.t().dot(x); 
     for j in 0..d {
         xtx_ridge[(j, j)] += lambda;
     }
+    // Finally matrix invert
     let ridge_inv = xtx_ridge.inv_into()?;
 
     Ok(Precomputed {
@@ -114,12 +109,25 @@ mod tests {
             }
         }
 
-        // D_lambda: first 2 entries should be lambda/(lambda + sigma_j^2), rest = 1.0
+        // D_lambda: first 2 entries should be sqrt(lambda/(lambda + sigma_j^2)), rest = 1.0
         assert_eq!(pre.d_lambda.len(), 4);
         assert!(pre.d_lambda[0] > 0.0 && pre.d_lambda[0] < 1.0);
         assert!(pre.d_lambda[1] > 0.0 && pre.d_lambda[1] < 1.0);
         assert_abs_diff_eq!(pre.d_lambda[2], 1.0, epsilon = 1e-10);
         assert_abs_diff_eq!(pre.d_lambda[3], 1.0, epsilon = 1e-10);
+
+        // Verify d_lambda uses sqrt: d_lambda^2 should equal lambda/(lambda + sigma^2)
+        let (_u_opt, sigma, _vt_opt) = x.svd(true, true).unwrap();
+        for j in 0..2 {
+            let s2 = sigma[j] * sigma[j];
+            let expected_sq = lambda / (lambda + s2);
+            assert_abs_diff_eq!(pre.d_lambda[j] * pre.d_lambda[j], expected_sq, epsilon = 1e-10);
+        }
+
+        // Verify d_lambda_inv is reciprocal of d_lambda
+        for j in 0..4 {
+            assert_abs_diff_eq!(pre.d_lambda[j] * pre.d_lambda_inv[j], 1.0, epsilon = 1e-10);
+        }
 
         // M should be 4×4
         assert_eq!(pre.m.shape(), &[4, 4]);

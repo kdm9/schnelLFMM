@@ -715,7 +715,7 @@ fn profile_pipeline() -> Result<()> {
 
     // 4a: Precompute C, H, etc.
     let ph = Phase::start("Assoc: precompute C,H");
-    let df = (n - d - k) as f64;
+    let df = (n - 1 - d - k) as f64;
 
     let utu = u_hat.t().dot(&u_hat);
     let utu_inv = safe_inv(&utu)?;
@@ -726,14 +726,16 @@ fn profile_pipeline() -> Result<()> {
     let mut i_minus_pu = Array2::<f64>::eye(n);
     i_minus_pu -= &p_u;
 
-    let mut c = Array2::<f64>::zeros((n, d + k));
-    c.slice_mut(ndarray::s![.., ..d]).assign(x);
-    c.slice_mut(ndarray::s![.., d..]).assign(&u_hat);
+    let c_cols = 1 + d + k;
+    let mut c = Array2::<f64>::zeros((n, c_cols));
+    c.column_mut(0).fill(1.0); // intercept
+    c.slice_mut(ndarray::s![.., 1..1 + d]).assign(x);
+    c.slice_mut(ndarray::s![.., 1 + d..]).assign(&u_hat);
 
     let ctc = c.t().dot(&c);
     let ctc_inv = safe_inv(&ctc)?;
     let h = ctc_inv.dot(&c.t());
-    let ctc_inv_diag: Vec<f64> = (0..d).map(|j| ctc_inv[(j, j)]).collect();
+    let ctc_inv_diag: Vec<f64> = (0..d).map(|j| ctc_inv[(1 + j, 1 + j)]).collect();
     phases.push(ph.stop());
 
     // 4b: Streaming association test pass
@@ -764,7 +766,7 @@ fn profile_pipeline() -> Result<()> {
                 let rss: f64 = res_col.dot(&res_col);
                 let sigma2 = rss / df;
                 for j in 0..d {
-                    let (t, _) = t_test(coefs[(j, col_in_chunk)], sigma2, ctc_inv_diag[j], df);
+                    let (t, _) = t_test(coefs[(1 + j, col_in_chunk)], sigma2, ctc_inv_diag[j], df);
                     local_tstats[(col_in_chunk, j)] = t;
                 }
             }

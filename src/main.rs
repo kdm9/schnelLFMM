@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ndarray::Array2;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -72,6 +73,11 @@ struct Cli {
     /// SNP normalization mode
     #[arg(long, default_value = "eigenstrat")]
     norm: SnpNorm,
+
+    /// Scale covariate columns to unit variance (in addition to centering).
+    /// By default, covariates are centered but not scaled.
+    #[arg(long)]
+    scale_cov: bool,
 }
 
 fn default_threads() -> usize {
@@ -88,9 +94,12 @@ fn main() -> Result<()> {
     // Force BLAS single-threaded: our worker pool is the sole source of parallelism.
     // set_var as belt-and-suspenders (may not take effect if BLAS is statically linked
     // and initializes its thread pool before main), plus FFI call for runtime override.
-    std::env::set_var("OPENBLAS_NUM_THREADS", "1");
-    std::env::set_var("MKL_NUM_THREADS", "1");
-    unsafe { openblas_set_num_threads(1); }
+    // SAFETY: called in main() before any threads are spawned.
+    unsafe {
+        std::env::set_var("OPENBLAS_NUM_THREADS", "1");
+        std::env::set_var("MKL_NUM_THREADS", "1");
+        openblas_set_num_threads(1);
+    }
 
     let cli = Cli::parse();
 
@@ -105,7 +114,7 @@ fn main() -> Result<()> {
     // --- Load covariates with sample matching ---
     eprintln!("Loading covariates from: {}", cli.cov.display());
     let (cov_names, x, kept_indices) =
-        load_covariates(&cli.cov, &bed.fam_records, cli.intersect_samples)?;
+        load_covariates(&cli.cov, &bed.fam_records, cli.intersect_samples, cli.verbose)?;
     let d = x.ncols();
 
     // Apply sample subsetting to main BED if needed
@@ -162,6 +171,7 @@ fn main() -> Result<()> {
         n_workers: cli.threads,
         progress: std::io::stderr().is_terminal(),
         norm: cli.norm,
+        scale_cov: cli.scale_cov,
     };
 
     eprintln!(
@@ -240,7 +250,7 @@ fn align_est_bed_samples(
         anyhow::bail!(
             "est-bed is missing {} sample(s) that are in the main BED file: [{}]{}",
             missing.len(),
-            missing.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+            missing.iter().take(5).map(String::as_str).collect::<Vec<_>>().join(", "),
             if missing.len() > 5 { ", ..." } else { "" },
         );
     }
@@ -286,11 +296,12 @@ fn load_covariates(
     path: &Path,
     fam: &[schnelfmm::bed::FamRecord],
     intersect: bool,
+    verbose: bool,
 ) -> Result<(Vec<String>, Array2<f64>, Vec<usize>)> {
     let delim = guess_delimiter(path);
     let delim_name = if delim == ',' { "CSV" } else { "TSV" };
 
-    if cli_verbose() {
+    if verbose {
         eprintln!("  Detected {} format (delimiter: {:?})", delim_name, delim);
     }
 
@@ -368,15 +379,19 @@ fn load_covariates(
             })
             .collect::<Result<Vec<_>>>()?;
 
-        if sample_data.contains_key(&sample_id) {
-            anyhow::bail!(
-                "Duplicate sample ID '{}' in covariate file (line {})",
-                sample_id,
-                i + 2,
-            );
+        match sample_data.entry(sample_id) {
+            Entry::Occupied(e) => {
+                anyhow::bail!(
+                    "Duplicate sample ID '{}' in covariate file (line {})",
+                    e.key(),
+                    i + 2,
+                );
+            }
+            Entry::Vacant(e) => {
+                file_order.push(e.key().clone());
+                e.insert(vals);
+            }
         }
-        file_order.push(sample_id.clone());
-        sample_data.insert(sample_id, vals);
     }
 
     if sample_data.is_empty() {
@@ -412,7 +427,7 @@ fn load_covariates(
                         fam_rec.fid,
                         n,
                         sample_data.len(),
-                        file_order.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+                        file_order.iter().take(5).map(String::as_str).collect::<Vec<_>>().join(", "),
                     );
                 }
             }
@@ -428,7 +443,7 @@ fn load_covariates(
             n,
             sample_data.len(),
             fam.iter().take(5).map(|r| r.iid.as_str()).collect::<Vec<_>>().join(", "),
-            file_order.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+            file_order.iter().take(5).map(String::as_str).collect::<Vec<_>>().join(", "),
         );
     }
 
@@ -453,18 +468,10 @@ fn load_covariates(
     );
 
     // Build output matrix
-    let mut x = Array2::<f64>::zeros((matched, n_covs));
-    for (out_row, vals) in rows.iter().enumerate() {
-        for (j, &v) in vals.iter().enumerate() {
-            x[(out_row, j)] = v;
-        }
-    }
+    let flat: Vec<f64> = rows.into_iter().flatten().collect();
+    let x = Array2::from_shape_vec((matched, n_covs), flat)
+        .expect("row count × col count should match flattened length");
 
     Ok((cov_names, x, kept_indices))
 }
 
-/// Check if --verbose was passed. Used by helper functions that don't have
-/// direct access to the Cli struct.
-fn cli_verbose() -> bool {
-    std::env::args().any(|a| a == "--verbose" || a == "-v")
-}

@@ -10,6 +10,7 @@ profiling = []
 ndarray = { version = "0.16", features = ["blas"] }
 ndarray-linalg = { version = "0.17", features = ["openblas-static"] }
 ndarray-rand = "0.15"
+ndarray-npy = "0.9"
 blas-src = { version = "0.10", features = ["openblas"] }
 openblas-src = { version = "0.10", features = ["cblas", "static"] }
 clap = { version = "4", features = ["derive"] }

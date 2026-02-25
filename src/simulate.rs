@@ -3,6 +3,7 @@ use ndarray::{Array1, Array2};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Binomial, Normal, Uniform};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
@@ -60,14 +61,14 @@ pub fn simulate(config: &SimConfig) -> SimData {
     // Column 0: iid N(0,1)
     // Columns j>0: r*X[:,0] + sqrt(1-r²)*Z_j giving pairwise r² ≈ covariate_r2
     let mut x = Array2::<f64>::zeros((n, d));
-    for i in 0..n {
-        x[(i, 0)] = rng.sample(normal);
-    }
+    x.column_mut(0).mapv_inplace(|_| rng.sample(normal));
     let r = config.covariate_r2.sqrt();
     let r_orth = (1.0 - config.covariate_r2).sqrt();
     for j in 1..d {
-        for i in 0..n {
-            x[(i, j)] = r * x[(i, 0)] + r_orth * rng.sample(normal);
+        // Can't borrow column 0 while mutating column j, so copy first
+        let col0: Vec<f64> = x.column(0).to_vec();
+        for (i, val) in x.column_mut(j).iter_mut().enumerate() {
+            *val = r * col0[i] + r_orth * rng.sample(normal);
         }
     }
 
@@ -99,16 +100,10 @@ pub fn simulate(config: &SimConfig) -> SimData {
 
         for i in 0..n {
             // Latent contribution: (U V^T)[i,j] = sum_k U[i,k] * V[j,k]
-            let mut uv = 0.0;
-            for kk in 0..k {
-                uv += u_true[(i, kk)] * v_true[(j, kk)];
-            }
+            let uv = u_true.row(i).dot(&v_true.row(j));
 
             // Covariate contribution: (X B^T)[i,j] = sum_d X[i,d] * B[j,d]
-            let mut xb = 0.0;
-            for dd in 0..d {
-                xb += x[(i, dd)] * b_true[(j, dd)];
-            }
+            let xb = x.row(i).dot(&b_true.row(j));
 
             // Shifted allele frequency
             let shifted_logit = base_logit + uv + xb;
@@ -205,8 +200,9 @@ pub fn write_ground_truth(path: &Path, sim: &SimData) -> Result<()> {
     writeln!(file, "{}", header.join("\t"))?;
 
     // Data
+    let causal_set: HashSet<usize> = sim.causal_indices.iter().copied().collect();
     for j in 0..p {
-        let is_causal = sim.causal_indices.contains(&j);
+        let is_causal = causal_set.contains(&j);
         let mut vals = vec![
             j.to_string(),
             if is_causal {

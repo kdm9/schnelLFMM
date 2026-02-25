@@ -38,6 +38,7 @@ fn test_lfmm2_quick() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
 
     // Simulate
@@ -87,6 +88,7 @@ fn test_lfmm2_large() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
 
     // Simulate
@@ -150,6 +152,7 @@ fn test_reproducibility() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
 
     let sim = simulate(&sim_config);
@@ -214,6 +217,7 @@ fn test_different_seeds_differ() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
 
     let r1 = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &base_config, None).unwrap();
@@ -467,6 +471,7 @@ fn test_parallel_matches_sequential() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
     let r_seq = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_seq, None).unwrap();
 
@@ -654,6 +659,7 @@ fn test_subset_rate_end_to_end() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
 
     let sim = simulate(&sim_config);
@@ -714,6 +720,7 @@ fn test_subset_indices_end_to_end() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
 
     let sim = simulate(&sim_config);
@@ -779,6 +786,7 @@ fn test_output_config_writes_results() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
 
     let sim = simulate(&sim_config);
@@ -1309,6 +1317,7 @@ fn test_normalization_modes_end_to_end() {
             n_workers: 0,
             progress: false,
             norm: mode,
+            scale_cov: false,
         };
         let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
 
@@ -1807,6 +1816,7 @@ fn test_k_sensitivity() {
                 n_workers: 0,
                 progress: false,
                 norm: SnpNorm::Eigenstrat,
+                scale_cov: false,
             };
             let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
             gif_for_k.push(r.gif);
@@ -1914,6 +1924,7 @@ fn test_variance_decomposition() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
 
     let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
@@ -2002,6 +2013,7 @@ fn test_variance_decomposition_signal_levels() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
 
     for &ls in &latent_scales {
@@ -2120,6 +2132,7 @@ fn test_variance_decomposition_with_noise() {
         n_workers: 0,
         progress: false,
         norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
     };
 
     let r_orig = fit_lfmm2(&bed_orig, &SubsetSpec::All, &bed_orig, &sim.x, &config, None).unwrap();

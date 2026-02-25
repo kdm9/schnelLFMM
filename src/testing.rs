@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use ndarray::Array2;
 use ndarray_linalg::InverseInto;
+use ndarray_npy::{read_npy, write_npy};
 use statrs::distribution::{ContinuousCDF, Normal, StudentsT};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use std::sync::Mutex;
@@ -49,10 +50,10 @@ pub struct TestResults {
 /// Step 3: B_hat^T = (X^T X + λI)^{-1} X^T (Y - P_U Y)
 ///   where P_U = U_hat (U_hat^T U_hat)^{-1} U_hat^T is the orthogonal projector onto col(U_hat).
 ///
-/// Step 4: Per-locus OLS with C = [X | U_hat], t-tests, GIF calibration.
-///   For each SNP j: y_j = C γ_j + ε_j, then t_j = γ̂[1..d] / se(γ̂[1..d]).
+/// Step 4: Per-locus OLS with C = [1 | X | U_hat], t-tests, GIF calibration.
+///   For each SNP j: y_j = C γ_j + ε_j, then t_j = γ̂[1..d+1] / se(γ̂[1..d+1]).
 ///   Standard errors come from se²(γ̂_j) = σ̂² · diag((C^T C)^{-1}), where σ̂² = RSS / df.
-///   Degrees of freedom: df = n - d - K (residual df after fitting d covariates + K latent factors).
+///   Degrees of freedom: df = n - d - K - 1 (residual df after fitting intercept + d covariates + K latent factors).
 ///
 /// When `output` is `Some`, each chunk's effect sizes and t-statistics are written
 /// to a temporary TSV fragment. After GIF calibration, fragments are coalesced into
@@ -71,17 +72,18 @@ pub fn test_associations_fused(
     let k = config.k;
     let chunk_size = config.chunk_size;
 
-    // Validate degrees of freedom: df = n - d - K must be positive for a valid t-test.
+    // Validate degrees of freedom: df = n - 1 - d - K must be positive for a valid t-test.
+    // The -1 accounts for the intercept column in C = [1 | X | U_hat].
     // With df ≤ 0 the Student-t distribution is undefined, and the usize subtraction
-    // (n - d - k) would silently wrap around to a huge value.
-    if n <= d + k {
+    // would silently wrap around to a huge value.
+    if n <= 1 + d + k {
         anyhow::bail!(
-            "Insufficient degrees of freedom: n={} samples but d+K={}+{}={}. \
-             Need n > d + K for valid t-tests. Reduce K or add more samples.",
-            n, d, k, d + k,
+            "Insufficient degrees of freedom: n={} samples but 1+d+K=1+{}+{}={}. \
+             Need n > 1 + d + K for valid t-tests. Reduce K or add more samples.",
+            n, d, k, 1 + d + k,
         );
     }
-    let df = (n - d - k) as f64;
+    let df = (n - 1 - d - k) as f64;
 
     // Precompute P_U = U_hat (U^T U)^{-1} U^T (n × n).
     let utu = u_hat.t().dot(u_hat);
@@ -96,20 +98,22 @@ pub fn test_associations_fused(
     i_minus_pu -= &p_u;
 
     // Step 4 precomputes:
-    // C = [X | U_hat] (n × (d+K)) — combined covariate + latent factor design matrix.
-    let mut c = Array2::<f64>::zeros((n, d + k));
-    c.slice_mut(ndarray::s![.., ..d]).assign(x);
-    c.slice_mut(ndarray::s![.., d..]).assign(u_hat);
+    // C = [1 | X | U_hat] (n × (1+d+K)) — intercept + covariate + latent factor design matrix.
+    let c_cols = 1 + d + k;
+    let mut c = Array2::<f64>::zeros((n, c_cols));
+    c.column_mut(0).fill(1.0); // intercept
+    c.slice_mut(ndarray::s![.., 1..1 + d]).assign(x);
+    c.slice_mut(ndarray::s![.., 1 + d..]).assign(u_hat);
 
     // (C^T C)^{-1}: needed for standard errors.
     let ctc = c.t().dot(&c);
-    let ctc_inv = safe_inv(&ctc, "C^T C  where C = [X | U_hat]")?;
+    let ctc_inv = safe_inv(&ctc, "C^T C  where C = [1 | X | U_hat]")?;
 
     // H = (C^T C)^{-1} C^T — the OLS hat matrix for coefficient estimation
     let h = ctc_inv.dot(&c.t());
 
-    // Diagonal of (C^T C)^{-1} for standard error computation
-    let ctc_inv_diag: Vec<f64> = (0..d).map(|j| ctc_inv[(j, j)]).collect();
+    // Diagonal of (C^T C)^{-1} for standard error computation (covariate indices 1..d+1)
+    let ctc_inv_diag: Vec<f64> = (0..d).map(|j| ctc_inv[(1 + j, 1 + j)]).collect();
 
     // Allocate output arrays
     let mut effect_sizes = Array2::<f64>::zeros((p, d));
@@ -152,16 +156,16 @@ pub fn test_associations_fused(
             let b_chunk = xtr.dot(&residual); // d × chunk_cols
             let b_chunk_t = b_chunk.t().to_owned();
 
-            // Step 4: OLS with C = [X | U_hat]
-            let coefs = h.dot(&chunk); // (d+K) × chunk_cols
+            // Step 4: OLS with C = [1 | X | U_hat]
+            let coefs = h.dot(&chunk); // (1+d+K) × chunk_cols
             let fitted = c.dot(&coefs); // n × chunk_cols
             let residuals = &chunk - &fitted; // n × chunk_cols
 
             // Variance decomposition: split fitted into covariate and latent parts.
-            // fitted_x = X @ coefs[0..d, :], fitted_u = fitted - fitted_x
-            let coefs_x = coefs.slice(ndarray::s![..d, ..]);
+            // Covariate coefficients are at indices 1..1+d (index 0 is intercept).
+            let coefs_x = coefs.slice(ndarray::s![1..1 + d, ..]);
             let fitted_x = x.dot(&coefs_x); // n × chunk_cols
-            // fitted_u = fitted - fitted_x (avoids a second matmul)
+            // fitted_u = fitted - fitted_x - intercept (avoids a second matmul)
 
             let mut local_tstats = Array2::<f64>::zeros((chunk_cols, d));
             let mut local_r2_cov = vec![0.0f64; chunk_cols];
@@ -175,7 +179,7 @@ pub fn test_associations_fused(
                 let sigma2 = rss / df;
 
                 for j in 0..d {
-                    let (t, _) = t_test(coefs[(j, col_in_chunk)], sigma2, ctc_inv_diag[j], df);
+                    let (t, _) = t_test(coefs[(1 + j, col_in_chunk)], sigma2, ctc_inv_diag[j], df);
                     local_tstats[(col_in_chunk, j)] = t;
                 }
 
@@ -207,11 +211,10 @@ pub fn test_associations_fused(
             mtx_r2_resid.lock().unwrap()[start..start + chunk_cols]
                 .copy_from_slice(&local_r2_resid);
 
-            // Write chunk TSV fragment if output configured
+            // Write chunk binary fragment if output configured
             if let Some(ref dir) = chunk_dir {
-                let bim_slice = &output.unwrap().bim[start..start + chunk_cols];
-                write_chunk_tsv(
-                    dir.path(), block.seq, bim_slice, &b_chunk_t, &local_tstats,
+                write_chunk_npy(
+                    dir.path(), block.seq, &b_chunk_t, &local_tstats,
                     &local_r2_cov, &local_r2_latent, &local_r2_resid, d,
                 )
                     .expect("failed to write chunk file");
@@ -264,6 +267,7 @@ pub fn test_associations_fused(
         coalesce_output(
             out.path,
             out.cov_names,
+            out.bim,
             chunk_dir.as_ref().unwrap().path(),
             n_chunks,
             &gif_per_trait,
@@ -282,13 +286,16 @@ pub fn test_associations_fused(
     })
 }
 
-/// Write a chunk's effect sizes, t-statistics, and variance decomposition as a TSV fragment.
+/// Write a chunk's numerical data as a binary .npy file.
 ///
-/// Format: `chr\tpos\tsnp_id\tbeta_0\tt_0\t...\tr2_cov\tr2_latent\tr2_resid`
-fn write_chunk_tsv(
+/// Packs betas (chunk_cols × d), tstats (chunk_cols × d), and r2 values
+/// into a single array of shape (chunk_cols, 2*d + 3):
+///   [beta_0 .. beta_{d-1}, t_0 .. t_{d-1}, r2_cov, r2_latent, r2_resid]
+///
+/// BIM metadata is not stored — it's recovered from OutputConfig during coalescing.
+fn write_chunk_npy(
     dir: &Path,
     seq: usize,
-    bim: &[BimRecord],
     betas: &Array2<f64>,
     tstats: &Array2<f64>,
     r2_cov: &[f64],
@@ -296,28 +303,31 @@ fn write_chunk_tsv(
     r2_resid: &[f64],
     d: usize,
 ) -> Result<()> {
-    let path = dir.join(format!("chunk_{:06}.tsv", seq));
-    let mut f = BufWriter::new(std::fs::File::create(path)?);
     let n_rows = betas.nrows();
+    let n_cols = 2 * d + 3;
+    let mut data = Array2::<f64>::zeros((n_rows, n_cols));
+    data.slice_mut(ndarray::s![.., ..d]).assign(betas);
+    data.slice_mut(ndarray::s![.., d..2 * d]).assign(tstats);
     for i in 0..n_rows {
-        write!(f, "{}\t{}\t{}", bim[i].chrom, bim[i].pos, bim[i].snp_id)?;
-        for j in 0..d {
-            write!(f, "\t{:.6e}\t{:.6e}", betas[(i, j)], tstats[(i, j)])?;
-        }
-        write!(f, "\t{:.6e}\t{:.6e}\t{:.6e}", r2_cov[i], r2_latent[i], r2_resid[i])?;
-        writeln!(f)?;
+        data[(i, 2 * d)] = r2_cov[i];
+        data[(i, 2 * d + 1)] = r2_latent[i];
+        data[(i, 2 * d + 2)] = r2_resid[i];
     }
+    let path = dir.join(format!("chunk_{:06}.npy", seq));
+    write_npy(&path, &data)
+        .map_err(|e| anyhow::anyhow!("Failed to write chunk {}: {}", path.display(), e))?;
     Ok(())
 }
 
-/// Coalesce chunk TSV fragments into a single output file with calibrated p-values.
+/// Coalesce binary chunk .npy files into a single TSV output with calibrated p-values.
 ///
-/// Reads each chunk file in sequence order, parses t-statistics, applies GIF
-/// calibration, and writes the final output with columns:
-/// `chr\tpos\tsnp_id\tp_cov1\tbeta_cov1\tt_cov1\t...`
+/// Reads each chunk's numerical data from .npy, sources BIM metadata from
+/// `bim` (indexed by chunk_size), applies GIF calibration, and writes:
+/// `chr\tpos\tsnp_id\tp_cov1\tbeta_cov1\tt_cov1\t...\tr2_cov\tr2_latent\tr2_resid`
 fn coalesce_output(
     output_path: &Path,
     cov_names: &[String],
+    bim: &[BimRecord],
     chunk_dir: &Path,
     n_chunks: usize,
     gif_per_trait: &[f64],
@@ -331,7 +341,7 @@ fn coalesce_output(
             .with_context(|| format!("Failed to create {}", output_path.display()))?,
     );
 
-    // Header: chr, pos, snp_id, per-covariate p/beta/t triples, then variance decomposition
+    // Header
     write!(out, "chr\tpos\tsnp_id")?;
     for name in cov_names {
         write!(out, "\tp_{}\tbeta_{}\tt_{}", name, name, name)?;
@@ -339,32 +349,31 @@ fn coalesce_output(
     write!(out, "\tr2_cov\tr2_latent\tr2_resid")?;
     writeln!(out)?;
 
-    // Concatenate chunk files in sequence order, inserting calibrated p-values
-    // Chunk format: chr, pos, snp_id, [beta_j, t_j]*d, r2_cov, r2_latent, r2_resid
-    let r2_offset = 3 + d * 2; // index of r2_cov in chunk fields
+    // Read each chunk .npy and write rows with BIM metadata + calibrated p-values
+    // Chunk layout: [beta_0..beta_{d-1}, t_0..t_{d-1}, r2_cov, r2_latent, r2_resid]
+    let mut global_row = 0usize;
     for seq in 0..n_chunks {
-        let chunk_path = chunk_dir.join(format!("chunk_{:06}.tsv", seq));
-        let f = std::fs::File::open(&chunk_path)
-            .with_context(|| format!("Failed to open chunk file: {}", chunk_path.display()))?;
-        let reader = BufReader::new(f);
-        for line in reader.lines() {
-            let line = line?;
-            if line.is_empty() {
-                continue;
-            }
-            let fields: Vec<&str> = line.split('\t').collect();
-            write!(out, "{}\t{}\t{}", fields[0], fields[1], fields[2])?;
+        let chunk_path = chunk_dir.join(format!("chunk_{:06}.npy", seq));
+        let data: Array2<f64> = read_npy(&chunk_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", chunk_path.display(), e))?;
+        let n_rows = data.nrows();
+
+        for i in 0..n_rows {
+            let bim_rec = &bim[global_row];
+            write!(out, "{}\t{}\t{}", bim_rec.chrom, bim_rec.pos, bim_rec.snp_id)?;
             for j in 0..d {
-                let beta_str = fields[3 + j * 2];
-                let t_str = fields[4 + j * 2];
-                let t: f64 = t_str.parse().unwrap_or(0.0);
+                let beta = data[(i, j)];
+                let t = data[(i, d + j)];
                 let z_cal = t / gif_sqrt[j];
                 let p_cal = 2.0 * normal.cdf(-z_cal.abs());
-                write!(out, "\t{:.6e}\t{}\t{}", p_cal, beta_str, t_str)?;
+                write!(out, "\t{:.6e}\t{:.6e}\t{:.6e}", p_cal, beta, t)?;
             }
-            // Variance decomposition columns (pass through from chunk)
-            write!(out, "\t{}\t{}\t{}", fields[r2_offset], fields[r2_offset + 1], fields[r2_offset + 2])?;
+            let r2_cov = data[(i, 2 * d)];
+            let r2_latent = data[(i, 2 * d + 1)];
+            let r2_resid = data[(i, 2 * d + 2)];
+            write!(out, "\t{:.6e}\t{:.6e}\t{:.6e}", r2_cov, r2_latent, r2_resid)?;
             writeln!(out)?;
+            global_row += 1;
         }
     }
 

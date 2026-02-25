@@ -139,15 +139,9 @@ pub fn estimate_factors_streaming(
 
     // Recover: U_hat = Q @ D_lambda_inv @ U_small[:, :K]
     // U_small is n × l, take first K columns
-    let u_small_k = u_small.slice(ndarray::s![.., ..k]).to_owned();
-
     // Apply D_lambda_inv as diagonal: scale each row i by d_lambda_inv[i]
-    let mut dlam_inv_u = u_small_k.clone();
-    for i in 0..n {
-        dlam_inv_u
-            .row_mut(i)
-            .mapv_inplace(|v| v * pre.d_lambda_inv[i]);
-    }
+    let d_col = pre.d_lambda_inv.view().insert_axis(ndarray::Axis(1)); // (n,) → (n, 1)
+    let dlam_inv_u = &d_col * &u_small.slice(ndarray::s![.., ..k]);
 
     // U_hat = Q @ dlam_inv_u
     let u_hat = pre.q_full.dot(&dlam_inv_u);
