@@ -1,12 +1,13 @@
 # schnelLFMM
 
 A fast streaming implementation of LFMM2 (Latent Factor Mixed Model) for GWAS
-and GEA, orignally from Caye et al. (2019) "LFMM 2: Fast and Accurate Inference
-of Gene-Environment Associations in Genome-Wide Studies." *Molecular Biology
-and Evolution*, 36(4), 852–860.
+and GEA.
 
 
 ## Overview
+
+LFMM2 is a common approach for Genotype-Environment associations, initially described in [Caye et al. (2019) "LFMM 2: Fast and Accurate Inference
+of Gene-Environment Associations in Genome-Wide Studies." *Molecular Biology and Evolution*, 36(4), 852–860.](https://academic.oup.com/mbe/article/36/4/852/5290100), and implemeneted in the [LEA R package](https://bioconductor.org/packages//release/bioc/html/LEA.html).
 
 schnelLFMM fits the model $\mathbf{Y} = \mathbf{X} \mathbf{B}^\top + \mathbf{U} \mathbf{V}^\top + \mathbf{E}$ where $\mathbf{Y}$ is a genotype matrix,
 $\mathbf{X}$ contains environmental variables/phenotypes, $\mathbf{U} \mathbf{V}^\top$ captures latent population structure, and
