@@ -6,15 +6,25 @@ and GEA.
 
 ## Overview
 
-LFMM2 is a common approach for Genotype-Environment associations, initially described in [Caye et al. (2019) "LFMM 2: Fast and Accurate Inference
-of Gene-Environment Associations in Genome-Wide Studies." *Molecular Biology and Evolution*, 36(4), 852–860.](https://academic.oup.com/mbe/article/36/4/852/5290100), and implemeneted in the [LEA R package](https://bioconductor.org/packages//release/bioc/html/LEA.html).
+LFMM2 is a common approach for Genotype-Environment associations, initially
+described in [Caye et al. (2019)](https://academic.oup.com/mbe/article/36/4/852/5290100),
+and implemeneted in the [LEA R package
+](https://bioconductor.org/packages//release/bioc/html/LEA.html). This tool is
+a reimplmenetation of the LFMM2 model in Rust that uses a randomised streaming
+SVD and association approach to both accelerate computation, and reduce memory
+usage for large datasets.
 
-schnelLFMM fits the model $\mathbf{Y} = \mathbf{X} \mathbf{B}^\top + \mathbf{U} \mathbf{V}^\top + \mathbf{E}$ where $\mathbf{Y}$ is a genotype matrix,
-$\mathbf{X}$ contains environmental variables/phenotypes, $\mathbf{U} \mathbf{V}^\top$ captures latent population structure, and
-$\mathbf{B}$ holds the per-SNP effect sizes to be tested.
 
-It scales to billions of SNPs by streaming PLINK .bed files from disk, so that the
-genotype matrix is never fully loaded into RAM.
+schnelLFMM fits the model $\mathbf{Y} = \mathbf{X} \mathbf{B}^\top + \mathbf{U}
+\mathbf{V}^\top + \mathbf{E}$ where $\mathbf{Y}$ is a genotype matrix,
+$\mathbf{X}$ contains environmental variables/phenotypes, $\mathbf{U}
+\mathbf{V}^\top$ captures latent population structure, and $\mathbf{B}$ holds
+the per-SNP effect sizes to be tested.
+
+schnelLFMM scales to billions of SNPs by streaming PLINK .bed files from disk,
+so that the genotype matrix is never fully loaded into RAM. Even on smaller
+datasets, it dramatically outpeforms LEA, taking only about 2 seconds to run a
+single-trait GWAS in Arabidopsis, compared to a few minutes for LEA.
 
 
 ### Differences to R's LEA::lfmm2()
@@ -27,13 +37,15 @@ Firstly, we accept standard PLINK 1.9 BED+FAM files for genotypes. No other
 reformatting of genotypes should be needed, and analyses leading to GEA or GWAS
 can use standard PLINK tooling for efficiency.
 
-We estimate genotype latent factors ($\mathbf{U}$) using randomised SVD. We use the
-Halko-Martinsson-Tropp algorithm (https://arxiv.org/abs/0909.4061) which allows
-streaming over the BED file without loading $\mathbf{Y}$ into memory.
+We estimate genotype latent factors ($\mathbf{U}$) using randomised SVD. We use
+the Halko-Martinsson-Tropp algorithm (https://arxiv.org/abs/0909.4061) which
+computes only a sparse subset of the SVD, and allows streaming over the BED
+file without loading $\mathbf{Y}$ into memory.
 
-We then compute the effect sizes $\mathbf{B}$ with ridge regression, and do per-locus
-statistical tests in an addtional streaming pass over SNPs. We finally do a
-per-trait GIF correction of test statistics to avoid inflated p-values.
+We then compute the effect sizes $\mathbf{B}$ with ridge regression and do
+per-locus statistical tests in an addtional streaming pass over SNPs. We
+finally do a per-trait GIF correction of test statistics to avoid inflated
+p-values.
 
 These multiple passes of the BED file might seem inefficient, however with
 modern SSDs computation time will vastly exceed the IO speed, so the overall
@@ -42,12 +54,11 @@ contribution to runtime is worth the vastly improved memory efficiency.
 
 ## Install
 
-Download a pre-built binary from
-[Releases](https://github.com/kdm9/schnelLFMM/releases), or build from
-source:
+Download a pre-built binary from [Releases](https://github.com/kdm9/schnelLFMM/releases),
+or build from source:
 
 ```sh
-# Requires Rust toolchain, gfortran
+# Requires Rust toolchain, and gcc/gfortran to compile OpenBLAS
 cargo install --git https://github.com/kdm9/schnelLFMM
 ```
 
