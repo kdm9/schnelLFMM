@@ -8,9 +8,9 @@ and Evolution*, 36(4), 852–860.
 
 ## Overview
 
-schnelLFMM fits the model **Y = X B' + U V' + E** where $\mathbf{Y}$ is a genotype matrix,
-X contains environmental variables/phenotypes, U V' captures latent population structure, and
-B holds the per-SNP effect sizes to be tested.
+schnelLFMM fits the model $\mathbf{Y} = \mathbf{X} \mathbf{B}^\top + \mathbf{U} \mathbf{V}^\top + \mathbf{E}$ where $\mathbf{Y}$ is a genotype matrix,
+$\mathbf{X}$ contains environmental variables/phenotypes, $\mathbf{U} \mathbf{V}^\top$ captures latent population structure, and
+$\mathbf{B}$ holds the per-SNP effect sizes to be tested.
 
 It scales to billions of SNPs by streaming PLINK .bed files from disk, so that the
 genotype matrix is never fully loaded into RAM.
@@ -26,11 +26,11 @@ Firstly, we accept standard PLINK 1.9 BED+FAM files for genotypes. No other
 reformatting of genotypes should be needed, and analyses leading to GEA or GWAS
 can use standard PLINK tooling for efficiency.
 
-We estimate genotype latent factors ($U$) using randomised SVD. We use the
+We estimate genotype latent factors ($\mathbf{U}$) using randomised SVD. We use the
 Halko-Martinsson-Tropp algorithm (https://arxiv.org/abs/0909.4061) which allows
-streaming over the BED file without loading Y into memory. 
+streaming over the BED file without loading $\mathbf{Y}$ into memory.
 
-We then compute the effect sizes B with ridge regression, and do per-locus
+We then compute the effect sizes $\mathbf{B}$ with ridge regression, and do per-locus
 statistical tests in an addtional streaming pass over SNPs. We finally do a
 per-trait GIF correction of test statistics to avoid inflated p-values.
 
@@ -79,7 +79,7 @@ schnellfmm -b all_snps.bed -c pheno.tsv -k 20 \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-l, --lambda` | `1e-5` | Ridge penalty (λ > 0 required for identifiability) |
+| `-l, --lambda` | `1e-5` | Ridge penalty ($\lambda > 0$ required for identifiability) |
 | `-o, --out` | `lfmm2_out` | Output file prefix |
 | `-t, --threads` | N cpus - 1 | Worker threads |
 | `--est-bed` |  | Separate LD-pruned .bed for factor estimation |
@@ -101,6 +101,6 @@ We have an example in `examples/ath` that reanalyses the days to flowering at
 ### Output
 
 Results are written to `<out>.tsv` (per-SNP effect sizes, t-statistics, and
-calibrated p-values for each trait, and a total R2 for covariates, latent
+calibrated p-values for each trait, and a total $R^2$ for covariates, latent
 factors, and residual variation) and `<out>.summary.txt` with a summary of run
 arguments and details.
