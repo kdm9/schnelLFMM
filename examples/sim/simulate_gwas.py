@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Simulate realistic GWAS data: genotypes (plink .bed/.bim/.fam) and phenotypes (.tsv).
 
-Two simulation methods:
-  msprime  - coalescent with recombination (realistic but slow for large datasets)
-  mvnorm   - block-correlated multivariate normal with Balding-Nichols population
-             structure. Streams block-by-block so datasets larger than RAM can be
-             generated. LD block sizes vary along the chromosome by drawing rho
-             from a Gamma-based distribution.
+Three simulation methods:
+  msprime        - coalescent with recombination (realistic but slow for large datasets)
+  mvnorm         - block-correlated multivariate normal with Balding-Nichols population
+                   structure. Streams block-by-block so datasets larger than RAM can be
+                   generated. LD block sizes vary along the chromosome by drawing rho
+                   from a Gamma-based distribution.
+  real_genotypes - use an existing PLINK .bed file and simulate phenotypes from
+                   causal SNPs drawn from the real genotypes. Does not write new
+                   PLINK files.
 
 Phenotypes are constructed from causal variants with Laplace-distributed effect
 sizes scaled to target heritability.
@@ -56,9 +59,17 @@ def parse_args():
     )
     p.add_argument(
         "--sim-method",
-        choices=["msprime", "mvnorm"],
+        choices=["msprime", "mvnorm", "real_genotypes"],
         default="mvnorm",
-        help="Genotype simulation method (default: mvnorm)",
+        help="Genotype simulation method (default: mvnorm). "
+        "real_genotypes requires --bed pointing to an existing PLINK .bed file.",
+    )
+    p.add_argument(
+        "--bed",
+        type=str,
+        default=None,
+        help="Path to existing PLINK .bed file (required for --sim-method real_genotypes). "
+        "Matching .bim and .fam files must exist alongside it.",
     )
     p.add_argument(
         "--ld-decay",
@@ -472,6 +483,139 @@ def simulate_genotypes_msprime(n_samples, n_snps_target, k_pops, pop_props, fst,
 
 
 # ---------------------------------------------------------------------------
+# real_genotypes simulation
+# ---------------------------------------------------------------------------
+
+def read_bed_genotypes(bed_path):
+    """Read a PLINK .bed file and return (G, positions, alleles_list, sample_ids).
+
+    G is (n_samples x n_snps) uint8 dosage matrix (0/1/2, 255=missing).
+    """
+    bed_path = Path(bed_path)
+    fam_path = bed_path.with_suffix(".fam")
+    bim_path = bed_path.with_suffix(".bim")
+
+    if not bed_path.exists():
+        sys.exit(f"Error: BED file not found: {bed_path}")
+    if not fam_path.exists():
+        sys.exit(f"Error: FAM file not found: {fam_path}")
+    if not bim_path.exists():
+        sys.exit(f"Error: BIM file not found: {bim_path}")
+
+    # Read FAM -> sample IDs (IID = column 1)
+    sample_ids = []
+    with open(fam_path) as f:
+        for line in f:
+            fields = line.strip().split()
+            if len(fields) >= 2:
+                sample_ids.append(fields[1])  # IID
+    n_samples = len(sample_ids)
+
+    # Read BIM -> positions and alleles
+    positions = []
+    alleles_list = []
+    with open(bim_path) as f:
+        for line in f:
+            fields = line.strip().split()
+            positions.append(int(fields[3]))
+            alleles_list.append((fields[4], fields[5]))
+    n_snps = len(positions)
+
+    # Read BED
+    BED_DECODE = np.array([0, 255, 1, 2], dtype=np.uint8)  # 00->hom_ref, 01->missing, 10->het, 11->hom_alt
+    bytes_per_snp = math.ceil(n_samples / 4)
+
+    with open(bed_path, "rb") as f:
+        magic = f.read(3)
+        if magic != b"\x6c\x1b\x01":
+            sys.exit("Error: not a valid SNP-major PLINK .bed file")
+
+        G = np.zeros((n_samples, n_snps), dtype=np.uint8)
+        for j in range(n_snps):
+            raw = np.frombuffer(f.read(bytes_per_snp), dtype=np.uint8)
+            # Unpack 2-bit genotypes
+            g0 = raw & 0x03
+            g1 = (raw >> 2) & 0x03
+            g2 = (raw >> 4) & 0x03
+            g3 = (raw >> 6) & 0x03
+            unpacked = np.empty(bytes_per_snp * 4, dtype=np.uint8)
+            unpacked[0::4] = g0
+            unpacked[1::4] = g1
+            unpacked[2::4] = g2
+            unpacked[3::4] = g3
+            G[:, j] = BED_DECODE[unpacked[:n_samples]]
+
+    return G, positions, alleles_list, sample_ids
+
+
+def simulate_real_genotypes(bed_path, traits, out, rng):
+    """Use real genotypes from an existing PLINK file, simulate phenotypes."""
+    print(f"Reading genotypes from {bed_path} ...")
+    G, positions, alleles_list, sample_ids = read_bed_genotypes(bed_path)
+    n_samples, n_snps = G.shape
+    print(f"  {n_samples} samples, {n_snps} SNPs")
+
+    # Replace missing (255) with per-SNP mean for phenotype simulation
+    G_float = G.astype(np.float64)
+    for j in range(n_snps):
+        col = G_float[:, j]
+        missing = col == 255
+        if missing.any():
+            mean_val = col[~missing].mean() if (~missing).any() else 0
+            col[missing] = mean_val
+
+    # Filter to polymorphic SNPs for causal selection
+    af = G_float.mean(axis=0) / 2
+    maf = np.minimum(af, 1 - af)
+    poly_mask = maf > 0.01  # require MAF > 1% for causal SNPs
+    poly_indices = np.where(poly_mask)[0]
+    print(f"  {len(poly_indices)} SNPs with MAF > 1% available as causal candidates")
+
+    print("\nSimulating phenotypes ...")
+    phenotypes = {}
+    causal_info = []
+
+    for trait in traits:
+        name = trait["name"]
+        h2 = trait["heritability"]
+        n_causal = min(trait["n_causal"], len(poly_indices))
+
+        causal_poly_idx = rng.choice(len(poly_indices), n_causal, replace=False)
+        causal_idx = poly_indices[causal_poly_idx]
+
+        G_causal = G_float[:, causal_idx]
+        means = G_causal.mean(axis=0)
+        stds = G_causal.std(axis=0)
+        stds[stds == 0] = 1.0
+        G_std = (G_causal - means) / stds
+
+        beta = rng.laplace(loc=0, scale=1.0, size=n_causal)
+        g = G_std @ beta
+
+        var_g = np.var(g)
+        if var_g == 0 or h2 == 0:
+            y = rng.normal(0, 1, n_samples)
+        else:
+            var_e = var_g * (1 - h2) / h2
+            noise = rng.normal(0, np.sqrt(var_e), n_samples)
+            y = g + noise
+
+        phenotypes[name] = y
+        actual_h2 = var_g / np.var(y) if np.var(y) > 0 else 0
+        print(f"  Trait '{name}': {n_causal} causal SNPs, target h2={h2:.3f}, actual h2={actual_h2:.3f}")
+
+        for ci, b in zip(causal_idx, beta):
+            causal_info.append((name, int(ci), float(b)))
+
+    write_phenotypes(f"{out}_phenotypes.tsv", sample_ids, phenotypes)
+    write_causal(f"{out}_causal.tsv", causal_info, positions, alleles_list)
+
+    print(f"\nDone.")
+    print(f"  {out}_phenotypes.tsv")
+    print(f"  {out}_causal.tsv")
+
+
+# ---------------------------------------------------------------------------
 # Phenotype simulation (in-memory, for msprime path)
 # ---------------------------------------------------------------------------
 
@@ -585,12 +729,24 @@ def main():
     traits = parse_traits(args.traits)
 
     print(f"Method: {args.sim_method}")
-    print(f"Populations: {args.k_pops}, proportions: {[f'{p:.2f}' for p in pop_props]}")
-    print(f"Target Fst: {args.fst}")
     print(f"Traits: {[t['name'] for t in traits]}")
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.sim_method == "real_genotypes":
+        if args.bed is None:
+            sys.exit("Error: --bed is required for --sim-method real_genotypes")
+        simulate_real_genotypes(
+            bed_path=args.bed,
+            traits=traits,
+            out=args.out,
+            rng=rng,
+        )
+        return
+
+    print(f"Populations: {args.k_pops}, proportions: {[f'{p:.2f}' for p in pop_props]}")
+    print(f"Target Fst: {args.fst}")
 
     if args.sim_method == "mvnorm":
         simulate_and_write_mvnorm(
