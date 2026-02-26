@@ -8,9 +8,9 @@ and GEA.
 
 LFMM2 is a common approach for Genotype-Environment associations, initially
 described in [Caye et al. (2019)](https://academic.oup.com/mbe/article/36/4/852/5290100),
-and implemeneted in the [LEA R package
+and implemented in the [LEA R package
 ](https://bioconductor.org/packages//release/bioc/html/LEA.html). This tool is
-a reimplmenetation of the LFMM2 model in Rust that uses a randomised streaming
+a reimplementation of the LFMM2 model in Rust that uses a randomised streaming
 SVD and association approach to both accelerate computation, and reduce memory
 usage for large datasets.
 
@@ -58,9 +58,12 @@ Download a pre-built binary from [Releases](https://github.com/kdm9/schnelLFMM/r
 or build from source:
 
 ```sh
-# Requires Rust toolchain, and gcc/gfortran to compile OpenBLAS
+# Requires Rust toolchain (https://rustup.rs), and gcc/gfortran to compile OpenBLAS
 cargo install --git https://github.com/kdm9/schnelLFMM
 ```
+
+Only Linux is officially supported, but it compiles for Mac M-series machines,
+and in theory on Windows if anyone works out how to get OpenBLAS to behave.
 
 ## Usage
 
