@@ -3,6 +3,7 @@ name: Rust
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
 
@@ -142,6 +143,38 @@ jobs:
         name: schnellfmm-macos-universal
         #path: schnellfmm-universal
         path: target/aarch64-apple-darwin/release/schnellfmm
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-linux-arm64, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Prepare release assets
+      run: |
+        cd artifacts
+        chmod +x schnellfmm-linux-x86_64/schnellfmm
+        chmod +x schnellfmm-linux-aarch64/schnellfmm
+        chmod +x schnellfmm-macos-universal/schnellfmm
+        tar czf schnellfmm-linux-x86_64.tar.gz -C schnellfmm-linux-x86_64 schnellfmm
+        tar czf schnellfmm-linux-aarch64.tar.gz -C schnellfmm-linux-aarch64 schnellfmm
+        tar czf schnellfmm-macos-aarch64.tar.gz -C schnellfmm-macos-universal schnellfmm
+
+    - name: Create release
+      uses: softprops/action-gh-release@v2
+      with:
+        generate_release_notes: true
+        files: |
+          artifacts/schnellfmm-linux-x86_64.tar.gz
+          artifacts/schnellfmm-linux-aarch64.tar.gz
+          artifacts/schnellfmm-macos-aarch64.tar.gz
 
 # Simply doesn't work with openblas-src, see https://github.com/blas-lapack-rs/openblas-src/issues/131
 #  build-windows:
