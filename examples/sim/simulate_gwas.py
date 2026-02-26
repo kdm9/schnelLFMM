@@ -487,9 +487,10 @@ def simulate_genotypes_msprime(n_samples, n_snps_target, k_pops, pop_props, fst,
 # ---------------------------------------------------------------------------
 
 def read_bed_genotypes(bed_path):
-    """Read a PLINK .bed file and return (G, positions, alleles_list, sample_ids).
+    """Read a PLINK .bed file and return (G, bim_records, sample_ids).
 
     G is (n_samples x n_snps) uint8 dosage matrix (0/1/2, 255=missing).
+    bim_records is a list of (chr, snp_id, pos, a1, a2) per SNP.
     """
     bed_path = Path(bed_path)
     fam_path = bed_path.with_suffix(".fam")
@@ -511,15 +512,13 @@ def read_bed_genotypes(bed_path):
                 sample_ids.append(fields[1])  # IID
     n_samples = len(sample_ids)
 
-    # Read BIM -> positions and alleles
-    positions = []
-    alleles_list = []
+    # Read BIM -> (chr, snp_id, pos, a1, a2)
+    bim_records = []
     with open(bim_path) as f:
         for line in f:
             fields = line.strip().split()
-            positions.append(int(fields[3]))
-            alleles_list.append((fields[4], fields[5]))
-    n_snps = len(positions)
+            bim_records.append((fields[0], fields[1], int(fields[3]), fields[4], fields[5]))
+    n_snps = len(bim_records)
 
     # Read BED
     BED_DECODE = np.array([0, 255, 1, 2], dtype=np.uint8)  # 00->hom_ref, 01->missing, 10->het, 11->hom_alt
@@ -545,13 +544,13 @@ def read_bed_genotypes(bed_path):
             unpacked[3::4] = g3
             G[:, j] = BED_DECODE[unpacked[:n_samples]]
 
-    return G, positions, alleles_list, sample_ids
+    return G, bim_records, sample_ids
 
 
 def simulate_real_genotypes(bed_path, traits, out, rng):
     """Use real genotypes from an existing PLINK file, simulate phenotypes."""
     print(f"Reading genotypes from {bed_path} ...")
-    G, positions, alleles_list, sample_ids = read_bed_genotypes(bed_path)
+    G, bim_records, sample_ids = read_bed_genotypes(bed_path)
     n_samples, n_snps = G.shape
     print(f"  {n_samples} samples, {n_snps} SNPs")
 
@@ -567,9 +566,9 @@ def simulate_real_genotypes(bed_path, traits, out, rng):
     # Filter to polymorphic SNPs for causal selection
     af = G_float.mean(axis=0) / 2
     maf = np.minimum(af, 1 - af)
-    poly_mask = maf > 0.01  # require MAF > 1% for causal SNPs
+    poly_mask = maf > 0.15  # require MAF > 15% for causal SNPs
     poly_indices = np.where(poly_mask)[0]
-    print(f"  {len(poly_indices)} SNPs with MAF > 1% available as causal candidates")
+    print(f"  {len(poly_indices)} SNPs with MAF > 15% available as causal candidates")
 
     print("\nSimulating phenotypes ...")
     phenotypes = {}
@@ -589,7 +588,13 @@ def simulate_real_genotypes(bed_path, traits, out, rng):
         stds[stds == 0] = 1.0
         G_std = (G_causal - means) / stds
 
+        # Truncated Laplace: resample any effects with |beta| < min_effect
+        min_effect = 0.25
         beta = rng.laplace(loc=0, scale=1.0, size=n_causal)
+        small = np.abs(beta) < min_effect
+        while small.any():
+            beta[small] = rng.laplace(loc=0, scale=1.0, size=small.sum())
+            small = np.abs(beta) < min_effect
         g = G_std @ beta
 
         var_g = np.var(g)
@@ -608,7 +613,13 @@ def simulate_real_genotypes(bed_path, traits, out, rng):
             causal_info.append((name, int(ci), float(b)))
 
     write_phenotypes(f"{out}_phenotypes.tsv", sample_ids, phenotypes)
-    write_causal(f"{out}_causal.tsv", causal_info, positions, alleles_list)
+
+    # Write causal file using real chr/snp_id/pos/alleles from BIM
+    with open(f"{out}_causal.tsv", "w") as f:
+        f.write("trait\tsnp_index\tsnp_id\tchr\tposition\tallele1\tallele2\teffect_size\n")
+        for trait_name, snp_idx, beta in causal_info:
+            chrom, snp_id, pos, a1, a2 = bim_records[snp_idx]
+            f.write(f"{trait_name}\t{snp_idx}\t{snp_id}\t{chrom}\t{pos}\t{a1}\t{a2}\t{beta:.6f}\n")
 
     print(f"\nDone.")
     print(f"  {out}_phenotypes.tsv")

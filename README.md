@@ -62,8 +62,9 @@ or build from source:
 cargo install --git https://github.com/kdm9/schnelLFMM
 ```
 
-Only Linux is officially supported, but it compiles for Mac M-series machines,
-and in theory on Windows if anyone works out how to get OpenBLAS to behave.
+Only Linux is officially supported, but schnelLFMM compiles for Mac M-series
+machines, and in theory on Windows and other supported rust targets, if anyone
+works out how to get OpenBLAS to behave.
 
 ## Usage
 
