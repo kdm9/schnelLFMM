@@ -87,6 +87,14 @@ def parse_args():
         default=100000,
         help="Maximum SNPs per LD block for mvnorm method (default: 100000)",
     )
+    p.add_argument(
+        "--causal-regions",
+        type=str,
+        default=None,
+        help="BED or GFF file specifying genomic regions where causal SNPs may be placed "
+        "(e.g. chromosome arms excluding centromeres). Only used with --sim-method real_genotypes. "
+        "BED format: chr, start (0-based), end. GFF format auto-detected by column count.",
+    )
     p.add_argument("--seed", type=int, default=42, help="Random seed")
     return p.parse_args()
 
@@ -117,6 +125,78 @@ def parse_traits(path):
                 }
             )
     return traits
+
+
+def parse_causal_regions(path):
+    """Parse a BED or GFF file into a dict of {chr: [(start, end), ...]}.
+
+    BED: 0-based half-open (chr, start, end, ...).
+    GFF/GFF3/GTF: 1-based inclusive (chr, source, type, start, end, ...),
+    converted to 0-based half-open internally.
+    Format is auto-detected: lines with >=8 tab-separated fields where
+    columns 4 and 5 are integers are treated as GFF; otherwise BED.
+    """
+    regions = {}  # chr -> list of (start, end)  0-based half-open
+    is_gff = None
+
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("track") or line.startswith("browser"):
+                continue
+            fields = line.split("\t")
+
+            # Auto-detect format on first data line
+            if is_gff is None:
+                if len(fields) >= 8:
+                    try:
+                        int(fields[3])
+                        int(fields[4])
+                        is_gff = True
+                    except ValueError:
+                        is_gff = False
+                else:
+                    is_gff = False
+
+            if is_gff:
+                chrom = fields[0]
+                start = int(fields[3]) - 1  # GFF is 1-based inclusive -> 0-based
+                end = int(fields[4])         # end stays (1-based inclusive end == 0-based half-open end)
+            else:
+                chrom = fields[0]
+                start = int(fields[1])
+                end = int(fields[2])
+
+            regions.setdefault(chrom, []).append((start, end))
+
+    # Sort intervals per chromosome
+    for chrom in regions:
+        regions[chrom].sort()
+
+    total_regions = sum(len(v) for v in regions.values())
+    total_bp = sum(e - s for intervals in regions.values() for s, e in intervals)
+    print(f"Loaded {total_regions} causal regions from {path} "
+          f"across {len(regions)} chromosomes ({total_bp:,} bp total)")
+    return regions
+
+
+def snp_in_regions(chrom, pos, regions):
+    """Check if a SNP (chrom, 1-based pos) falls within any region.
+
+    Uses binary search for efficiency. Regions are 0-based half-open.
+    """
+    import bisect
+    intervals = regions.get(str(chrom))
+    if intervals is None:
+        return False
+    # pos is 1-based from BIM; convert to 0-based for comparison
+    pos0 = pos - 1
+    # Find the rightmost interval whose start <= pos0
+    idx = bisect.bisect_right(intervals, (pos0, float('inf'))) - 1
+    if idx < 0:
+        return False
+    start, end = intervals[idx]
+    return start <= pos0 < end
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +627,7 @@ def read_bed_genotypes(bed_path):
     return G, bim_records, sample_ids
 
 
-def simulate_real_genotypes(bed_path, traits, out, rng):
+def simulate_real_genotypes(bed_path, traits, out, rng, causal_regions=None):
     """Use real genotypes from an existing PLINK file, simulate phenotypes."""
     print(f"Reading genotypes from {bed_path} ...")
     G, bim_records, sample_ids = read_bed_genotypes(bed_path)
@@ -570,6 +650,15 @@ def simulate_real_genotypes(bed_path, traits, out, rng):
     poly_indices = np.where(poly_mask)[0]
     print(f"  {len(poly_indices)} SNPs with MAF > 15% available as causal candidates")
 
+    # Further restrict to allowed causal regions if specified
+    if causal_regions is not None:
+        region_mask = np.array([
+            snp_in_regions(bim_records[i][0], bim_records[i][2], causal_regions)
+            for i in poly_indices
+        ])
+        poly_indices = poly_indices[region_mask]
+        print(f"  {len(poly_indices)} of those fall within causal regions")
+
     print("\nSimulating phenotypes ...")
     phenotypes = {}
     causal_info = []
@@ -589,7 +678,7 @@ def simulate_real_genotypes(bed_path, traits, out, rng):
         G_std = (G_causal - means) / stds
 
         # Truncated Laplace: resample any effects with |beta| < min_effect
-        min_effect = 0.25
+        min_effect = 0.05
         beta = rng.laplace(loc=0, scale=1.0, size=n_causal)
         small = np.abs(beta) < min_effect
         while small.any():
@@ -748,11 +837,15 @@ def main():
     if args.sim_method == "real_genotypes":
         if args.bed is None:
             sys.exit("Error: --bed is required for --sim-method real_genotypes")
+        causal_regions = None
+        if args.causal_regions is not None:
+            causal_regions = parse_causal_regions(args.causal_regions)
         simulate_real_genotypes(
             bed_path=args.bed,
             traits=traits,
             out=args.out,
             rng=rng,
+            causal_regions=causal_regions,
         )
         return
 
