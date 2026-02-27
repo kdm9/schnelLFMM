@@ -85,32 +85,37 @@ pub fn test_associations_fused(
     }
     let df = (n - 1 - d - k) as f64;
 
-    // Precompute P_U = U_hat (U^T U)^{-1} U^T (n × n).
-    let utu = u_hat.t().dot(u_hat);
-    let utu_inv = safe_inv(&utu, "U_hat^T U_hat")?;
-    let p_u = u_hat.dot(&utu_inv).dot(&u_hat.t());
+    // Serial BLAS section: precompute projectors and OLS hat matrix
+    let (i_minus_pu, xtr, c, ctc_inv, h) = crate::with_multithreaded_blas(config.n_workers, || -> Result<_> {
+        // Precompute P_U = U_hat (U^T U)^{-1} U^T (n × n).
+        let utu = u_hat.t().dot(u_hat);
+        let utu_inv = safe_inv(&utu, "U_hat^T U_hat")?;
+        let p_u = u_hat.dot(&utu_inv).dot(&u_hat.t());
 
-    // XtR = (X^T X + λI)^{-1} X^T (d × n) — precomputed ridge projection
-    let xtr = pre.ridge_inv.dot(&x.t());
+        // XtR = (X^T X + λI)^{-1} X^T (d × n) — precomputed ridge projection
+        let xtr = pre.ridge_inv.dot(&x.t());
 
-    // I - P_U for Step 3 residual: projects Y onto the space orthogonal to U_hat
-    let mut i_minus_pu = Array2::<f64>::eye(n);
-    i_minus_pu -= &p_u;
+        // I - P_U for Step 3 residual: projects Y onto the space orthogonal to U_hat
+        let mut i_minus_pu = Array2::<f64>::eye(n);
+        i_minus_pu -= &p_u;
 
-    // Step 4 precomputes:
-    // C = [1 | X | U_hat] (n × (1+d+K)) — intercept + covariate + latent factor design matrix.
-    let c_cols = 1 + d + k;
-    let mut c = Array2::<f64>::zeros((n, c_cols));
-    c.column_mut(0).fill(1.0); // intercept
-    c.slice_mut(ndarray::s![.., 1..1 + d]).assign(x);
-    c.slice_mut(ndarray::s![.., 1 + d..]).assign(u_hat);
+        // Step 4 precomputes:
+        // C = [1 | X | U_hat] (n × (1+d+K)) — intercept + covariate + latent factor design matrix.
+        let c_cols = 1 + d + k;
+        let mut c = Array2::<f64>::zeros((n, c_cols));
+        c.column_mut(0).fill(1.0); // intercept
+        c.slice_mut(ndarray::s![.., 1..1 + d]).assign(x);
+        c.slice_mut(ndarray::s![.., 1 + d..]).assign(u_hat);
 
-    // (C^T C)^{-1}: needed for standard errors.
-    let ctc = c.t().dot(&c);
-    let ctc_inv = safe_inv(&ctc, "C^T C  where C = [1 | X | U_hat]")?;
+        // (C^T C)^{-1}: needed for standard errors.
+        let ctc = c.t().dot(&c);
+        let ctc_inv = safe_inv(&ctc, "C^T C  where C = [1 | X | U_hat]")?;
 
-    // H = (C^T C)^{-1} C^T — the OLS hat matrix for coefficient estimation
-    let h = ctc_inv.dot(&c.t());
+        // H = (C^T C)^{-1} C^T — the OLS hat matrix for coefficient estimation
+        let h = ctc_inv.dot(&c.t());
+
+        Ok((i_minus_pu, xtr, c, ctc_inv, h))
+    })?;
 
     // Diagonal of (C^T C)^{-1} for standard error computation (covariate indices 1..d+1)
     let ctc_inv_diag: Vec<f64> = (0..d).map(|j| ctc_inv[(1 + j, 1 + j)]).collect();

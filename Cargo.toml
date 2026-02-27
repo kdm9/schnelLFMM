@@ -24,6 +24,7 @@ anyhow = "1"
 byteorder = "1"
 tempfile = "3"
 indicatif = "0.18.4"
+fastrace = { version ="0.7", features = ["enable"] }
 
 [dev-dependencies]
 approx = "0.5"

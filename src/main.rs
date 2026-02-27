@@ -86,24 +86,19 @@ fn default_threads() -> usize {
         .unwrap_or(1)
 }
 
-extern "C" {
-    fn openblas_set_num_threads(num_threads: std::ffi::c_int);
-}
+use fastrace::collector::Config;
+use fastrace::collector::ConsoleReporter;
+use fastrace::prelude::*;
 
 fn main() -> Result<()> {
     // Force BLAS single-threaded: our worker pool is the sole source of parallelism.
-    // set_var as belt-and-suspenders (may not take effect if BLAS is statically linked
-    // and initializes its thread pool before main), plus FFI call for runtime override.
-    // SAFETY: called in main() before any threads are spawned.
-    unsafe {
-        std::env::set_var("OPENBLAS_NUM_THREADS", "1");
-        std::env::set_var("MKL_NUM_THREADS", "1");
-        openblas_set_num_threads(1);
-    }
+    schnellfmm::with_multithreaded_blas(1, || {});
+
+    fastrace::set_reporter(ConsoleReporter, Config::default());
 
     let cli = Cli::parse();
 
-    // --- Load genotype data ---
+    // Load genotype data
     eprintln!("Loading BED file: {}", cli.bed.display());
     let mut bed = BedFile::open(&cli.bed)?;
     eprintln!(
@@ -111,7 +106,7 @@ fn main() -> Result<()> {
         bed.n_samples, bed.n_snps
     );
 
-    // --- Load covariates with sample matching ---
+    // Load covariates with sample matching
     eprintln!("Loading covariates from: {}", cli.cov.display());
     let (cov_names, x, kept_indices) =
         load_covariates(&cli.cov, &bed.fam_records, cli.intersect_samples, cli.verbose)?;
@@ -130,7 +125,7 @@ fn main() -> Result<()> {
         cov_names.join(", ")
     );
 
-    // --- Estimation subset ---
+    // Estimation subset
     if cli.est_bed.is_some() && cli.est_rate.is_some() {
         anyhow::bail!("Cannot specify both --est-bed and --est-rate");
     }
@@ -180,7 +175,7 @@ fn main() -> Result<()> {
         config.oversampling, config.n_power_iter,
     );
 
-    // --- Run LFMM2 with streaming output ---
+    // Run LFMM2 with streaming output
     let results_path = PathBuf::from(format!("{}.tsv", cli.out));
     let summary_path = format!("{}.summary.txt", cli.out);
 

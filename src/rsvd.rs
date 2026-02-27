@@ -12,6 +12,9 @@ use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
 
+
+
+
 /// Estimate latent factors U_hat via randomized SVD of M @ Y_est.
 ///
 /// This implements Steps 1-2 of the LFMM2 algorithm:
@@ -41,7 +44,7 @@ pub fn estimate_factors_streaming(
     let omega = Array2::from_shape_fn((n, l), |_| normal.sample(&mut rng));
 
     // Precompute Mt_omega = M^T @ Omega (n × l)
-    let mt_omega = pre.m.t().dot(&omega);
+    let mt_omega = crate::with_multithreaded_blas(config.n_workers, || pre.m.t().dot(&omega));
 
     // Step 1a: Initial sketch
     // Z = Y_est^T @ Mt_omega (p_est × l)
@@ -87,11 +90,13 @@ pub fn estimate_factors_streaming(
             pb.finish_and_clear();
         }
 
-        // QR orthogonalize
-        let q_aqz = qr_q(&a_qz);
+        // Serial BLAS section: QR + matrix multiply between parallel passes
+        let mt_q = crate::with_multithreaded_blas(config.n_workers, || {
+            let q_aqz = qr_q(&a_qz);
+            pre.m.t().dot(&q_aqz)
+        });
 
         // Backward pass: A^T @ Q_aqz = Y_est^T @ (M^T @ Q_aqz) (p_est × l)
-        let mt_q = pre.m.t().dot(&q_aqz);
         z = Array2::<f64>::zeros((p_est, l));
         {
             let label = format!("Power iter {}/{} (bwd)", iter + 1, config.n_power_iter);
@@ -133,18 +138,21 @@ pub fn estimate_factors_streaming(
         pb.finish_and_clear();
     }
 
-    // Small SVD of B_svd (n × l)
-    let (u_opt, _s, _vt_opt) = b_svd.svd(true, false)?;
-    let u_small = u_opt.expect("SVD should return U");
+    // Serial BLAS section: SVD + matrix multiply after final projection pass
+    let u_hat = crate::with_multithreaded_blas(config.n_workers, || -> Result<Array2<f64>> {
+        // Small SVD of B_svd (n × l)
+        let (u_opt, _s, _vt_opt) = b_svd.svd(true, false)?;
+        let u_small = u_opt.expect("SVD should return U");
 
-    // Recover: U_hat = Q @ D_lambda_inv @ U_small[:, :K]
-    // U_small is n × l, take first K columns
-    // Apply D_lambda_inv as diagonal: scale each row i by d_lambda_inv[i]
-    let d_col = pre.d_lambda_inv.view().insert_axis(ndarray::Axis(1)); // (n,) → (n, 1)
-    let dlam_inv_u = &d_col * &u_small.slice(ndarray::s![.., ..k]);
+        // Recover: U_hat = Q @ D_lambda_inv @ U_small[:, :K]
+        // U_small is n × l, take first K columns
+        // Apply D_lambda_inv as diagonal: scale each row i by d_lambda_inv[i]
+        let d_col = pre.d_lambda_inv.view().insert_axis(ndarray::Axis(1)); // (n,) → (n, 1)
+        let dlam_inv_u = &d_col * &u_small.slice(ndarray::s![.., ..k]);
 
-    // U_hat = Q @ dlam_inv_u
-    let u_hat = pre.q_full.dot(&dlam_inv_u);
+        // U_hat = Q @ dlam_inv_u
+        Ok(pre.q_full.dot(&dlam_inv_u))
+    })?;
 
     Ok(u_hat)
 }

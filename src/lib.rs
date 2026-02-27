@@ -16,6 +16,20 @@ use rsvd::estimate_factors_streaming;
 use testing::{test_associations_fused, TestResults};
 pub use testing::OutputConfig;
 
+extern "C" {
+    fn openblas_set_num_threads(num_threads: std::ffi::c_int);
+}
+
+/// Temporarily enable multithreaded BLAS for a serial section,
+/// then restore single-threaded mode for the next parallel sweep.
+pub fn with_multithreaded_blas<T>(n_workers: usize, f: impl FnOnce() -> T) -> T {
+    let n = (n_workers.max(1)) as std::ffi::c_int;
+    unsafe { openblas_set_num_threads(n); }
+    let result = f();
+    unsafe { openblas_set_num_threads(1); }
+    result
+}
+
 /// Configuration for the LFMM2 algorithm.
 pub struct Lfmm2Config {
     /// Number of latent factors (K)
@@ -35,11 +49,9 @@ pub struct Lfmm2Config {
     /// 0 is treated as 1 — all paths use the parallel streaming infrastructure
     /// (1 decoder thread + n_workers worker threads via crossbeam channels).
     ///
-    /// BLAS should always be single-threaded when using this library, since
-    /// the worker pool is the sole source of parallelism. The CLI calls
-    /// `openblas_set_num_threads(1)` automatically. Library callers should
-    /// set `OPENBLAS_NUM_THREADS=1` (and `MKL_NUM_THREADS=1`) or call
-    /// `openblas_set_num_threads(1)` via FFI before invoking `fit_lfmm2`.
+    /// During parallel streaming sweeps, BLAS is single-threaded (each worker
+    /// calls BLAS independently). Between sweeps, BLAS is temporarily set to
+    /// n_workers threads via `with_multithreaded_blas` for serial linear algebra.
     pub n_workers: usize,
     /// Show progress bars on stderr for streaming passes.
     pub progress: bool,
@@ -100,7 +112,7 @@ pub fn estimate_factors(
     config: &Lfmm2Config,
 ) -> Result<Array2<f64>> {
     let xs = center_covariates(x, config.scale_cov);
-    let pre = precompute(&xs, config.lambda)?;
+    let pre = with_multithreaded_blas(config.n_workers, || precompute(&xs, config.lambda))?;
     estimate_factors_streaming(y_est, subset, &pre, config)
 }
 
@@ -118,7 +130,7 @@ pub fn test_associations(
     output: Option<&OutputConfig>,
 ) -> Result<TestResults> {
     let xs = center_covariates(x, config.scale_cov);
-    let pre = precompute(&xs, config.lambda)?;
+    let pre = with_multithreaded_blas(config.n_workers, || precompute(&xs, config.lambda))?;
     test_associations_fused(y_full, &xs, u_hat, &pre, config, output)
 }
 
@@ -140,7 +152,7 @@ pub fn fit_lfmm2(
     if config.progress {
         eprintln!("Precomputing SVD of X...");
     }
-    let pre = precompute(&xs, config.lambda)?;
+    let pre = with_multithreaded_blas(config.n_workers, || precompute(&xs, config.lambda))?;
     if config.progress {
         let p_est = y_est.subset_snp_count(est_subset);
         eprintln!(
