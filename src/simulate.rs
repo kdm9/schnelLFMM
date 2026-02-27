@@ -57,7 +57,7 @@ pub fn simulate(config: &SimConfig) -> SimData {
     let v_scale = config.latent_scale / (k as f64).sqrt();
     let v_true = Array2::from_shape_fn((p, k), |_| rng.sample(normal) * v_scale);
 
-    // Generate X (n × d) — covariates with pairwise correlation ≈ covariate_r2
+    // Generate X (n × d) - covariates with pairwise correlation ≈ covariate_r2
     // Column 0: iid N(0,1)
     // Columns j>0: r*X[:,0] + sqrt(1-r²)*Z_j giving pairwise r² ≈ covariate_r2
     let mut x = Array2::<f64>::zeros((n, d));

@@ -47,7 +47,7 @@ pub struct Lfmm2Config {
     pub seed: u64,
     /// Number of worker threads for parallel chunk processing.
     ///
-    /// 0 is treated as 1 — all paths use the parallel streaming infrastructure
+    /// 0 is treated as 1 - all paths use the parallel streaming infrastructure
     /// (1 decoder thread + n_workers worker threads via crossbeam channels).
     ///
     /// During parallel streaming sweeps, BLAS is single-threaded (each worker
@@ -140,7 +140,7 @@ pub fn test_associations(
 /// - y_est: BedFile for factor estimation (may be LD-pruned or the same as y_full)
 /// - est_subset: which SNPs from y_est to use (All, Rate, or Indices)
 /// - y_full: All SNPs for testing (Steps 3-4)
-/// - x: Covariate matrix (n × d) — centered (and optionally scaled) internally
+/// - x: Covariate matrix (n × d) - centered (and optionally scaled) internally
 pub fn fit_lfmm2(
     y_est: &BedFile,
     est_subset: &SubsetSpec,

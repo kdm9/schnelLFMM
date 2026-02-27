@@ -10,7 +10,7 @@ use schnellfmm::bed::{BedFile, SubsetSpec};
 use schnellfmm::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
 
 #[derive(Parser)]
-#[command(name = "lfmm2", about = "Latent Factor Mixed Model v2 — GWAS with latent confounders")]
+#[command(name = "lfmm2", about = "Latent Factor Mixed Model v2 - GWAS with latent confounders")]
 struct Cli {
     /// PLINK .bed file (with .bim/.fam)
     #[arg(short = 'b', long)]
@@ -306,7 +306,7 @@ fn load_covariates(
     let header_fields: Vec<&str> = header_line.split(delim).collect();
     if header_fields.len() < 2 {
         anyhow::bail!(
-            "Covariate file header has only {} field(s) — expected at least a sample ID column \
+            "Covariate file header has only {} field(s) - expected at least a sample ID column \
              and one covariate column (delimiter: {:?})",
             header_fields.len(),
             delim,

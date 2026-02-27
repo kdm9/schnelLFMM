@@ -24,8 +24,21 @@ anyhow = "1"
 byteorder = "1"
 tempfile = "3"
 indicatif = "0.18.4"
-fastrace = { version ="0.7", features = ["enable"] }
+
+[patch.crates-io]
+native-tls = {git = "https://github.com/rust-native-tls/rust-native-tls"}
 
 [dev-dependencies]
 approx = "0.5"
 tempfile = "3"
+
+[package.metadata.cross.build]
+default-target = "x86_64-unknown-linux-gnu"    # use this target if none is explicitly provided
+pre-build = [                                  # additional commands to run prior to building the package
+    "dpkg --add-architecture $CROSS_DEB_ARCH", 
+    "apt-get update && apt-get --assume-yes install libssl-dev:$CROSS_DEB_ARCH libopenblas-dev:$CROSS_DEB_ARCH"
+]
+[package.metadata.cross.build.env]
+passthrough=[
+    "NOFORTRAN=1",
+]

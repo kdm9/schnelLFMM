@@ -159,7 +159,7 @@ impl TsqHistogram {
 /// fragment. After GIF calibration, fragments are coalesced into the final
 /// output file with calibrated p-values.
 ///
-/// No p-dimensional arrays are held in RAM — all per-SNP data flows through
+/// No p-dimensional arrays are held in RAM - all per-SNP data flows through
 /// chunk files on disk.
 pub fn test_associations_fused(
     y_full: &BedFile,
@@ -195,7 +195,7 @@ pub fn test_associations_fused(
         let utu_inv = safe_inv(&utu, "U_hat^T U_hat")?;
         let p_u = u_hat.dot(&utu_inv).dot(&u_hat.t());
 
-        // XtR = (X^T X + λI)^{-1} X^T (d × n) — precomputed ridge projection
+        // XtR = (X^T X + λI)^{-1} X^T (d × n) - precomputed ridge projection
         let xtr = pre.ridge_inv.dot(&x.t());
 
         // I - P_U for Step 3 residual: projects Y onto the space orthogonal to U_hat
@@ -203,7 +203,7 @@ pub fn test_associations_fused(
         i_minus_pu -= &p_u;
 
         // Step 4 precomputes:
-        // C = [1 | X | U_hat] (n × (1+d+K)) — intercept + covariate + latent factor design matrix.
+        // C = [1 | X | U_hat] (n × (1+d+K)) - intercept + covariate + latent factor design matrix.
         let c_cols = 1 + d + k;
         let mut c = Array2::<f64>::zeros((n, c_cols));
         c.column_mut(0).fill(1.0); // intercept
@@ -214,7 +214,7 @@ pub fn test_associations_fused(
         let ctc = c.t().dot(&c);
         let ctc_inv = safe_inv(&ctc, "C^T C  where C = [1 | X | U_hat]")?;
 
-        // H = (C^T C)^{-1} C^T — the OLS hat matrix for coefficient estimation
+        // H = (C^T C)^{-1} C^T - the OLS hat matrix for coefficient estimation
         let h = ctc_inv.dot(&c.t());
 
         Ok((i_minus_pu, xtr, c, ctc_inv, h))
@@ -333,7 +333,7 @@ pub fn test_associations_fused(
 /// into a single array of shape (chunk_cols, 2*d + 3):
 ///   [beta_0 .. beta_{d-1}, t_0 .. t_{d-1}, r2_cov, r2_latent, r2_resid]
 ///
-/// BIM metadata is not stored — it's recovered from OutputConfig during coalescing.
+/// BIM metadata is not stored - it's recovered from OutputConfig during coalescing.
 fn write_chunk_npy(
     dir: &Path,
     seq: usize,
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_safe_inv_positive_definite() {
-        // A = [[2, 1], [1, 3]] — symmetric positive definite (eigenvalues ~1.38, 3.62)
+        // A = [[2, 1], [1, 3]] - symmetric positive definite (eigenvalues ~1.38, 3.62)
         let a = array![[2.0, 1.0], [1.0, 3.0]];
         let inv = safe_inv(&a, "test_pd").unwrap();
 

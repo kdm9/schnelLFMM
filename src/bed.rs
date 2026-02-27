@@ -18,13 +18,11 @@ const DECODE_TABLE: [f64; 4] = [0.0, f64::NAN, 1.0, 2.0];
 /// SNP normalization mode applied after centering.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum SnpNorm {
-    /// Center only — subtract mean, no variance scaling.
-    CenterOnly,
-    /// Eigenstrat — divide by sqrt(2pq) for approximately unit variance under HWE.
+    /// Center only - subtract mean, no variance scaling. Matches R's LEA::lfmm2()
     #[default]
+    CenterOnly,
+    /// Eigenstrat - divide by sqrt(2pq) for approximately unit variance under HWE.
     Eigenstrat,
-    /// HWE — multiply by sqrt(2pq) so Var(g) = 2pq exactly.
-    Hwe,
 }
 
 #[derive(Debug, Clone)]
@@ -230,7 +228,6 @@ pub fn decode_bed_chunk_into(
 /// 4. Applies normalization according to `norm`:
 ///    - `CenterOnly`: no scaling (scale = 1.0)
 ///    - `Eigenstrat`: divides by sqrt(2pq) for approx unit variance under HWE
-///    - `Hwe`: multiplies by sqrt(2pq) so Var(g) = 2pq exactly
 ///
 /// Monomorphic SNPs (p=0 or p=1) have zero variance and are left as all zeros.
 ///
@@ -303,10 +300,6 @@ fn compute_scale(mean: f64, norm: SnpNorm) -> f64 {
         SnpNorm::Eigenstrat => {
             let denom = twopq.sqrt();
             if denom > 1e-10 { 1.0 / denom } else { 0.0 }
-        }
-        SnpNorm::Hwe => {
-            let s = twopq.sqrt();
-            if s < 1e-10 { 0.0 } else { s }
         }
     }
 }
@@ -525,11 +518,5 @@ mod tests {
         assert!((dec[(1, 0)] - (1.0 - mean) * s).abs() < 1e-10);
         assert!((dec[(2, 0)] - (2.0 - mean) * s).abs() < 1e-10);
 
-        // HWE: (g - mean) * sqrt(2pq)
-        let dec = decode_bed_chunk(&packed, n, n, 1, SnpNorm::Hwe, None);
-        let s = twopq.sqrt();
-        assert!((dec[(0, 0)] - (0.0 - mean) * s).abs() < 1e-10);
-        assert!((dec[(1, 0)] - (1.0 - mean) * s).abs() < 1e-10);
-        assert!((dec[(2, 0)] - (2.0 - mean) * s).abs() < 1e-10);
     }
 }

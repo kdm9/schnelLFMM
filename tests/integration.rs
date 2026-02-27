@@ -1413,7 +1413,7 @@ fn test_normalization_modes_end_to_end() {
     write_plink(dir.path(), "sim", &sim).unwrap();
     let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
 
-    let modes = [SnpNorm::CenterOnly, SnpNorm::Eigenstrat, SnpNorm::Hwe];
+    let modes = [SnpNorm::CenterOnly, SnpNorm::Eigenstrat];
     let d = sim.x.ncols();
     let cov_names = default_cov_names(d);
     let mut parsed_results = Vec::new();
@@ -1495,7 +1495,7 @@ fn test_normalization_modes_end_to_end() {
 fn test_cli_norm_flag() {
     let (dir, bed, cov) = cli_test_fixtures();
 
-    for mode in &["center-only", "eigenstrat", "hwe"] {
+    for mode in &["center-only", "eigenstrat"] {
         let out_prefix = dir.path().join(format!("out_{}", mode));
         let output = Command::new(lfmm2_bin())
             .args([
