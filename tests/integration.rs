@@ -1490,7 +1490,7 @@ fn test_normalization_modes_end_to_end() {
     }
 }
 
-/// CLI: --norm flag accepts all 3 valid values.
+/// CLI: --norm flag accepts all valid values.
 #[test]
 fn test_cli_norm_flag() {
     let (dir, bed, cov) = cli_test_fixtures();
