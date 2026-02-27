@@ -180,7 +180,7 @@ fn main() -> Result<()> {
     };
 
     let y_est = est_bed.as_ref().unwrap_or(&bed);
-    let results = fit_lfmm2(y_est, &est_subset, &bed, &x, &config, Some(&output_config))?;
+    let results = fit_lfmm2(y_est, &est_subset, &bed, &x, &config, &output_config)?;
 
     eprintln!("GIF: {:.4}", results.gif);
     eprintln!("Results written to {}", results_path.display());

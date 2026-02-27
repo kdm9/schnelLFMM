@@ -128,7 +128,7 @@ pub fn test_associations(
     x: &Array2<f64>,
     u_hat: &Array2<f64>,
     config: &Lfmm2Config,
-    output: Option<&OutputConfig>,
+    output: &OutputConfig,
 ) -> Result<TestResults> {
     let xs = center_covariates(x, config.scale_cov);
     let pre = with_multithreaded_blas(config.n_workers, || precompute(&xs, config.lambda))?;
@@ -147,7 +147,7 @@ pub fn fit_lfmm2(
     y_full: &BedFile,
     x: &Array2<f64>,
     config: &Lfmm2Config,
-    output: Option<&OutputConfig>,
+    output: &OutputConfig,
 ) -> Result<TestResults> {
     let xs = center_covariates(x, config.scale_cov);
     if config.progress {

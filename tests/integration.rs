@@ -8,8 +8,77 @@ use schnellfmm::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
 use ndarray::Array2;
 use ndarray_linalg::SVD;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Parsed per-SNP results from the output TSV.
+struct ParsedResults {
+    /// p_values[snp_idx][cov_idx]
+    p_values: Vec<Vec<f64>>,
+    /// effect_sizes[snp_idx][cov_idx]
+    effect_sizes: Vec<Vec<f64>>,
+    /// t_stats[snp_idx][cov_idx]
+    t_stats: Vec<Vec<f64>>,
+    r2_cov: Vec<f64>,
+    r2_latent: Vec<f64>,
+    r2_resid: Vec<f64>,
+}
+
+/// Parse the output TSV written by coalesce_output.
+fn read_results_tsv(path: &Path) -> ParsedResults {
+    let content = fs::read_to_string(path).unwrap();
+    let mut lines = content.lines();
+    let header = lines.next().expect("empty TSV");
+    let header_fields: Vec<&str> = header.split('\t').collect();
+
+    // Detect d from header: columns are chr, pos, snp_id, then 3 per cov, then r2_cov/r2_latent/r2_resid
+    // So d = (n_cols - 3 - 3) / 3
+    let n_cols = header_fields.len();
+    let d = (n_cols - 3 - 3) / 3;
+
+    let mut p_values = Vec::new();
+    let mut effect_sizes = Vec::new();
+    let mut t_stats = Vec::new();
+    let mut r2_cov = Vec::new();
+    let mut r2_latent = Vec::new();
+    let mut r2_resid = Vec::new();
+
+    for line in lines {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let mut pv = Vec::with_capacity(d);
+        let mut es = Vec::with_capacity(d);
+        let mut ts = Vec::with_capacity(d);
+        for j in 0..d {
+            let base = 3 + j * 3;
+            pv.push(fields[base].parse::<f64>().unwrap());
+            es.push(fields[base + 1].parse::<f64>().unwrap());
+            ts.push(fields[base + 2].parse::<f64>().unwrap());
+        }
+        p_values.push(pv);
+        effect_sizes.push(es);
+        t_stats.push(ts);
+
+        let r2_start = 3 + d * 3;
+        r2_cov.push(fields[r2_start].parse::<f64>().unwrap());
+        r2_latent.push(fields[r2_start + 1].parse::<f64>().unwrap());
+        r2_resid.push(fields[r2_start + 2].parse::<f64>().unwrap());
+    }
+
+    ParsedResults { p_values, effect_sizes, t_stats, r2_cov, r2_latent, r2_resid }
+}
+
+/// Create default covariate names for d covariates.
+fn default_cov_names(d: usize) -> Vec<String> {
+    (0..d).map(|j| format!("cov_{}", j)).collect()
+}
+
+/// Create an OutputConfig, output path, and cov_names for a test.
+/// Returns (output_path, cov_names) — caller must create OutputConfig referencing these.
+fn test_output_setup(dir: &Path, d: usize) -> (PathBuf, Vec<String>) {
+    let output_path = dir.join("results.tsv");
+    let cov_names = default_cov_names(d);
+    (output_path, cov_names)
+}
 
 /// Tier 1: Quick test — small simulation for basic correctness.
 /// n=200, p=10_000, K=3, d=2 (r²≈0.3), 20 causal SNPs
@@ -54,10 +123,13 @@ fn test_lfmm2_quick() {
     assert_eq!(bed.n_snps, 10_000);
 
     // Run LFMM2
-    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
+    let (output_path, cov_names) = test_output_setup(dir.path(), sim.x.ncols());
+    let output_config = OutputConfig { path: &output_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &output_config).unwrap();
 
     // Validation checks
-    validate_results(&results, &sim, &config);
+    let parsed = read_results_tsv(&output_path);
+    validate_results(&results, &parsed, &sim, &config);
 }
 
 /// Tier 2: Large simulation for thorough validation.
@@ -114,13 +186,16 @@ fn test_lfmm2_large() {
 
     // Run LFMM2
     eprintln!("Running LFMM2...");
-    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
+    let (output_path, cov_names) = test_output_setup(testdata, sim.x.ncols());
+    let output_config = OutputConfig { path: &output_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &output_config).unwrap();
 
     // Validation
-    validate_results(&results, &sim, &config);
+    let parsed = read_results_tsv(&output_path);
+    validate_results(&results, &parsed, &sim, &config);
 
     // Write Rust results for R comparison
-    write_rust_results(testdata, &results);
+    write_rust_results(testdata, &parsed);
 
     eprintln!("Done. Results in testdata/");
     eprintln!("To compare with LEA: cd testdata && Rscript run_lea_comparison.R");
@@ -156,26 +231,35 @@ fn test_reproducibility() {
     };
 
     let sim = simulate(&sim_config);
+    let d = sim.x.ncols();
 
     let dir1 = tempfile::tempdir().unwrap();
     write_plink(dir1.path(), "sim", &sim).unwrap();
     let bed1 = BedFile::open(dir1.path().join("sim.bed")).unwrap();
-    let r1 = fit_lfmm2(&bed1, &SubsetSpec::All, &bed1, &sim.x, &config, None).unwrap();
+    let (out1, cn1) = test_output_setup(dir1.path(), d);
+    let oc1 = OutputConfig { path: &out1, bim: &bed1.bim_records, cov_names: &cn1 };
+    let r1 = fit_lfmm2(&bed1, &SubsetSpec::All, &bed1, &sim.x, &config, &oc1).unwrap();
 
     let dir2 = tempfile::tempdir().unwrap();
     write_plink(dir2.path(), "sim", &sim).unwrap();
     let bed2 = BedFile::open(dir2.path().join("sim.bed")).unwrap();
-    let r2 = fit_lfmm2(&bed2, &SubsetSpec::All, &bed2, &sim.x, &config, None).unwrap();
+    let (out2, cn2) = test_output_setup(dir2.path(), d);
+    let oc2 = OutputConfig { path: &out2, bim: &bed2.bim_records, cov_names: &cn2 };
+    let r2 = fit_lfmm2(&bed2, &SubsetSpec::All, &bed2, &sim.x, &config, &oc2).unwrap();
 
-    // Bitwise identical
-    assert_eq!(r1.p_values.shape(), r2.p_values.shape());
-    for (a, b) in r1.p_values.iter().zip(r2.p_values.iter()) {
-        assert!(
-            (a - b).abs() < 1e-15,
-            "Reproducibility failed: {} vs {}",
-            a,
-            b
-        );
+    // Compare TSV outputs
+    let p1 = read_results_tsv(&out1);
+    let p2 = read_results_tsv(&out2);
+    assert_eq!(p1.p_values.len(), p2.p_values.len());
+    for (row1, row2) in p1.p_values.iter().zip(p2.p_values.iter()) {
+        for (a, b) in row1.iter().zip(row2.iter()) {
+            assert!(
+                (a - b).abs() < 1e-15,
+                "Reproducibility failed: {} vs {}",
+                a,
+                b
+            );
+        }
     }
     assert!((r1.gif - r2.gif).abs() < 1e-15);
 }
@@ -220,23 +304,30 @@ fn test_different_seeds_differ() {
         scale_cov: false,
     };
 
-    let r1 = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &base_config, None).unwrap();
+    let d = sim_config.d;
+    let cov_names = default_cov_names(d);
+    let out1_path = dir.path().join("results1.tsv");
+    let oc1 = OutputConfig { path: &out1_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let r1 = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &base_config, &oc1).unwrap();
 
     let alt_config = Lfmm2Config {
         seed: 999,
         ..base_config
     };
-    let r2 = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &alt_config, None).unwrap();
+    let out2_path = dir.path().join("results2.tsv");
+    let oc2 = OutputConfig { path: &out2_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let r2 = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &alt_config, &oc2).unwrap();
 
+    let p1 = read_results_tsv(&out1_path);
+    let p2 = read_results_tsv(&out2_path);
     let p = sim_config.n_snps;
-    let d = sim_config.d;
 
     // 1. Results must NOT be identical — at least some p-values should differ
     let mut n_differ = 0;
     let mut max_diff = 0.0f64;
     for i in 0..p {
         for j in 0..d {
-            let diff = (r1.p_values[(i, j)] - r2.p_values[(i, j)]).abs();
+            let diff = (p1.p_values[i][j] - p2.p_values[i][j]).abs();
             if diff > 1e-15 {
                 n_differ += 1;
             }
@@ -254,8 +345,8 @@ fn test_different_seeds_differ() {
 
     // 2. Results should be similar: high Spearman rank correlation per covariate
     for j in 0..d {
-        let mut v1: Vec<f64> = (0..p).map(|i| r1.p_values[(i, j)]).collect();
-        let mut v2: Vec<f64> = (0..p).map(|i| r2.p_values[(i, j)]).collect();
+        let mut v1: Vec<f64> = (0..p).map(|i| p1.p_values[i][j]).collect();
+        let mut v2: Vec<f64> = (0..p).map(|i| p2.p_values[i][j]).collect();
         let rho = spearman_rank_corr(&mut v1, &mut v2);
         eprintln!("  Covariate {}: Spearman rho = {:.4}", j, rho);
         assert!(
@@ -325,6 +416,7 @@ fn ranks(vals: &mut [f64]) -> Vec<f64> {
 
 fn validate_results(
     results: &schnellfmm::testing::TestResults,
+    parsed: &ParsedResults,
     sim: &schnellfmm::simulate::SimData,
     _config: &Lfmm2Config,
 ) {
@@ -347,7 +439,7 @@ fn validate_results(
         for j in 0..d {
             if sim.b_true[(idx, j)].abs() > 1e-10 {
                 sign_total += 1;
-                if results.effect_sizes[(idx, j)].signum() == sim.b_true[(idx, j)].signum() {
+                if parsed.effect_sizes[idx][j].signum() == sim.b_true[(idx, j)].signum() {
                     sign_matches += 1;
                 }
             }
@@ -372,7 +464,7 @@ fn validate_results(
     for j_snp in 0..p {
         if !sim.causal_indices.contains(&j_snp) {
             for j_cov in 0..d {
-                if results.p_values[(j_snp, j_cov)] < 0.05 {
+                if parsed.p_values[j_snp][j_cov] < 0.05 {
                     fp_count += 1;
                 }
             }
@@ -391,7 +483,7 @@ fn validate_results(
     let mut tp_count = 0;
     for &idx in &sim.causal_indices {
         for j in 0..d {
-            if results.p_values[(idx, j)] < 0.05 {
+            if parsed.p_values[idx][j] < 0.05 {
                 tp_count += 1;
             }
         }
@@ -473,27 +565,30 @@ fn test_parallel_matches_sequential() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
     };
-    let r_seq = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_seq, None).unwrap();
+    let d = sim.x.ncols();
+    let cov_names = default_cov_names(d);
+    let out_seq = dir.path().join("results_seq.tsv");
+    let oc_seq = OutputConfig { path: &out_seq, bim: &bed.bim_records, cov_names: &cov_names };
+    let r_seq = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_seq, &oc_seq).unwrap();
 
     // Parallel run
     let config_par = Lfmm2Config {
         n_workers: 2,
         ..config_seq
     };
-    let r_par = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_par, None).unwrap();
+    let out_par = dir.path().join("results_par.tsv");
+    let oc_par = OutputConfig { path: &out_par, bim: &bed.bim_records, cov_names: &cov_names };
+    let r_par = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_par, &oc_par).unwrap();
 
     // P-values should match within floating-point tolerance.
-    // Pattern A (disjoint writes) are bitwise identical across thread counts.
-    // Pattern B (per-worker accumulators summed at the end) may differ at ~1e-9
-    // due to FP summation order: workers accumulate locally then merge, vs
-    // sequential accumulation with n_workers=1.
+    let p_seq = read_results_tsv(&out_seq);
+    let p_par = read_results_tsv(&out_par);
     let tol = 1e-6;
-    let p = r_seq.p_values.nrows();
-    let d = r_seq.p_values.ncols();
+    let p = p_seq.p_values.len();
     let mut max_diff = 0.0f64;
     for i in 0..p {
         for j in 0..d {
-            let diff = (r_seq.p_values[(i, j)] - r_par.p_values[(i, j)]).abs();
+            let diff = (p_seq.p_values[i][j] - p_par.p_values[i][j]).abs();
             max_diff = max_diff.max(diff);
         }
     }
@@ -518,18 +613,18 @@ fn test_parallel_matches_sequential() {
     );
 }
 
-fn write_rust_results(dir: &Path, results: &schnellfmm::testing::TestResults) {
+fn write_rust_results(dir: &Path, parsed: &ParsedResults) {
     use std::io::Write;
 
-    let p = results.p_values.nrows();
-    let d = results.p_values.ncols();
+    let p = parsed.p_values.len();
+    let d = if p > 0 { parsed.p_values[0].len() } else { 0 };
 
     // Write p-values
     let mut f = fs::File::create(dir.join("sim_rust_pvalues.tsv")).unwrap();
     let header: Vec<String> = (0..d).map(|j| format!("p_{}", j)).collect();
     writeln!(f, "{}", header.join("\t")).unwrap();
     for i in 0..p {
-        let vals: Vec<String> = (0..d).map(|j| format!("{:.6e}", results.p_values[(i, j)])).collect();
+        let vals: Vec<String> = (0..d).map(|j| format!("{:.6e}", parsed.p_values[i][j])).collect();
         writeln!(f, "{}", vals.join("\t")).unwrap();
     }
 
@@ -538,7 +633,7 @@ fn write_rust_results(dir: &Path, results: &schnellfmm::testing::TestResults) {
     let header: Vec<String> = (0..d).map(|j| format!("t_{}", j)).collect();
     writeln!(f, "{}", header.join("\t")).unwrap();
     for i in 0..p {
-        let vals: Vec<String> = (0..d).map(|j| format!("{:.6e}", results.t_stats[(i, j)])).collect();
+        let vals: Vec<String> = (0..d).map(|j| format!("{:.6e}", parsed.t_stats[i][j])).collect();
         writeln!(f, "{}", vals.join("\t")).unwrap();
     }
 
@@ -548,18 +643,15 @@ fn write_rust_results(dir: &Path, results: &schnellfmm::testing::TestResults) {
     writeln!(f, "{}", header.join("\t")).unwrap();
     for i in 0..p {
         let vals: Vec<String> = (0..d)
-            .map(|j| format!("{:.6e}", results.effect_sizes[(i, j)]))
+            .map(|j| format!("{:.6e}", parsed.effect_sizes[i][j]))
             .collect();
         writeln!(f, "{}", vals.join("\t")).unwrap();
     }
 
     // Write summary
     let mut f = fs::File::create(dir.join("sim_rust_summary.txt")).unwrap();
-    writeln!(f, "GIF: {:.6}", results.gif).unwrap();
-    writeln!(f, "n_samples: {}", results.u_hat.nrows()).unwrap();
-    writeln!(f, "n_snps: {}", results.p_values.nrows()).unwrap();
-    writeln!(f, "K: {}", results.u_hat.ncols()).unwrap();
-    writeln!(f, "d: {}", results.effect_sizes.ncols()).unwrap();
+    writeln!(f, "n_snps: {}", p).unwrap();
+    writeln!(f, "d: {}", d).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -667,13 +759,19 @@ fn test_subset_rate_end_to_end() {
     write_plink(dir.path(), "sim", &sim).unwrap();
     let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
 
+    let d = sim.x.ncols();
+    let cov_names = default_cov_names(d);
+
     // Run with Rate(0.5) — estimate on half the SNPs, test on all
-    let r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config, None).unwrap();
+    let out_rate = dir.path().join("results_rate.tsv");
+    let oc_rate = OutputConfig { path: &out_rate, bim: &bed.bim_records, cov_names: &cov_names };
+    let r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config, &oc_rate).unwrap();
+    let p_rate = read_results_tsv(&out_rate);
 
     // Output must cover ALL p SNPs, not just the estimation subset
-    assert_eq!(r_rate.p_values.nrows(), sim_config.n_snps);
-    assert_eq!(r_rate.effect_sizes.nrows(), sim_config.n_snps);
-    assert_eq!(r_rate.t_stats.nrows(), sim_config.n_snps);
+    assert_eq!(p_rate.p_values.len(), sim_config.n_snps);
+    assert_eq!(p_rate.effect_sizes.len(), sim_config.n_snps);
+    assert_eq!(p_rate.t_stats.len(), sim_config.n_snps);
 
     // GIF should be reasonable
     assert!(
@@ -683,10 +781,13 @@ fn test_subset_rate_end_to_end() {
     );
 
     // P-values should differ from using All (different estimation subset → different U_hat)
-    let r_all = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
+    let out_all = dir.path().join("results_all.tsv");
+    let oc_all = OutputConfig { path: &out_all, bim: &bed.bim_records, cov_names: &cov_names };
+    let _r_all = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc_all).unwrap();
+    let p_all = read_results_tsv(&out_all);
     let mut any_diff = false;
     for i in 0..sim_config.n_snps {
-        if (r_rate.p_values[(i, 0)] - r_all.p_values[(i, 0)]).abs() > 1e-10 {
+        if (p_rate.p_values[i][0] - p_all.p_values[i][0]).abs() > 1e-10 {
             any_diff = true;
             break;
         }
@@ -728,28 +829,37 @@ fn test_subset_indices_end_to_end() {
     write_plink(dir.path(), "sim", &sim).unwrap();
     let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
 
+    let d = sim.x.ncols();
+    let cov_names = default_cov_names(d);
+
     // Pick every 2nd SNP — same as Rate(0.5)
     let indices: Vec<usize> = (0..sim_config.n_snps).step_by(2).collect();
-    let r_indices = fit_lfmm2(
+    let out_idx = dir.path().join("results_idx.tsv");
+    let oc_idx = OutputConfig { path: &out_idx, bim: &bed.bim_records, cov_names: &cov_names };
+    let _r_indices = fit_lfmm2(
         &bed,
         &SubsetSpec::Indices(indices.clone()),
         &bed,
         &sim.x,
         &config,
-        None,
+        &oc_idx,
     )
     .unwrap();
+    let p_indices = read_results_tsv(&out_idx);
 
     // Output must cover ALL p SNPs
-    assert_eq!(r_indices.p_values.nrows(), sim_config.n_snps);
+    assert_eq!(p_indices.p_values.len(), sim_config.n_snps);
 
     // Since Rate(0.5) produces the same index set as step_by(2), results should match
-    let r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config, None).unwrap();
+    let out_rate = dir.path().join("results_rate.tsv");
+    let oc_rate = OutputConfig { path: &out_rate, bim: &bed.bim_records, cov_names: &cov_names };
+    let _r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config, &oc_rate).unwrap();
+    let p_rate = read_results_tsv(&out_rate);
 
     let mut max_diff = 0.0f64;
     for i in 0..sim_config.n_snps {
         for j in 0..sim_config.d {
-            let diff = (r_indices.p_values[(i, j)] - r_rate.p_values[(i, j)]).abs();
+            let diff = (p_indices.p_values[i][j] - p_rate.p_values[i][j]).abs();
             max_diff = max_diff.max(diff);
         }
     }
@@ -804,7 +914,7 @@ fn test_output_config_writes_results() {
     };
 
     let results = fit_lfmm2(
-        &bed, &SubsetSpec::All, &bed, &sim.x, &config, Some(&output_config),
+        &bed, &SubsetSpec::All, &bed, &sim.x, &config, &output_config,
     ).unwrap();
 
     // Verify file exists and has correct structure
@@ -1304,9 +1414,11 @@ fn test_normalization_modes_end_to_end() {
     let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
 
     let modes = [SnpNorm::CenterOnly, SnpNorm::Eigenstrat, SnpNorm::Hwe];
-    let mut results = Vec::new();
+    let d = sim.x.ncols();
+    let cov_names = default_cov_names(d);
+    let mut parsed_results = Vec::new();
 
-    for &mode in &modes {
+    for (idx, &mode) in modes.iter().enumerate() {
         let config = Lfmm2Config {
             k: 3,
             lambda: 1e-5,
@@ -1319,7 +1431,9 @@ fn test_normalization_modes_end_to_end() {
             norm: mode,
             scale_cov: false,
         };
-        let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
+        let out_path = dir.path().join(format!("results_{}.tsv", idx));
+        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+        let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
 
         // Each mode should produce a valid GIF
         assert!(
@@ -1328,11 +1442,12 @@ fn test_normalization_modes_end_to_end() {
             mode,
             r.gif,
         );
+        let pr = read_results_tsv(&out_path);
         // Output dimensions must match
-        assert_eq!(r.p_values.nrows(), sim_config.n_snps);
-        assert_eq!(r.p_values.ncols(), sim_config.d);
+        assert_eq!(pr.p_values.len(), sim_config.n_snps);
+        assert_eq!(pr.p_values[0].len(), sim_config.d);
 
-        results.push(r);
+        parsed_results.push(pr);
     }
 
     // Modes should produce different results
@@ -1341,7 +1456,7 @@ fn test_normalization_modes_end_to_end() {
         for j in (i + 1)..modes.len() {
             let mut n_differ = 0;
             for snp in 0..p {
-                if (results[i].p_values[(snp, 0)] - results[j].p_values[(snp, 0)]).abs() > 1e-10 {
+                if (parsed_results[i].p_values[snp][0] - parsed_results[j].p_values[snp][0]).abs() > 1e-10 {
                     n_differ += 1;
                 }
             }
@@ -1357,8 +1472,8 @@ fn test_normalization_modes_end_to_end() {
     // High Spearman correlation between modes (all should recover similar signal)
     for i in 0..modes.len() {
         for j in (i + 1)..modes.len() {
-            let mut v1: Vec<f64> = (0..p).map(|s| results[i].p_values[(s, 0)]).collect();
-            let mut v2: Vec<f64> = (0..p).map(|s| results[j].p_values[(s, 0)]).collect();
+            let mut v1: Vec<f64> = (0..p).map(|s| parsed_results[i].p_values[s][0]).collect();
+            let mut v2: Vec<f64> = (0..p).map(|s| parsed_results[j].p_values[s][0]).collect();
             let rho = spearman_rank_corr(&mut v1, &mut v2);
             eprintln!(
                 "Spearman({:?}, {:?}) = {:.4}",
@@ -1804,6 +1919,7 @@ fn test_k_sensitivity() {
 
         let mut gif_for_k = Vec::new();
         let mut pval_vecs: Vec<Vec<f64>> = Vec::new();
+        let cov_names = default_cov_names(sim_config.d);
 
         for &k_run in &k_range {
             let config = Lfmm2Config {
@@ -1818,9 +1934,12 @@ fn test_k_sensitivity() {
                 norm: SnpNorm::Eigenstrat,
                 scale_cov: false,
             };
-            let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
+            let out_path = dir.path().join(format!("results_k{}_kt{}.tsv", k_run, k_true));
+            let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+            let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
+            let pr = read_results_tsv(&out_path);
             gif_for_k.push(r.gif);
-            pval_vecs.push((0..sim_config.n_snps).map(|i| r.p_values[(i, 0)]).collect());
+            pval_vecs.push((0..sim_config.n_snps).map(|i| pr.p_values[i][0]).collect());
         }
 
         // Log all GIF values for this K_true
@@ -1927,20 +2046,23 @@ fn test_variance_decomposition() {
         scale_cov: false,
     };
 
-    let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, None).unwrap();
+    let (output_path, cov_names) = test_output_setup(dir.path(), sim.x.ncols());
+    let oc = OutputConfig { path: &output_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let _r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
+    let pr = read_results_tsv(&output_path);
     let p = sim_config.n_snps;
 
     // All r² values should be non-negative
     for i in 0..p {
-        assert!(r.r2_cov[i] >= 0.0, "r2_cov[{}] negative: {}", i, r.r2_cov[i]);
-        assert!(r.r2_latent[i] >= 0.0, "r2_latent[{}] negative: {}", i, r.r2_latent[i]);
-        assert!(r.r2_resid[i] >= 0.0, "r2_resid[{}] negative: {}", i, r.r2_resid[i]);
+        assert!(pr.r2_cov[i] >= 0.0, "r2_cov[{}] negative: {}", i, pr.r2_cov[i]);
+        assert!(pr.r2_latent[i] >= 0.0, "r2_latent[{}] negative: {}", i, pr.r2_latent[i]);
+        assert!(pr.r2_resid[i] >= 0.0, "r2_resid[{}] negative: {}", i, pr.r2_resid[i]);
     }
 
     // Residual R² should be < 1 for most SNPs (the model explains something)
-    let mean_r2_resid: f64 = r.r2_resid.iter().sum::<f64>() / p as f64;
-    let mean_r2_latent: f64 = r.r2_latent.iter().sum::<f64>() / p as f64;
-    let mean_r2_cov: f64 = r.r2_cov.iter().sum::<f64>() / p as f64;
+    let mean_r2_resid: f64 = pr.r2_resid.iter().sum::<f64>() / p as f64;
+    let mean_r2_latent: f64 = pr.r2_latent.iter().sum::<f64>() / p as f64;
+    let mean_r2_cov: f64 = pr.r2_cov.iter().sum::<f64>() / p as f64;
 
     eprintln!("Variance decomposition (means across {} SNPs):", p);
     eprintln!("  r2_cov:    {:.4}", mean_r2_cov);
@@ -1963,12 +2085,12 @@ fn test_variance_decomposition() {
 
     // Causal SNPs should have higher r2_cov than null SNPs (on average)
     let causal_r2_cov: f64 = sim.causal_indices.iter()
-        .map(|&i| r.r2_cov[i])
+        .map(|&i| pr.r2_cov[i])
         .sum::<f64>() / sim.causal_indices.len() as f64;
     let null_count = p - sim.causal_indices.len();
     let null_r2_cov: f64 = (0..p)
         .filter(|i| !sim.causal_indices.contains(i))
-        .map(|i| r.r2_cov[i])
+        .map(|i| pr.r2_cov[i])
         .sum::<f64>() / null_count as f64;
 
     eprintln!("  Causal mean r2_cov: {:.4}", causal_r2_cov);
@@ -2035,11 +2157,14 @@ fn test_variance_decomposition_signal_levels() {
         write_plink(dir.path(), "sim", &sim).unwrap();
         let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
 
-        let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &lfmm_config, None).unwrap();
+        let (out_path, cn) = test_output_setup(dir.path(), sim.x.ncols());
+        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cn };
+        let _r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &lfmm_config, &oc).unwrap();
+        let pr = read_results_tsv(&out_path);
         let p = sim_config.n_snps;
 
-        let mean_latent: f64 = r.r2_latent.iter().sum::<f64>() / p as f64;
-        let mean_resid: f64 = r.r2_resid.iter().sum::<f64>() / p as f64;
+        let mean_latent: f64 = pr.r2_latent.iter().sum::<f64>() / p as f64;
+        let mean_resid: f64 = pr.r2_resid.iter().sum::<f64>() / p as f64;
 
         eprintln!(
             "latent_scale={:.1}: mean r2_latent={:.4}, mean r2_resid={:.4}",
@@ -2135,7 +2260,12 @@ fn test_variance_decomposition_with_noise() {
         scale_cov: false,
     };
 
-    let r_orig = fit_lfmm2(&bed_orig, &SubsetSpec::All, &bed_orig, &sim.x, &config, None).unwrap();
+    let d = sim.x.ncols();
+    let cov_names = default_cov_names(d);
+    let out_orig = dir_orig.path().join("results.tsv");
+    let oc_orig = OutputConfig { path: &out_orig, bim: &bed_orig.bim_records, cov_names: &cov_names };
+    let _r_orig = fit_lfmm2(&bed_orig, &SubsetSpec::All, &bed_orig, &sim.x, &config, &oc_orig).unwrap();
+    let pr_orig = read_results_tsv(&out_orig);
 
     // --- Create noisy genotypes: random bit flips at 10% rate ---
     let n = sim_config.n_samples;
@@ -2168,12 +2298,15 @@ fn test_variance_decomposition_with_noise() {
     schnellfmm::bed::write_fam(&dir_noisy.path().join("sim.fam"), &fam_records).unwrap();
 
     let bed_noisy = BedFile::open(dir_noisy.path().join("sim.bed")).unwrap();
-    let r_noisy = fit_lfmm2(&bed_noisy, &SubsetSpec::All, &bed_noisy, &sim.x, &config, None).unwrap();
+    let out_noisy = dir_noisy.path().join("results.tsv");
+    let oc_noisy = OutputConfig { path: &out_noisy, bim: &bed_noisy.bim_records, cov_names: &cov_names };
+    let _r_noisy = fit_lfmm2(&bed_noisy, &SubsetSpec::All, &bed_noisy, &sim.x, &config, &oc_noisy).unwrap();
+    let pr_noisy = read_results_tsv(&out_noisy);
 
-    let mean_resid_orig: f64 = r_orig.r2_resid.iter().sum::<f64>() / p as f64;
-    let mean_resid_noisy: f64 = r_noisy.r2_resid.iter().sum::<f64>() / p as f64;
-    let mean_latent_orig: f64 = r_orig.r2_latent.iter().sum::<f64>() / p as f64;
-    let mean_latent_noisy: f64 = r_noisy.r2_latent.iter().sum::<f64>() / p as f64;
+    let mean_resid_orig: f64 = pr_orig.r2_resid.iter().sum::<f64>() / p as f64;
+    let mean_resid_noisy: f64 = pr_noisy.r2_resid.iter().sum::<f64>() / p as f64;
+    let mean_latent_orig: f64 = pr_orig.r2_latent.iter().sum::<f64>() / p as f64;
+    let mean_latent_noisy: f64 = pr_noisy.r2_latent.iter().sum::<f64>() / p as f64;
 
     eprintln!("Original:  r2_resid={:.4}, r2_latent={:.4}", mean_resid_orig, mean_latent_orig);
     eprintln!("Noisy:     r2_resid={:.4}, r2_latent={:.4}", mean_resid_noisy, mean_latent_noisy);

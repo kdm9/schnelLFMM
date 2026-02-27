@@ -17,9 +17,9 @@ use crate::timer::Timer;
 
 /// Configuration for streaming results output.
 ///
-/// When provided to `test_associations_fused`, each chunk writes a TSV fragment
-/// during the streaming pass. After GIF calibration, fragments are coalesced
-/// into a single output file with calibrated p-values.
+/// Each chunk writes a binary .npy fragment during the streaming pass.
+/// After GIF calibration, fragments are coalesced into a single output
+/// file with calibrated p-values.
 pub struct OutputConfig<'a> {
     pub path: &'a Path,
     pub bim: &'a [BimRecord],
@@ -30,20 +30,119 @@ pub struct OutputConfig<'a> {
 pub struct TestResults {
     /// Estimated latent factors: n × K
     pub u_hat: Array2<f64>,
-    /// Effect sizes: p × d (ridge regression B from Step 3)
-    pub effect_sizes: Array2<f64>,
-    /// t-statistics: p × d (from per-locus regression, Step 4)
-    pub t_stats: Array2<f64>,
-    /// Calibrated p-values: p × d (after GIF correction)
-    pub p_values: Array2<f64>,
     /// Genomic inflation factor
     pub gif: f64,
-    /// Per-SNP proportion of variance explained by covariates X: length p
-    pub r2_cov: Vec<f64>,
-    /// Per-SNP proportion of variance explained by latent factors U: length p
-    pub r2_latent: Vec<f64>,
-    /// Per-SNP residual proportion of variance: length p
-    pub r2_resid: Vec<f64>,
+}
+
+/// Streaming histogram for estimating the median of t² values per trait.
+///
+/// Uses fixed-width bins over [0, max_val) to avoid storing all p values.
+/// Memory: d × n_bins × 8 bytes (800 KB per trait with default settings).
+struct TsqHistogram {
+    /// counts[trait_idx][bin_idx]
+    counts: Vec<Vec<u64>>,
+    n_bins: usize,
+    bin_width: f64,
+    /// Total count per trait (including clamped values)
+    total: Vec<u64>,
+}
+
+impl TsqHistogram {
+    fn new(d: usize) -> Self {
+        let n_bins = 100_000;
+        let bin_width = 0.001;
+        TsqHistogram {
+            counts: vec![vec![0u64; n_bins]; d],
+            n_bins,
+            bin_width,
+            total: vec![0u64; d],
+        }
+    }
+
+    /// Add a batch of t² values for all traits from a chunk.
+    fn add_chunk(&mut self, tstats: &Array2<f64>, d: usize) {
+        let chunk_cols = tstats.nrows();
+        for col in 0..chunk_cols {
+            for j in 0..d {
+                let t = tstats[(col, j)];
+                let t_sq = t * t;
+                if t_sq.is_finite() {
+                    let bin = ((t_sq / self.bin_width) as usize).min(self.n_bins - 1);
+                    self.counts[j][bin] += 1;
+                    self.total[j] += 1;
+                }
+            }
+        }
+    }
+
+    /// Compute per-trait GIF from the histogram medians.
+    /// Returns (gif_per_trait, avg_gif).
+    fn compute_gif(&self) -> (Vec<f64>, f64) {
+        let d = self.counts.len();
+        let mut gif_per_trait = Vec::with_capacity(d);
+        let mut total_gif = 0.0;
+
+        for j in 0..d {
+            let median_t_sq = self.median_for_trait(j);
+            let gif = if median_t_sq < 1e-10 {
+                1.0
+            } else {
+                median_t_sq / 0.4549
+            };
+            gif_per_trait.push(gif);
+            total_gif += gif;
+        }
+
+        let avg_gif = total_gif / d as f64;
+        (gif_per_trait, avg_gif)
+    }
+
+    /// Walk bins to find the median for a given trait.
+    fn median_for_trait(&self, j: usize) -> f64 {
+        let n = self.total[j];
+        if n == 0 {
+            return 0.0;
+        }
+        // For median, we need the value at position n/2 (0-indexed).
+        // For even n, we average positions n/2-1 and n/2.
+        let is_even = n % 2 == 0;
+        let target = if is_even { n / 2 - 1 } else { n / 2 };
+
+        let mut cumulative = 0u64;
+        let mut first_bin = None;
+        let mut second_bin = None;
+
+        for bin in 0..self.n_bins {
+            cumulative += self.counts[j][bin];
+            if first_bin.is_none() && cumulative > target {
+                first_bin = Some(bin);
+                if !is_even {
+                    // Odd count: median is the middle value
+                    return (bin as f64 + 0.5) * self.bin_width;
+                }
+            }
+            if is_even && first_bin.is_some() && cumulative > target + 1 {
+                second_bin = Some(bin);
+                break;
+            }
+            if is_even && first_bin.is_some() && cumulative == target + 1 {
+                // The second median value is at exactly this position
+                second_bin = Some(bin);
+                // But it might be in the next non-empty bin
+                if cumulative > target + 1 {
+                    break;
+                }
+            }
+        }
+
+        match (first_bin, second_bin) {
+            (Some(b1), Some(b2)) => {
+                ((b1 as f64 + 0.5) * self.bin_width + (b2 as f64 + 0.5) * self.bin_width) / 2.0
+            }
+            (Some(b1), None) => (b1 as f64 + 0.5) * self.bin_width,
+            _ => 0.0,
+        }
+    }
 }
 
 /// Perform Steps 3-4 fused in a single pass over Y_full.
@@ -56,16 +155,19 @@ pub struct TestResults {
 ///   Standard errors come from se²(γ̂_j) = σ̂² · diag((C^T C)^{-1}), where σ̂² = RSS / df.
 ///   Degrees of freedom: df = n - d - K - 1 (residual df after fitting intercept + d covariates + K latent factors).
 ///
-/// When `output` is `Some`, each chunk's effect sizes and t-statistics are written
-/// to a temporary TSV fragment. After GIF calibration, fragments are coalesced into
-/// the final output file with calibrated p-values inserted.
+/// Each chunk's effect sizes and t-statistics are written to a temporary .npy
+/// fragment. After GIF calibration, fragments are coalesced into the final
+/// output file with calibrated p-values.
+///
+/// No p-dimensional arrays are held in RAM — all per-SNP data flows through
+/// chunk files on disk.
 pub fn test_associations_fused(
     y_full: &BedFile,
     x: &Array2<f64>,
     u_hat: &Array2<f64>,
     pre: &Precomputed,
     config: &Lfmm2Config,
-    output: Option<&OutputConfig>,
+    output: &OutputConfig,
 ) -> Result<TestResults> {
     let n = y_full.n_samples;
     let p = y_full.n_snps;
@@ -117,30 +219,21 @@ pub fn test_associations_fused(
 
         Ok((i_minus_pu, xtr, c, ctc_inv, h))
     })?;
-    timer.finish()
+    timer.finish();
 
     // Diagonal of (C^T C)^{-1} for standard error computation (covariate indices 1..d+1)
     let ctc_inv_diag: Vec<f64> = (0..d).map(|j| ctc_inv[(1 + j, 1 + j)]).collect();
 
-    // Allocate output arrays
-    let mut effect_sizes = Array2::<f64>::zeros((p, d));
-    let mut t_stats = Array2::<f64>::zeros((p, d));
-    let mut r2_cov = vec![0.0f64; p];
-    let mut r2_latent = vec![0.0f64; p];
-    let mut r2_resid = vec![0.0f64; p];
+    // Create temp dir for chunk files
+    let parent = output.path.parent().unwrap_or(Path::new("."));
+    let chunk_dir = tempfile::Builder::new()
+        .prefix(".lfmm2_chunks_")
+        .tempdir_in(parent)
+        .context("Failed to create temp directory for chunk files")?;
 
-    // Create temp dir for chunk files if writing output
-    let chunk_dir = if let Some(out) = output {
-        let parent = out.path.parent().unwrap_or(Path::new("."));
-        Some(
-            tempfile::Builder::new()
-                .prefix(".lfmm2_chunks_")
-                .tempdir_in(parent)
-                .context("Failed to create temp directory for chunk files")?,
-        )
-    } else {
-        None
-    };
+    // Streaming histogram for GIF estimation (no p-dimensional allocations)
+    let histogram = TsqHistogram::new(d);
+    let mtx_histogram = Mutex::new(histogram);
 
     // Single fused pass over Y_full
     let subset = SubsetSpec::All;
@@ -148,15 +241,9 @@ pub fn test_associations_fused(
     let pb = make_progress_bar(n_chunks as u64, "Association tests", config.progress);
 
     {
-        let mtx_effects = Mutex::new(&mut effect_sizes);
-        let mtx_tstats = Mutex::new(&mut t_stats);
-        let mtx_r2_cov = Mutex::new(&mut r2_cov[..]);
-        let mtx_r2_latent = Mutex::new(&mut r2_latent[..]);
-        let mtx_r2_resid = Mutex::new(&mut r2_resid[..]);
         parallel_stream(y_full, &subset, chunk_size, config.n_workers, config.norm, |_worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let chunk_cols = block.n_cols;
-            let start = block.seq * chunk_size;
 
             // Step 3: B = (XtR @ (I - P_U) @ chunk)^T
             let residual = i_minus_pu.dot(&chunk);
@@ -205,91 +292,38 @@ pub fn test_associations_fused(
                 // else: monomorphic SNP, all zeros → leave r2 as 0.0
             }
 
-            mtx_effects.lock().unwrap()
-                .slice_mut(ndarray::s![start..start + chunk_cols, ..])
-                .assign(&b_chunk_t);
-            mtx_tstats.lock().unwrap()
-                .slice_mut(ndarray::s![start..start + chunk_cols, ..])
-                .assign(&local_tstats);
-            mtx_r2_cov.lock().unwrap()[start..start + chunk_cols]
-                .copy_from_slice(&local_r2_cov);
-            mtx_r2_latent.lock().unwrap()[start..start + chunk_cols]
-                .copy_from_slice(&local_r2_latent);
-            mtx_r2_resid.lock().unwrap()[start..start + chunk_cols]
-                .copy_from_slice(&local_r2_resid);
+            // Feed t² values into streaming histogram
+            mtx_histogram.lock().unwrap().add_chunk(&local_tstats, d);
 
-            // Write chunk binary fragment if output configured
-            if let Some(ref dir) = chunk_dir {
-                write_chunk_npy(
-                    dir.path(), block.seq, &b_chunk_t, &local_tstats,
-                    &local_r2_cov, &local_r2_latent, &local_r2_resid, d,
-                )
-                    .expect("failed to write chunk file");
-            }
+            // Write chunk binary fragment
+            write_chunk_npy(
+                chunk_dir.path(), block.seq, &b_chunk_t, &local_tstats,
+                &local_r2_cov, &local_r2_latent, &local_r2_resid, d,
+            )
+                .expect("failed to write chunk file");
 
             pb.inc(1);
         });
     }
     pb.finish_and_clear();
 
-    // GIF calibration (genomic inflation factor).
-    //
-    // Under the null, t² ~ χ²(1). The GIF is:
-    //   GIF = median(t²) / median(χ²(1)) = median(t²) / 0.4549
-    // where 0.4549 ≈ qchisq(0.5, df=1). A well-calibrated test gives GIF ≈ 1.
-    //
-    // Calibrated z-scores: z_cal = t / sqrt(GIF), p_cal = 2Φ(-|z_cal|).
-    let normal = Normal::new(0.0, 1.0).unwrap();
-
-    let mut p_values = Array2::<f64>::zeros((p, d));
-    let mut gif_per_trait = Vec::with_capacity(d);
-    let mut total_gif = 0.0;
-
-    for j in 0..d {
-        let t_col = t_stats.column(j);
-        let mut z_sq: Vec<f64> = t_col.iter().map(|&t| t * t).filter(|v| v.is_finite()).collect();
-        z_sq.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let median_z_sq = median_sorted(&z_sq);
-
-        let gif = if median_z_sq < 1e-10 {
-            1.0
-        } else {
-            median_z_sq / 0.4549
-        };
-        gif_per_trait.push(gif);
-        total_gif += gif;
-
-        let gif_sqrt = gif.sqrt();
-        for i in 0..p {
-            let z = t_stats[(i, j)];
-            let z_cal = z / gif_sqrt;
-            p_values[(i, j)] = 2.0 * normal.cdf(-z_cal.abs());
-        }
-    }
-
-    let avg_gif = total_gif / d as f64;
+    // GIF calibration via streaming histogram
+    let (gif_per_trait, avg_gif) = mtx_histogram.into_inner().unwrap().compute_gif();
 
     // Coalesce chunk files into final output
-    if let Some(out) = output {
-        coalesce_output(
-            out.path,
-            out.cov_names,
-            out.bim,
-            chunk_dir.as_ref().unwrap().path(),
-            n_chunks,
-            &gif_per_trait,
-        )?;
-    }
+    coalesce_output(
+        output.path,
+        output.cov_names,
+        output.bim,
+        chunk_dir.path(),
+        n_chunks,
+        &gif_per_trait,
+        config.progress,
+    )?;
 
     Ok(TestResults {
         u_hat: u_hat.to_owned(),
-        effect_sizes,
-        t_stats,
-        p_values,
         gif: avg_gif,
-        r2_cov,
-        r2_latent,
-        r2_resid,
     })
 }
 
@@ -338,6 +372,7 @@ fn coalesce_output(
     chunk_dir: &Path,
     n_chunks: usize,
     gif_per_trait: &[f64],
+    progress: bool,
 ) -> Result<()> {
     let d = cov_names.len();
     let normal = Normal::new(0.0, 1.0).unwrap();
@@ -359,6 +394,7 @@ fn coalesce_output(
     // Read each chunk .npy and write rows with BIM metadata + calibrated p-values
     // Chunk layout: [beta_0..beta_{d-1}, t_0..t_{d-1}, r2_cov, r2_latent, r2_resid]
     let mut global_row = 0usize;
+    let pb = make_progress_bar(n_chunks as u64, "Write output", progress);
     for seq in 0..n_chunks {
         let chunk_path = chunk_dir.join(format!("chunk_{:06}.npy", seq));
         let data: Array2<f64> = read_npy(&chunk_path)
@@ -382,7 +418,9 @@ fn coalesce_output(
             writeln!(out)?;
             global_row += 1;
         }
+        pb.inc(1);
     }
+    pb.finish_and_clear();
 
     Ok(())
 }
@@ -447,6 +485,7 @@ fn t_test(coef: f64, sigma2: f64, ctc_inv_jj: f64, df: f64) -> (f64, f64) {
 }
 
 /// Compute median of a sorted slice.
+#[cfg(test)]
 fn median_sorted(sorted: &[f64]) -> f64 {
     let n = sorted.len();
     if n == 0 {
@@ -508,5 +547,18 @@ mod tests {
                 assert_abs_diff_eq!(product[(i, j)], expected, epsilon = 1e-6);
             }
         }
+    }
+
+    #[test]
+    fn test_tsq_histogram_basic() {
+        let mut hist = TsqHistogram::new(1);
+        // Feed in known t-values: [1, 2, 3, 4, 5] → t²=[1, 4, 9, 16, 25]
+        // Median t² = 9.0, GIF = 9.0 / 0.4549 ≈ 19.78
+        let tstats = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        hist.add_chunk(&tstats, 1);
+        let (gif_per_trait, _avg_gif) = hist.compute_gif();
+        let expected_gif = 9.0 / 0.4549;
+        assert!((gif_per_trait[0] - expected_gif).abs() < 0.1,
+            "GIF mismatch: got {:.4}, expected {:.4}", gif_per_trait[0], expected_gif);
     }
 }
