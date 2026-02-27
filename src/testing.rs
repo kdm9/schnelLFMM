@@ -13,6 +13,7 @@ use crate::parallel::parallel_stream;
 use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
+use crate::timer::Timer;
 
 /// Configuration for streaming results output.
 ///
@@ -85,7 +86,7 @@ pub fn test_associations_fused(
     }
     let df = (n - 1 - d - k) as f64;
 
-    // Serial BLAS section: precompute projectors and OLS hat matrix
+    let timer = Timer::new("OLS hat");
     let (i_minus_pu, xtr, c, ctc_inv, h) = crate::with_multithreaded_blas(config.n_workers, || -> Result<_> {
         // Precompute P_U = U_hat (U^T U)^{-1} U^T (n × n).
         let utu = u_hat.t().dot(u_hat);
@@ -116,6 +117,7 @@ pub fn test_associations_fused(
 
         Ok((i_minus_pu, xtr, c, ctc_inv, h))
     })?;
+    timer.finish()
 
     // Diagonal of (C^T C)^{-1} for standard error computation (covariate indices 1..d+1)
     let ctc_inv_diag: Vec<f64> = (0..d).map(|j| ctc_inv[(1 + j, 1 + j)]).collect();

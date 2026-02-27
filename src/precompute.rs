@@ -1,6 +1,7 @@
 use anyhow::Result;
 use ndarray::{Array1, Array2};
 use ndarray_linalg::{InverseInto, SVD};
+use crate::timer::Timer;
 
 /// Precomputed quantities from Step 0 of the LFMM2 algorithm.
 ///
@@ -42,12 +43,15 @@ pub fn precompute(x: &Array2<f64>, lambda: f64) -> Result<Precomputed> {
     // SVD of X: X = Q Σ R^T
     // ndarray-linalg SVD returns (U, s, Vt) where X = U @ diag(s) @ Vt
     // U is n×n (full) when X is n×d with n > d
+    let timer =  Timer::new("SVD(X)");
     let (u_opt, s, _vt_opt) = x.svd(true, true)?;
     let q_full = u_opt.expect("SVD should return U");
     let sigma = s; // singular values, length min(n, d)
+    timer.finish();
 
     // Build D_λ diagonal (length n)
     // Uses sqrt to match LEA: d_λ[j] = sqrt(λ / (λ + σ_j²))
+    let timer =  Timer::new("inv(D_lambda)");
     let mut d_lambda = Array1::<f64>::ones(n);
     for j in 0..sigma.len().min(d) {
         let s2 = sigma[j] * sigma[j];
@@ -56,7 +60,9 @@ pub fn precompute(x: &Array2<f64>, lambda: f64) -> Result<Precomputed> {
 
     // D_λ^{-1}
     let d_lambda_inv = d_lambda.mapv(|v| 1.0 / v);
+    timer.finish();
 
+    let timer =  Timer::new("inv(XtX_ridge)");
     // M = D_λ @ Q^T
     // D_λ is diagonal, so M[i, j] = d_lambda[i] * Q^T[i, j] = d_lambda[i] * Q[j, i]
     let d_col = d_lambda.view().insert_axis(ndarray::Axis(1)); // (n,) → (n, 1)
@@ -70,6 +76,7 @@ pub fn precompute(x: &Array2<f64>, lambda: f64) -> Result<Precomputed> {
     }
     // Finally matrix invert
     let ridge_inv = xtx_ridge.inv_into()?;
+    timer.finish();
 
     Ok(Precomputed {
         q_full,

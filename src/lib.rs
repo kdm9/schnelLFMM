@@ -5,6 +5,7 @@ pub mod progress;
 pub mod rsvd;
 pub mod simulate;
 pub mod testing;
+pub mod timer;
 
 use anyhow::Result;
 use ndarray::{Array2, Axis};

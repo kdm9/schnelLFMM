@@ -86,15 +86,9 @@ fn default_threads() -> usize {
         .unwrap_or(1)
 }
 
-use fastrace::collector::Config;
-use fastrace::collector::ConsoleReporter;
-use fastrace::prelude::*;
-
 fn main() -> Result<()> {
     // Force BLAS single-threaded: our worker pool is the sole source of parallelism.
     schnellfmm::with_multithreaded_blas(1, || {});
-
-    fastrace::set_reporter(ConsoleReporter, Config::default());
 
     let cli = Cli::parse();
 

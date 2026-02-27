@@ -17,7 +17,7 @@ use schnellfmm::parallel::{
     subset_indices, PerWorkerAccumulator, SnpBlock,
 };
 use schnellfmm::precompute::precompute;
-use schnellfmm::rsvd::qr_q;
+use ndarray_linalg::QR;
 use schnellfmm::simulate::{simulate, write_plink, SimConfig};
 
 extern "C" {
@@ -604,7 +604,7 @@ fn profile_pipeline() -> Result<()> {
 
     // 3c: QR(Z)
     let ph = Phase::start("RSVD: QR(Z)");
-    let mut q_z = qr_q(&z);
+    let mut q_z = z.qr().expect("QR failed").0;
     phases.push(ph.stop());
 
     // Power iterations
@@ -635,7 +635,7 @@ fn profile_pipeline() -> Result<()> {
 
         // QR(AQz)
         let ph = Phase::start(&format!("RSVD: QR(AQz) iter {}", iter + 1));
-        let q_aqz = qr_q(&a_qz);
+        let q_aqz = a_qz.qr().expect("QR failed").0;
         phases.push(ph.stop());
 
         // Mt_q = M^T @ Q_aqz
@@ -668,7 +668,7 @@ fn profile_pipeline() -> Result<()> {
 
         // QR(Z)
         let ph = Phase::start(&format!("RSVD: QR(Z) iter {}", iter + 1));
-        q_z = qr_q(&z);
+        q_z = z.qr().expect("QR failed").0;
         phases.push(ph.stop());
     }
 

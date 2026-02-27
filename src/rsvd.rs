@@ -1,6 +1,6 @@
 use anyhow::Result;
 use ndarray::Array2;
-use ndarray_linalg::SVD;
+use ndarray_linalg::{QR, SVD};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rand_distr::{Distribution, Normal};
@@ -11,7 +11,7 @@ use crate::parallel::{parallel_stream, PerWorkerAccumulator};
 use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
-
+use crate::timer::Timer;
 
 
 
@@ -39,17 +39,22 @@ pub fn estimate_factors_streaming(
     let show = config.progress;
 
     // Generate random sketch matrix Omega (n × l)
+    let t = Timer::new("generate omega");
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
     let normal = Normal::new(0.0, 1.0).unwrap();
     let omega = Array2::from_shape_fn((n, l), |_| normal.sample(&mut rng));
+    t.finish();
 
     // Precompute Mt_omega = M^T @ Omega (n × l)
+    let t = Timer::new("Mt @ omega");
     let mt_omega = crate::with_multithreaded_blas(config.n_workers, || pre.m.t().dot(&omega));
+    t.finish();
 
     // Step 1a: Initial sketch
     // Z = Y_est^T @ Mt_omega (p_est × l)
     let mut z = Array2::<f64>::zeros((p_est, l));
     {
+        let t = Timer::new("initial sketch (parallel)");
         let pb = make_progress_bar(n_chunks, "RSVD sketch", show);
         let z_mutex = Mutex::new(&mut z);
         parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, |_worker_id, block| {
@@ -62,16 +67,19 @@ pub fn estimate_factors_streaming(
             pb.inc(1);
         });
         pb.finish_and_clear();
+        t.finish();
     }
 
-    // QR of Z -> Q_z
-    let mut q_z = qr_q(&z);
+    let t = Timer::new("QR of Z (initial)");
+    let (mut q_z, _) = crate::with_multithreaded_blas(config.n_workers, || z.qr().expect("QR failed"));
+    t.finish();
 
     // Step 1b: Power iterations
     for iter in 0..config.n_power_iter {
         // Forward pass: A @ Q_z = M @ Y_est @ Q_z (n × l, accumulated)
         let a_qz;
         {
+            let t = Timer::new("power iter fwd (parallel)");
             let label = format!("Power iter {}/{} (fwd)", iter + 1, config.n_power_iter);
             let pb = make_progress_bar(n_chunks, &label, show);
             let n_w = config.n_workers.max(1);
@@ -88,17 +96,20 @@ pub fn estimate_factors_streaming(
             });
             a_qz = acc.sum();
             pb.finish_and_clear();
+            t.finish();
         }
 
-        // Serial BLAS section: QR + matrix multiply between parallel passes
+        let t = Timer::new("power iter QR(a_qz) + Mt@Q (BLAS)");
         let mt_q = crate::with_multithreaded_blas(config.n_workers, || {
-            let q_aqz = qr_q(&a_qz);
+            let (q_aqz, _) = a_qz.qr().expect("QR failed");
             pre.m.t().dot(&q_aqz)
         });
+        t.finish();
 
         // Backward pass: A^T @ Q_aqz = Y_est^T @ (M^T @ Q_aqz) (p_est × l)
         z = Array2::<f64>::zeros((p_est, l));
         {
+            let t = Timer::new("power iter bwd (parallel)");
             let label = format!("Power iter {}/{} (bwd)", iter + 1, config.n_power_iter);
             let pb = make_progress_bar(n_chunks, &label, show);
             let z_mutex = Mutex::new(&mut z);
@@ -112,15 +123,20 @@ pub fn estimate_factors_streaming(
                 pb.inc(1);
             });
             pb.finish_and_clear();
+            t.finish();
         }
 
-        q_z = qr_q(&z);
+        let t = Timer::new("QR of Z (power iter)");
+        let (q, _) = crate::with_multithreaded_blas(config.n_workers, || z.qr().expect("QR failed"));
+        q_z = q;
+        t.finish();
     }
 
     // Step 2: Project and recover SVD
     // B_svd = A @ Q_z = M @ Y_est @ Q_z (n × l)
     let b_svd;
     {
+        let t = Timer::new("final projection (parallel)");
         let pb = make_progress_bar(n_chunks, "RSVD project", show);
         let n_w = config.n_workers.max(1);
         let acc = PerWorkerAccumulator::new(n_w, (n, l));
@@ -136,9 +152,10 @@ pub fn estimate_factors_streaming(
         });
         b_svd = acc.sum();
         pb.finish_and_clear();
+        t.finish();
     }
 
-    // Serial BLAS section: SVD + matrix multiply after final projection pass
+    let t = Timer::new("final SVD + recover U_hat (BLAS)");
     let u_hat = crate::with_multithreaded_blas(config.n_workers, || -> Result<Array2<f64>> {
         // Small SVD of B_svd (n × l)
         let (u_opt, _s, _vt_opt) = b_svd.svd(true, false)?;
@@ -153,53 +170,9 @@ pub fn estimate_factors_streaming(
         // U_hat = Q @ dlam_inv_u
         Ok(pre.q_full.dot(&dlam_inv_u))
     })?;
+    t.finish();
 
     Ok(u_hat)
-}
-
-/// Compute the thin QR factorization and return Q.
-///
-/// For a matrix A (m × n), returns Q (m × min(m, n)).
-pub fn qr_q(a: &Array2<f64>) -> Array2<f64> {
-    let m = a.nrows();
-    let n = a.ncols();
-    let k = m.min(n);
-
-    // Use Gram-Schmidt orthogonalization (modified for numerical stability)
-    // For our use case, the matrices are either p×l (tall, l small) or n×l (small)
-    let mut q = a.clone();
-
-    for j in 0..k {
-        // Orthogonalize column j against previous columns
-        for i in 0..j {
-            let dot: f64 = q.column(i).dot(&q.column(j));
-            let qi = q.column(i).to_owned();
-            q.column_mut(j)
-                .zip_mut_with(&qi, |v, &qi_v| *v -= dot * qi_v);
-        }
-
-        // Normalize
-        let norm: f64 = q.column(j).dot(&q.column(j)).sqrt();
-        if norm > 1e-14 {
-            q.column_mut(j).mapv_inplace(|v| v / norm);
-        }
-    }
-
-    // Re-orthogonalize (second pass for stability)
-    for j in 0..k {
-        for i in 0..j {
-            let dot: f64 = q.column(i).dot(&q.column(j));
-            let qi = q.column(i).to_owned();
-            q.column_mut(j)
-                .zip_mut_with(&qi, |v, &qi_v| *v -= dot * qi_v);
-        }
-        let norm: f64 = q.column(j).dot(&q.column(j)).sqrt();
-        if norm > 1e-14 {
-            q.column_mut(j).mapv_inplace(|v| v / norm);
-        }
-    }
-
-    q
 }
 
 #[cfg(test)]
@@ -210,7 +183,7 @@ mod tests {
     #[test]
     fn test_qr_orthogonality() {
         let a = Array2::from_shape_fn((10, 3), |(_i, _j)| rand::random::<f64>());
-        let q = qr_q(&a);
+        let (q, _) = a.qr().unwrap();
 
         // Q^T Q should be approximately identity
         let qtq = q.t().dot(&q);
@@ -233,7 +206,7 @@ mod tests {
     fn test_qr_column_space() {
         // QR should preserve the column space
         let a = Array2::from_shape_fn((5, 2), |(i, j)| (i + j) as f64);
-        let q = qr_q(&a);
+        let (q, _) = a.qr().unwrap();
 
         // Each original column should be in the span of Q's columns
         for j in 0..2 {
