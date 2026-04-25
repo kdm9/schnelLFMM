@@ -22,29 +22,18 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ matrix.rust }}
-
-    - name: Cache cargo
-      uses: Swatinem/rust-cache@v2
-      with:
-        key: linux-x86_64-${{ matrix.rust }}
-
-    - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y gfortran libopenblas-dev
-
-    - name: Build
+    - name: Build and test in manylinux2014
       env:
-        # Pin OpenBLAS (compiled from source by openblas-src) to a stable
-        # x86-64-v3 baseline (AVX2/FMA) so the binary works on all current
-        # GitHub runners regardless of exact CPU model.
+        RUST_TOOLCHAIN: ${{ matrix.rust }}
         OPENBLAS_TARGET: HASWELL
-      run: cargo build --verbose --release
-
-    - name: Run tests
-      run: cargo test --verbose --release
+      run: |
+        docker run --rm \
+          -e RUST_TOOLCHAIN \
+          -e OPENBLAS_TARGET \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          quay.io/pypa/manylinux2014_x86_64 \
+          /bin/bash /workspace/.github/scripts/build-linux-x86_64.sh
 
     - name: Upload binary
       if: matrix.rust == 'stable'
