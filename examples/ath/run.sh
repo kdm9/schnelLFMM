@@ -39,6 +39,8 @@ plink1.9 --recode ped --out 1k1g_intersect_ldprune --bfile 1k1g_intersect_ldprun
 
 cargo build --release --bin schnellfmm
 time ../../target/release/schnellfmm \
+    --nmf-impute \
+    --nmf-iter 30 \
     --bed 1k1g_intersect_ldprune.bed \
     --cov pheno_intersect.tsv \
     -k $LFMM_K \

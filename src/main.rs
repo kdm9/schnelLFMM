@@ -250,6 +250,13 @@ fn main() -> Result<()> {
                 writeln!(f, "mean_impute_cv_mae: {:.6}", mean_mae)?;
             }
         }
+        if let (Some(gwas_mae), Some(gwas_mean), Some(gwas_cnt)) =
+            (results.nmf_gwas_cv_mae, results.nmf_gwas_cv_mean_mae, results.nmf_gwas_cv_count)
+        {
+            writeln!(f, "nmf_gwas_cv_mae: {:.6}", gwas_mae)?;
+            writeln!(f, "nmf_gwas_cv_mean_mae: {:.6}", gwas_mean)?;
+            writeln!(f, "nmf_gwas_cv_count: {}", gwas_cnt)?;
+        }
     }
 
     eprintln!("Done. Output: {}, {}", results_path.display(), summary_path);

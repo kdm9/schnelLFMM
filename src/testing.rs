@@ -8,7 +8,11 @@ use std::path::Path;
 
 use std::sync::Mutex;
 
-use crate::bed::{BedFile, BimRecord, SubsetSpec};
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+use rand_distr::Distribution;
+
+use crate::bed::{decode_raw_bed_chunk_into, BedFile, BimRecord, SubsetSpec};
 use crate::parallel::{parallel_stream, ImputeConfig};
 use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
@@ -36,6 +40,24 @@ pub struct TestResults {
     pub nmf_cv: Option<Vec<f64>>,
     /// Mean imputation CV MAE for comparison (only when NMF imputation is used).
     pub nmf_cv_mean: Option<f64>,
+    /// Per-block GWAS-phase CV MAE using the actual NmfOnTheFly estimator
+    /// (H_chunk = max(0, W_pinv @ Y)), same method used during GWAS scans.
+    pub nmf_gwas_cv_mae: Option<f64>,
+    /// Mean-imputation baseline MAE on the same held-out positions.
+    pub nmf_gwas_cv_mean_mae: Option<f64>,
+    /// Number of masked positions evaluated in the GWAS-phase CV.
+    pub nmf_gwas_cv_count: Option<u64>,
+}
+
+/// Configuration for per-block NMF cross-validation during the GWAS pass.
+///
+/// Evaluates the same `H_chunk = max(0, W_pinv @ Y_imputed)` estimator
+/// used on-the-fly for imputing missing genotypes during association testing.
+pub struct NmfGwasCvConfig {
+    pub cv_rate: f64,
+    pub seed: u64,
+    pub w: Array2<f64>,
+    pub w_pinv: Array2<f64>,
 }
 
 /// Streaming histogram for estimating the median of t² values per trait.
@@ -173,6 +195,7 @@ pub fn test_associations_fused(
     config: &Lfmm2Config,
     output: &OutputConfig,
     impute: ImputeConfig,
+    nmf_gwas_cv: Option<NmfGwasCvConfig>,
 ) -> Result<TestResults> {
     let n = y_full.n_samples;
     let p = y_full.n_snps;
@@ -245,6 +268,15 @@ pub fn test_associations_fused(
     let n_chunks = p.div_ceil(chunk_size);
     let pb = make_progress_bar(n_chunks as u64, "Association tests", config.progress);
 
+    // Per-block CV state using the same NmfOnTheFly estimator
+    let nmf_cv_acc: Option<std::sync::Arc<std::sync::Mutex<(f64, f64, u64)>>> =
+        nmf_gwas_cv.as_ref().map(|_| {
+            std::sync::Arc::new(Mutex::new((0.0f64, 0.0f64, 0u64)))
+        });
+    let cv_bps = y_full.bytes_per_snp();
+    let cv_n_physical = y_full.n_physical_samples;
+    let cv_sample_keep: Option<Vec<usize>> = y_full.sample_keep.clone();
+
     {
         parallel_stream(y_full, &subset, chunk_size, config.n_workers, config.norm, impute, |_worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
@@ -308,9 +340,88 @@ pub fn test_associations_fused(
                 .expect("failed to write chunk file");
 
             pb.inc(1);
+
+            // Per-block NMF CV using the on-the-fly estimator (same as GWAS imputation)
+            if let (Some(ref cv_cfg), Some(ref acc)) = (&nmf_gwas_cv, &nmf_cv_acc) {
+                let n_cols = block.n_cols;
+                let cv_indices: Vec<usize> = (0..n_cols).collect();
+
+                let mut raw_geno = Array2::<f64>::zeros((n, n_cols));
+                {
+                    let out_view = raw_geno.view_mut();
+                    decode_raw_bed_chunk_into(
+                        &block.raw, cv_bps, cv_n_physical, &cv_indices,
+                        out_view, cv_sample_keep.as_deref(),
+                    );
+                }
+
+                let mut masked = raw_geno.clone();
+                let mut mask_rng = ChaCha8Rng::seed_from_u64(cv_cfg.seed + block.seq as u64);
+                let unif_dist = rand_distr::Uniform::new(0.0f64, 1.0);
+
+                let mut mask_positions: Vec<(usize, usize, f64)> = Vec::new();
+                for col in 0..n_cols {
+                    for row in 0..n {
+                        let val = raw_geno[(row, col)];
+                        if !val.is_nan() {
+                            let r: f64 = unif_dist.sample(&mut mask_rng);
+                            if r < cv_cfg.cv_rate {
+                                mask_positions.push((row, col, val));
+                                masked[(row, col)] = f64::NAN;
+                            }
+                        }
+                    }
+                }
+
+                if !mask_positions.is_empty() {
+                    for col in 0..n_cols {
+                        let mut sum = 0.0;
+                        let mut n_obs = 0u32;
+                        for row in 0..n {
+                            let v = masked[(row, col)];
+                            if !v.is_nan() { sum += v; n_obs += 1; }
+                        }
+                        let mean = if n_obs > 0 { sum / n_obs as f64 } else { 0.0 };
+                        for row in 0..n {
+                            if masked[(row, col)].is_nan() {
+                                masked[(row, col)] = mean;
+                            }
+                        }
+                    }
+
+                    let h_raw = cv_cfg.w_pinv.dot(&masked);
+                    let h_chunk: Array2<f64> = h_raw.mapv(|v| v.max(0.0));
+                    let pred = cv_cfg.w.dot(&h_chunk);
+
+                    let mut nmf_err = 0.0f64;
+                    let mut mean_err = 0.0f64;
+                    for &(row, col, true_val) in &mask_positions {
+                        nmf_err += (true_val - pred[(row, col)]).abs();
+                        mean_err += (true_val - masked[(row, col)]).abs();
+                        // masked[(row, col)] is the column-mean fill for this position (LOO basis)
+                    }
+
+                    let mut acc_guard = acc.lock().unwrap();
+                    acc_guard.0 += nmf_err;
+                    acc_guard.1 += mean_err;
+                    acc_guard.2 += mask_positions.len() as u64;
+                }
+            }
         });
     }
     pb.finish_and_clear();
+
+    // Extract GWAS-phase CV results from the shared accumulator
+    let (nmf_gwas_cv_mae, nmf_gwas_cv_mean_mae, nmf_gwas_cv_count) =
+        match nmf_cv_acc {
+            Some(acc) => {
+                let (nmf_err, mean_err, count) = *acc.lock().unwrap();
+                let nmf_mae = if count > 0 { nmf_err / count as f64 } else { 0.0 };
+                let mean_mae = if count > 0 { mean_err / count as f64 } else { 0.0 };
+                (Some(nmf_mae), Some(mean_mae), Some(count))
+            }
+            None => (None, None, None),
+        };
 
     // GIF calibration via streaming histogram
     let (gif_per_trait, avg_gif) = mtx_histogram.into_inner().unwrap().compute_gif();
@@ -331,6 +442,9 @@ pub fn test_associations_fused(
         gif: avg_gif,
         nmf_cv: None,
         nmf_cv_mean: None,
+        nmf_gwas_cv_mae,
+        nmf_gwas_cv_mean_mae,
+        nmf_gwas_cv_count,
     })
 }
 

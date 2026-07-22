@@ -17,7 +17,7 @@ pub use nmf::NmfConfig;
 pub use parallel::ImputeConfig;
 use precompute::precompute;
 use rsvd::estimate_factors_streaming;
-use testing::{test_associations_fused, TestResults};
+use testing::{test_associations_fused, NmfGwasCvConfig, TestResults};
 pub use testing::OutputConfig;
 
 extern "C" {
@@ -150,7 +150,7 @@ pub fn test_associations(
 ) -> Result<TestResults> {
     let xs = center_covariates(x, config.scale_cov);
     let pre = with_multithreaded_blas(config.n_workers, || precompute(&xs, config.lambda))?;
-    test_associations_fused(y_full, &xs, u_hat, &pre, config, output, ImputeConfig::Mean)
+    test_associations_fused(y_full, &xs, u_hat, &pre, config, output, ImputeConfig::Mean, None)
 }
 
 /// Full LFMM2 pipeline: estimate latent factors + test associations.
@@ -242,7 +242,16 @@ pub fn fit_lfmm2(
         _ => ImputeConfig::Mean,
     };
 
-    let mut results = test_associations_fused(y_full, &xs, &u_hat, &pre, config, output, impute_cfg_test)?;
+    let nmf_gwas_cv = config.nmf.as_ref().zip(nmf_w.as_ref()).zip(nmf_w_pinv.as_ref()).map(
+        |((nmf_cfg, w), wpinv)| NmfGwasCvConfig {
+            cv_rate: nmf_cfg.cv_rate,
+            seed: config.seed,
+            w: w.clone(),
+            w_pinv: wpinv.clone(),
+        },
+    );
+
+    let mut results = test_associations_fused(y_full, &xs, &u_hat, &pre, config, output, impute_cfg_test, nmf_gwas_cv)?;
 
     // Report NMF CV errors in results if available
     if let Some(report) = nmf_report {

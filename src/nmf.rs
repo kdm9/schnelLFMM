@@ -9,8 +9,6 @@ use std::sync::Mutex;
 use crate::bed::{BedFile, SnpNorm, SubsetSpec};
 use crate::parallel::{parallel_stream, ImputeConfig};
 use crate::progress::make_progress_bar;
-// Timer import kept for future instrumentation use
-// use crate::timer::Timer;
 
 /// Configuration for Non-negative Matrix Factorisation imputation.
 #[derive(Clone, Debug)]
@@ -55,9 +53,9 @@ impl Default for NmfConfig {
 
 /// Result from NMF imputation on the estimation subset.
 pub struct NmfEstResult {
-    /// Sample factor matrix: n × K, non-negative.
+    /// Sample factor matrix: n x K, non-negative.
     pub w: Array2<f64>,
-    /// SNP factor matrix: K × p_est, non-negative, held in RAM.
+    /// SNP factor matrix: K x p_est, non-negative, held in RAM.
     pub h_full: Array2<f64>,
     /// Per-iteration cross-validation MAE (mean absolute error on masked
     /// genotypes). Length = n_iter.
@@ -130,11 +128,11 @@ pub fn nmf_impute_estimation(
                     // H_chunk for this chunk
                     let h_chunk = impute_nmf_get_h(&h_full, block.seq, config.chunk_size, chunk_cols);
 
-                    // numerator_W = Y_chunk @ H_chunk^T  (n × K)
+                    // numerator_W = Y_chunk @ H_chunk^T  (n x K)
                     let num_partial = chunk.dot(&h_chunk.t());
                     num_w.lock().unwrap().scaled_add(1.0, &num_partial);
 
-                    // H_chunk @ H_chunk^T  (K × K)
+                    // H_chunk @ H_chunk^T  (K x K)
                     let hh_partial = h_chunk.dot(&h_chunk.t());
                     *hh_acc.lock().unwrap() += &hh_partial;
 
@@ -181,7 +179,7 @@ pub fn nmf_impute_estimation(
                     let chunk = block.data.slice(s![.., ..block.n_cols]);
                     let chunk_cols = block.n_cols;
 
-                    let num_h = w_ref.t().dot(&chunk); // K × chunk_cols
+                    let num_h = w_ref.t().dot(&chunk); // K x chunk_cols
                     let start = block.seq * chunk_sz;
                     let end = (start + chunk_cols).min(p_snps);
 
@@ -286,7 +284,7 @@ fn init_from_random_probe(
     let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
     let omega = Array2::from_shape_fn((n, l), |_| normal.sample(&mut rng));
 
-    // Z = Y_est^T @ Omega  (p_est × l)
+    // Z = Y_est^T @ Omega  (p_est x l)
     let mut z = Array2::<f64>::zeros((p_est, l));
     {
         let pb = make_progress_bar(n_chunks, "NMF init probe", config.progress);
@@ -310,11 +308,12 @@ fn init_from_random_probe(
         pb.finish_and_clear();
     }
 
-    // Thin SVD of Z: Z ≈ U_z @ diag(s) @ Vt_z
-    let (_u_z, _s, vt_z) = z.svd(true, true)?;
-    let vt = vt_z.unwrap(); // l × l
+    // Thin SVD of Z: only need Vt (l x l), NOT full U (p_est x p_est)
+    // Computing full U would be p_est^2 entries, too large for RAM
+    let (_u_z, _s, vt_z) = z.svd(false, true)?;
+    let vt = vt_z.unwrap(); // l x l
 
-    // W_probe = Omega @ Vt[:K, :]^T  (n × l @ l × K = n × K)
+    // W_probe = Omega @ Vt[:K, :]^T  (n x l @ l x K = n x K)
     let w_probe = crate::with_multithreaded_blas(config.n_workers, || {
         omega.dot(&vt.slice(s![..k, ..]).t())
     });
