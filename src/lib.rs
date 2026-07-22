@@ -1,4 +1,5 @@
 pub mod bed;
+pub mod nmf;
 pub mod parallel;
 pub mod precompute;
 pub mod progress;
@@ -12,6 +13,8 @@ use ndarray::{Array2, Axis};
 
 use bed::{BedFile, SubsetSpec};
 pub use bed::SnpNorm;
+pub use nmf::NmfConfig;
+pub use parallel::ImputeConfig;
 use precompute::precompute;
 use rsvd::estimate_factors_streaming;
 use testing::{test_associations_fused, TestResults};
@@ -29,6 +32,15 @@ pub fn with_multithreaded_blas<T>(n_workers: usize, f: impl FnOnce() -> T) -> T 
     let result = f();
     unsafe { openblas_set_num_threads(1); }
     result
+}
+
+/// Imputation strategy for missing genotypes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImputeStrategy {
+    /// Current behaviour: impute missing to per-SNP mean (becomes 0 after centering).
+    Mean,
+    /// NMF low-rank imputation: fill missing genotypes with W @ H reconstruction.
+    Nmf,
 }
 
 /// Configuration for the LFMM2 algorithm.
@@ -60,6 +72,10 @@ pub struct Lfmm2Config {
     pub norm: SnpNorm,
     /// Whether to scale (divide by std-dev) covariate columns after centering.
     pub scale_cov: bool,
+    /// Imputation strategy for missing genotypes.
+    pub impute: ImputeStrategy,
+    /// NMF configuration (only used when impute == ImputeStrategy::Nmf).
+    pub nmf: Option<NmfConfig>,
 }
 
 impl Default for Lfmm2Config {
@@ -75,6 +91,8 @@ impl Default for Lfmm2Config {
             progress: false,
             norm: SnpNorm::default(),
             scale_cov: false,
+            impute: ImputeStrategy::Mean,
+            nmf: None,
         }
     }
 }
@@ -114,7 +132,7 @@ pub fn estimate_factors(
 ) -> Result<Array2<f64>> {
     let xs = center_covariates(x, config.scale_cov);
     let pre = with_multithreaded_blas(config.n_workers, || precompute(&xs, config.lambda))?;
-    estimate_factors_streaming(y_est, subset, &pre, config)
+    estimate_factors_streaming(y_est, subset, &pre, config, ImputeConfig::Mean)
 }
 
 /// Run association tests on all SNPs using pre-estimated U_hat.
@@ -132,7 +150,7 @@ pub fn test_associations(
 ) -> Result<TestResults> {
     let xs = center_covariates(x, config.scale_cov);
     let pre = with_multithreaded_blas(config.n_workers, || precompute(&xs, config.lambda))?;
-    test_associations_fused(y_full, &xs, u_hat, &pre, config, output)
+    test_associations_fused(y_full, &xs, u_hat, &pre, config, output, ImputeConfig::Mean)
 }
 
 /// Full LFMM2 pipeline: estimate latent factors + test associations.
@@ -154,6 +172,46 @@ pub fn fit_lfmm2(
         eprintln!("Precomputing SVD of X...");
     }
     let pre = with_multithreaded_blas(config.n_workers, || precompute(&xs, config.lambda))?;
+
+    // Phase 0 (optional): NMF imputation on estimation subset
+    let nmf_w: Option<Array2<f64>>;
+    let nmf_h_full: Option<Array2<f64>>;
+    let nmf_w_pinv: Option<Array2<f64>>;
+    let nmf_report: Option<nmf::NmfEstResult>;
+
+    if config.impute == ImputeStrategy::Nmf {
+        let nmf_cfg = config.nmf.as_ref().expect("NmfConfig required when impute=Nmf");
+        if config.progress {
+            let p_est = y_est.subset_snp_count(est_subset);
+            eprintln!(
+                "Running NMF imputation (K={}, {} iterations, {} estimation SNPs)...",
+                nmf_cfg.k, nmf_cfg.n_iter, p_est,
+            );
+        }
+        let result = nmf::nmf_impute_estimation(y_est, est_subset, nmf_cfg)?;
+        if config.progress {
+            eprintln!(
+                "NMF complete: cv_mae = {:.6} (vs mean_impute = {:.6})",
+                result.cv_mae_per_iter.last().unwrap_or(&0.0),
+                result.cv_mae_mean_impute,
+            );
+        }
+        let w = result.w.clone();
+        let h = result.h_full.clone();
+        let wt_w = w.t().dot(&w);
+        let w_inv = crate::testing::safe_inv(&wt_w, "W^T W for NMF pinv")?;
+        let w_pinv_mat = w_inv.dot(&w.t());
+        nmf_w = Some(w);
+        nmf_h_full = Some(h);
+        nmf_w_pinv = Some(w_pinv_mat);
+        nmf_report = Some(result);
+    } else {
+        nmf_w = None;
+        nmf_h_full = None;
+        nmf_w_pinv = None;
+        nmf_report = None;
+    }
+
     if config.progress {
         let p_est = y_est.subset_snp_count(est_subset);
         eprintln!(
@@ -161,9 +219,36 @@ pub fn fit_lfmm2(
             config.n_power_iter, p_est,
         );
     }
-    let u_hat = estimate_factors_streaming(y_est, est_subset, &pre, config)?;
+
+    let impute_cfg_est = match (&nmf_w, &nmf_h_full) {
+        (Some(w), Some(h)) => ImputeConfig::NmfInRam {
+            w: w.clone(),
+            h_full: h.clone(),
+        },
+        _ => ImputeConfig::Mean,
+    };
+
+    let u_hat = estimate_factors_streaming(y_est, est_subset, &pre, config, impute_cfg_est)?;
+
     if config.progress {
         eprintln!("Testing associations...");
     }
-    test_associations_fused(y_full, &xs, &u_hat, &pre, config, output)
+
+    let impute_cfg_test = match (&nmf_w, &nmf_w_pinv) {
+        (Some(w), Some(wpinv)) => ImputeConfig::NmfOnTheFly {
+            w: w.clone(),
+            w_pinv: wpinv.clone(),
+        },
+        _ => ImputeConfig::Mean,
+    };
+
+    let mut results = test_associations_fused(y_full, &xs, &u_hat, &pre, config, output, impute_cfg_test)?;
+
+    // Report NMF CV errors in results if available
+    if let Some(report) = nmf_report {
+        results.nmf_cv = Some(report.cv_mae_per_iter);
+        results.nmf_cv_mean = Some(report.cv_mae_mean_impute);
+    }
+
+    Ok(results)
 }

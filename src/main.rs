@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use ndarray::Array2;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -7,10 +7,11 @@ use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use schnellfmm::bed::{BedFile, SubsetSpec};
-use schnellfmm::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
+use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, NmfConfig, OutputConfig, SnpNorm};
 
 #[derive(Parser)]
 #[command(name = "lfmm2", about = "Latent Factor Mixed Model v2 - GWAS with latent confounders")]
+#[command(group = ArgGroup::new("impute").args(&["mean_impute", "nmf_impute"]))]
 struct Cli {
     /// PLINK .bed file (with .bim/.fam)
     #[arg(short = 'b', long)]
@@ -78,6 +79,26 @@ struct Cli {
     /// By default, covariates are centered but not scaled.
     #[arg(long)]
     scale_cov: bool,
+
+    /// Use mean imputation for missing genotypes (default).
+    #[arg(long, default_value = "true")]
+    mean_impute: bool,
+
+    /// Use NMF low-rank imputation for missing genotypes.
+    #[arg(long)]
+    nmf_impute: bool,
+
+    /// NMF rank (default: same as -k).
+    #[arg(long)]
+    nmf_k: Option<usize>,
+
+    /// NMF multiplicative update iterations (default: 3).
+    #[arg(long, default_value = "3")]
+    nmf_iter: usize,
+
+    /// Fraction of genotypes held out per NMF iteration for CV (default: 0.0005).
+    #[arg(long, default_value = "0.0005")]
+    nmf_cv_rate: f64,
 }
 
 fn default_threads() -> usize {
@@ -150,6 +171,8 @@ fn main() -> Result<()> {
         SubsetSpec::All
     };
 
+    let config_progress = std::io::stderr().is_terminal();
+    let config_norm = cli.norm;
     let config = Lfmm2Config {
         k: cli.k,
         lambda: cli.lambda,
@@ -158,9 +181,30 @@ fn main() -> Result<()> {
         n_power_iter: cli.power_iter,
         seed: cli.seed,
         n_workers: cli.threads,
-        progress: std::io::stderr().is_terminal(),
+        progress: config_progress,
         norm: cli.norm,
         scale_cov: cli.scale_cov,
+        impute: if cli.nmf_impute {
+            ImputeStrategy::Nmf
+        } else {
+            ImputeStrategy::Mean
+        },
+        nmf: if cli.nmf_impute {
+            let nmf_k = cli.nmf_k.unwrap_or(cli.k);
+            Some(NmfConfig {
+                k: nmf_k,
+                n_iter: cli.nmf_iter,
+                eps: 1e-16,
+                cv_rate: cli.nmf_cv_rate,
+                chunk_size: cli.chunk_size,
+                n_workers: cli.threads,
+                norm: config_norm,
+                progress: config_progress,
+                seed: cli.seed,
+            })
+        } else {
+            None
+        },
     };
 
     eprintln!(
@@ -196,6 +240,16 @@ fn main() -> Result<()> {
         writeln!(f, "covariates: {}", cov_names.join(", "))?;
         writeln!(f, "lambda: {}", cli.lambda)?;
         writeln!(f, "threads: {}", cli.threads)?;
+        writeln!(f, "imputation: {}", if cli.nmf_impute { "nmf" } else { "mean" })?;
+        if let Some(ref cv) = results.nmf_cv {
+            writeln!(f, "nmf_iterations: {}", cv.len())?;
+            for (i, mae) in cv.iter().enumerate() {
+                writeln!(f, "nmf_cv_mae_iter_{}: {:.6}", i + 1, mae)?;
+            }
+            if let Some(mean_mae) = results.nmf_cv_mean {
+                writeln!(f, "mean_impute_cv_mae: {:.6}", mean_mae)?;
+            }
+        }
     }
 
     eprintln!("Done. Output: {}, {}", results_path.display(), summary_path);

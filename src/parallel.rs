@@ -1,7 +1,7 @@
 use ndarray::Array2;
 use std::sync::Mutex;
 
-use crate::bed::{decode_bed_chunk_into, BedFile, SnpNorm, SubsetSpec};
+use crate::bed::{decode_bed_chunk_into, decode_raw_bed_chunk_into, BedFile, SnpNorm, SubsetSpec};
 
 /// A pre-allocated buffer for a chunk of decoded SNP data.
 pub struct SnpBlock {
@@ -15,6 +15,25 @@ pub struct SnpBlock {
     /// Raw packed bytes copied from mmap by the IO thread.
     /// Workers decode from this into `data` before calling process_fn.
     pub raw: Vec<u8>,
+}
+
+/// Imputation strategy for the streaming decode step.
+#[derive(Clone)]
+pub enum ImputeConfig {
+    /// Current behaviour: fill NaN with per-SNP mean (zero after centering).
+    Mean,
+    /// NMF with pre-computed H: fill NaN with W @ H_chunk before centering.
+    /// W is n × K, h_full is K × p (or K × p_est), indexed by chunk offset.
+    NmfInRam {
+        w: Array2<f64>,
+        h_full: Array2<f64>,
+    },
+    /// NMF on-the-fly: compute H_chunk = max(0, W_pinv @ Y_filled) within each chunk,
+    /// then fill NaN with W @ H_chunk. Used in the testing pass.
+    NmfOnTheFly {
+        w: Array2<f64>,
+        w_pinv: Array2<f64>,
+    },
 }
 
 /// Per-worker accumulator for forward passes that sum partial results.
@@ -97,18 +116,16 @@ fn copy_raw_chunk(mmap_data: &[u8], bps: usize, chunk_indices: &[usize], dst: &m
 ///
 /// Architecture:
 /// - **IO thread**: copies raw packed bytes from the mmap sequentially into buffers.
-///   This keeps disk reads in order (important for spinning disks and readahead).
 /// - **Worker threads**: decode the raw 2-bit→f64 data, then call `process_fn`.
-///   Decode is CPU-bound and benefits from parallelization across workers.
 ///
-/// Uses `std::thread::scope` so that `process_fn` can borrow from the caller's stack
-/// without requiring `'static` bounds.
+/// Uses `std::thread::scope` so that `process_fn` can borrow from the caller's stack.
 pub fn parallel_stream<F>(
     bed: &BedFile,
     subset: &SubsetSpec,
     chunk_size: usize,
     n_workers: usize,
     norm: SnpNorm,
+    impute: ImputeConfig,
     process_fn: F,
 ) where
     F: Fn(usize, &SnpBlock) + Send + Sync,
@@ -119,20 +136,15 @@ pub fn parallel_stream<F>(
     let n_physical_samples = bed.n_physical_samples;
     let sample_keep = bed.sample_keep.as_deref();
     let bps = bed.bytes_per_snp();
-    let mmap_data = &bed.mmap[3..]; // skip 3-byte magic header
 
     let pool_size = n_workers + 1;
     let raw_buf_size = chunk_size * bps;
 
-    // Pre-compute local indices [0, 1, ..., chunk_size-1] for decode_bed_chunk_into.
-    // After the IO thread packs raw bytes contiguously, SNP i is at offset i*bps.
     let local_indices: Vec<usize> = (0..chunk_size).collect();
 
-    // Create channels
     let (free_tx, free_rx) = crossbeam_channel::bounded::<SnpBlock>(pool_size);
     let (filled_tx, filled_rx) = crossbeam_channel::bounded::<SnpBlock>(pool_size);
 
-    // Seed the free pool with pre-allocated blocks
     for _ in 0..pool_size {
         free_tx
             .send(SnpBlock {
@@ -144,24 +156,22 @@ pub fn parallel_stream<F>(
             .unwrap();
     }
 
+    let mmap_data = &bed.mmap[3..];
+    let impute_ref = &impute;
+
     std::thread::scope(|s| {
-        // IO thread: copies raw bytes from mmap sequentially, sends to workers
         s.spawn(|| {
             for (seq, chunk_indices) in indices.chunks(chunk_size).enumerate() {
                 let mut block = free_rx.recv().unwrap();
                 let n_cols = chunk_indices.len();
-
                 copy_raw_chunk(mmap_data, bps, chunk_indices, &mut block.raw);
-
                 block.n_cols = n_cols;
                 block.seq = seq;
                 filled_tx.send(block).unwrap();
             }
-            // Drop sender to signal workers that no more blocks are coming
             drop(filled_tx);
         });
 
-        // Worker threads: decode raw bytes → f64, then call process_fn
         for worker_id in 0..n_workers {
             let filled_rx = filled_rx.clone();
             let free_tx = free_tx.clone();
@@ -169,18 +179,90 @@ pub fn parallel_stream<F>(
             let local_indices = &local_indices;
             s.spawn(move || {
                 while let Ok(mut block) = filled_rx.recv() {
-                    // Decode: raw packed bytes → centered/scaled f64 matrix
                     let n_cols = block.n_cols;
-                    let out_view = block.data.slice_mut(ndarray::s![.., ..n_cols]);
-                    decode_bed_chunk_into(
-                        &block.raw,
-                        bps,
-                        n_physical_samples,
-                        &local_indices[..n_cols],
-                        out_view,
-                        norm,
-                        sample_keep,
-                    );
+                    let n_out = n_output_samples;
+
+                    match impute_ref {
+                        ImputeConfig::Mean => {
+                            let out_view = block.data.slice_mut(ndarray::s![.., ..n_cols]);
+                            decode_bed_chunk_into(
+                                &block.raw,
+                                bps,
+                                n_physical_samples,
+                                &local_indices[..n_cols],
+                                out_view,
+                                norm,
+                                sample_keep,
+                                None,
+                            );
+                        }
+                        ImputeConfig::NmfInRam { w, h_full } => {
+                            let start = block.seq * chunk_size;
+                            let h_chunk = h_full.slice(ndarray::s![.., start..start + n_cols]);
+                            let fill_values = w.dot(&h_chunk);
+                            let out_view = block.data.slice_mut(ndarray::s![.., ..n_cols]);
+                            decode_bed_chunk_into(
+                                &block.raw,
+                                bps,
+                                n_physical_samples,
+                                &local_indices[..n_cols],
+                                out_view,
+                                norm,
+                                sample_keep,
+                                Some(fill_values.view()),
+                            );
+                        }
+                        ImputeConfig::NmfOnTheFly { w, w_pinv } => {
+                            // Pass 1: raw decode → fill NaN with mean → compute H_chunk
+                            {
+                                let out = block.data.slice_mut(ndarray::s![.., ..n_cols]);
+                                decode_raw_bed_chunk_into(
+                                    &block.raw,
+                                    bps,
+                                    n_physical_samples,
+                                    &local_indices[..n_cols],
+                                    out,
+                                    sample_keep,
+                                );
+                            }
+                            // Fill NaN with column means
+                            for col in 0..n_cols {
+                                let mut sum = 0.0;
+                                let mut n_obs = 0u32;
+                                for row in 0..n_out {
+                                    let v = block.data[(row, col)];
+                                    if !v.is_nan() {
+                                        sum += v;
+                                        n_obs += 1;
+                                    }
+                                }
+                                let mean = if n_obs > 0 { sum / n_obs as f64 } else { 0.0 };
+                                for row in 0..n_out {
+                                    if block.data[(row, col)].is_nan() {
+                                        block.data[(row, col)] = mean;
+                                    }
+                                }
+                            }
+                            // H_chunk = max(0, W_pinv @ Y_filled)
+                            let y_view = block.data.slice(ndarray::s![.., ..n_cols]);
+                            let h_chunk_raw = w_pinv.dot(&y_view);
+                            let h_chunk: Array2<f64> = h_chunk_raw.mapv(|v| v.max(0.0));
+                            let fill_values = w.dot(&h_chunk);
+
+                            // Pass 2: final decode with NMF fill (overwrites block.data)
+                            let out2 = block.data.slice_mut(ndarray::s![.., ..n_cols]);
+                            decode_bed_chunk_into(
+                                &block.raw,
+                                bps,
+                                n_physical_samples,
+                                &local_indices[..n_cols],
+                                out2,
+                                norm,
+                                sample_keep,
+                                Some(fill_values.view()),
+                            );
+                        }
+                    }
 
                     process_fn(worker_id, &block);
                     let _ = free_tx.send(block);

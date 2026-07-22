@@ -7,7 +7,7 @@ use rand_distr::{Distribution, Normal};
 use std::sync::Mutex;
 
 use crate::bed::{BedFile, SubsetSpec};
-use crate::parallel::{parallel_stream, PerWorkerAccumulator};
+use crate::parallel::{parallel_stream, ImputeConfig, PerWorkerAccumulator};
 use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
@@ -28,6 +28,7 @@ pub fn estimate_factors_streaming(
     subset: &SubsetSpec,
     pre: &Precomputed,
     config: &Lfmm2Config,
+    impute: ImputeConfig,
 ) -> Result<Array2<f64>> {
     let n = y_est.n_samples;
     let k = config.k;
@@ -57,7 +58,7 @@ pub fn estimate_factors_streaming(
         let t = Timer::new("initial sketch (parallel)");
         let pb = make_progress_bar(n_chunks, "RSVD sketch", show);
         let z_mutex = Mutex::new(&mut z);
-        parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, |_worker_id, block| {
+        parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, impute.clone(), |_worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let z_block = chunk.t().dot(&mt_omega);
             let start = block.seq * chunk_size;
@@ -84,7 +85,7 @@ pub fn estimate_factors_streaming(
             let pb = make_progress_bar(n_chunks, &label, show);
             let n_w = config.n_workers.max(1);
             let acc = PerWorkerAccumulator::new(n_w, (n, l));
-            parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, |worker_id, block| {
+            parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, impute.clone(), |worker_id, block| {
                 let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
                 let offset = block.seq * chunk_size;
                 let q_z_block =
@@ -113,7 +114,7 @@ pub fn estimate_factors_streaming(
             let label = format!("Power iter {}/{} (bwd)", iter + 1, config.n_power_iter);
             let pb = make_progress_bar(n_chunks, &label, show);
             let z_mutex = Mutex::new(&mut z);
-            parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, |_worker_id, block| {
+            parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, impute.clone(), |_worker_id, block| {
                 let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
                 let z_block = chunk.t().dot(&mt_q);
                 let start = block.seq * chunk_size;
@@ -140,7 +141,7 @@ pub fn estimate_factors_streaming(
         let pb = make_progress_bar(n_chunks, "RSVD project", show);
         let n_w = config.n_workers.max(1);
         let acc = PerWorkerAccumulator::new(n_w, (n, l));
-        parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, |worker_id, block| {
+        parallel_stream(y_est, subset, chunk_size, config.n_workers, config.norm, impute.clone(), |worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let offset = block.seq * chunk_size;
             let q_z_block =

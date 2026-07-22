@@ -178,6 +178,8 @@ impl BedFile {
 /// - `n_output_samples`: rows in the output matrix (equals `n_physical_samples` when
 ///   `sample_keep` is `None`, or `sample_keep.len()` otherwise)
 /// - `sample_keep`: if `Some`, only these physical-sample indices are decoded
+/// - `fill_values`: if `Some`, an (n_output_samples × chunk_size) matrix of per-entry
+///   fill values for NaN positions. If `None`, NaN → per-column mean (current behaviour).
 pub fn decode_bed_chunk(
     packed: &[u8],
     n_physical_samples: usize,
@@ -191,7 +193,7 @@ pub fn decode_bed_chunk(
 
     for snp in 0..chunk_size {
         let snp_bytes = &packed[snp * bytes_per_snp..(snp + 1) * bytes_per_snp];
-        decode_single_snp(snp_bytes, n_physical_samples, out.column_mut(snp), norm, sample_keep);
+        decode_single_snp(snp_bytes, n_physical_samples, out.column_mut(snp), norm, sample_keep, None);
     }
     out
 }
@@ -204,6 +206,8 @@ pub fn decode_bed_chunk(
 /// - `snp_indices`: which SNPs to decode (column indices in the .bed file)
 /// - `out`: pre-allocated output (n_output_samples × snp_indices.len())
 /// - `sample_keep`: if `Some`, only these physical-sample indices are decoded
+/// - `fill_values`: if `Some`, an (n_output_samples × n_cols) matrix used to fill
+///   NaN entries before centering. If `None`, NaN → per-column mean.
 pub fn decode_bed_chunk_into(
     mmap_data: &[u8],
     bps: usize,
@@ -212,75 +216,161 @@ pub fn decode_bed_chunk_into(
     mut out: ndarray::ArrayViewMut2<f64>,
     norm: SnpNorm,
     sample_keep: Option<&[usize]>,
+    fill_values: Option<ndarray::ArrayView2<f64>>,
 ) {
     for (col, &snp_idx) in snp_indices.iter().enumerate() {
         let snp_bytes = &mmap_data[snp_idx * bps..(snp_idx + 1) * bps];
-        decode_single_snp(snp_bytes, n_physical_samples, out.column_mut(col), norm, sample_keep);
+        let col_fill: Option<Vec<f64>> = fill_values.as_ref().map(|fv| {
+            fv.column(col).to_vec()
+        });
+        decode_single_snp(
+            snp_bytes,
+            n_physical_samples,
+            out.column_mut(col),
+            norm,
+            sample_keep,
+            col_fill.as_deref(),
+        );
     }
 }
 
-/// Decode a single SNP column, impute missing to mean, center, and optionally scale.
+/// Decode raw genotypes (2-bit → {0, 1, 2, NaN}) without imputation,
+/// centering, or scaling. NaN marks missing genotypes.
+///
+/// - `mmap_data`: mmap bytes after the 3-byte header
+/// - `bps`: bytes per SNP
+/// - `n_physical_samples`: on-disk sample count
+/// - `snp_indices`: which SNPs to decode
+/// - `out`: pre-allocated output (n_output_samples × snp_indices.len())
+/// - `sample_keep`: if `Some`, only these physical-sample indices are decoded
+pub fn decode_raw_bed_chunk_into(
+    mmap_data: &[u8],
+    bps: usize,
+    n_physical_samples: usize,
+    snp_indices: &[usize],
+    mut out: ndarray::ArrayViewMut2<f64>,
+    sample_keep: Option<&[usize]>,
+) {
+    for (col, &snp_idx) in snp_indices.iter().enumerate() {
+        let snp_bytes = &mmap_data[snp_idx * bps..(snp_idx + 1) * bps];
+        decode_raw_single_snp(snp_bytes, n_physical_samples, out.column_mut(col), sample_keep);
+    }
+}
+
+/// Decode raw genotypes for a single SNP column: 2-bit → {0, 1, 2, NaN}.
+/// No imputation, centering, or scaling.
+fn decode_raw_single_snp(
+    snp_bytes: &[u8],
+    n_physical_samples: usize,
+    mut col: ndarray::ArrayViewMut1<f64>,
+    sample_keep: Option<&[usize]>,
+) {
+    if let Some(keep) = sample_keep {
+        for (out_idx, &phys_idx) in keep.iter().enumerate() {
+            let byte = snp_bytes[phys_idx / 4];
+            let code = (byte >> (2 * (phys_idx % 4))) & 0x03;
+            col[out_idx] = DECODE_TABLE[code as usize];
+        }
+    } else {
+        for sample in 0..n_physical_samples {
+            let byte = snp_bytes[sample / 4];
+            let code = (byte >> (2 * (sample % 4))) & 0x03;
+            col[sample] = DECODE_TABLE[code as usize];
+        }
+    }
+}
+
+/// Decode a single SNP column, impute missing, center, and optionally scale.
 ///
 /// After decoding 2-bit genotypes to {0, 1, 2}, this function:
-/// 1. Computes the per-SNP mean (excluding missing values)
-/// 2. Imputes missing values to the mean (centered = 0)
-/// 3. Centers all values by subtracting the mean
+/// 1. (Raw decode) Produces {0, 1, 2, NaN} for each genotype.
+/// 2. If `fill_values` is `Some`, pre-fills NaN entries with `fill_values[i]`
+///    and computes the column mean over all entries (including the filled ones).
+///    If `None` (current behaviour), computes mean from observed entries only
+///    and fills NaN with that mean (so centered value becomes 0).
+/// 3. Centers all values by subtracting the mean.
 /// 4. Applies normalization according to `norm`:
 ///    - `CenterOnly`: no scaling (scale = 1.0)
-///    - `Eigenstrat`: divides by sqrt(2pq) for approx unit variance under HWE
+///    - `Eigenstrat`: divides by sqrt(2pq) for approx unit variance under HWE.
 ///
 /// Monomorphic SNPs (p=0 or p=1) have zero variance and are left as all zeros.
 ///
 /// When `sample_keep` is `Some`, only those physical-sample indices are decoded
-/// into `col` (which has length `sample_keep.len()`). Mean/variance statistics
-/// are computed over the kept samples only.
+/// into `col` (which has length `sample_keep.len()`).
 pub(crate) fn decode_single_snp(
     snp_bytes: &[u8],
     n_physical_samples: usize,
     mut col: ndarray::ArrayViewMut1<f64>,
     norm: SnpNorm,
     sample_keep: Option<&[usize]>,
+    fill_values: Option<&[f64]>,
 ) {
     if let Some(keep) = sample_keep {
         // Subsetting path: decode only kept samples
-        let mut sum = 0.0f64;
-        let mut n_valid = 0u32;
+        let n_out = keep.len();
 
-        // Pass 1: decode kept samples and compute mean
+        // Pass 1: raw decode
         for (out_idx, &phys_idx) in keep.iter().enumerate() {
             debug_assert!(phys_idx < n_physical_samples);
             let byte = snp_bytes[phys_idx / 4];
             let code = (byte >> (2 * (phys_idx % 4))) & 0x03;
-            let val = DECODE_TABLE[code as usize];
-            col[out_idx] = val;
-            if !val.is_nan() {
-                sum += val;
-                n_valid += 1;
+            col[out_idx] = DECODE_TABLE[code as usize];
+        }
+
+        // Fill NaN if fill_values provided
+        if let Some(fv) = fill_values {
+            for i in 0..n_out {
+                if col[i].is_nan() {
+                    col[i] = fv[i];
+                }
             }
         }
 
+        // Compute mean over non-NaN entries (if fill_values, all entries are non-NaN)
+        let mut sum = 0.0f64;
+        let mut n_valid = 0u32;
+        for i in 0..n_out {
+            let v = col[i];
+            if !v.is_nan() {
+                sum += v;
+                n_valid += 1;
+            }
+        }
         let mean = if n_valid > 0 { sum / n_valid as f64 } else { 0.0 };
         let scale = compute_scale(mean, norm);
 
-        // Pass 2: impute, center, scale
+        // Center and scale (NaN → 0 if no fill_values, otherwise already filled)
         col.mapv_inplace(|v| if v.is_nan() { 0.0 } else { (v - mean) * scale });
     } else {
-        // Original fast path: all samples
+        // Fast path: all samples
         let n_samples = n_physical_samples;
-        let mut sum = 0.0f64;
-        let mut n_valid = 0u32;
 
+        // Pass 1: raw decode
         for sample in 0..n_samples {
             let byte = snp_bytes[sample / 4];
             let code = (byte >> (2 * (sample % 4))) & 0x03;
-            let val = DECODE_TABLE[code as usize];
-            col[sample] = val;
-            if !val.is_nan() {
-                sum += val;
-                n_valid += 1;
+            col[sample] = DECODE_TABLE[code as usize];
+        }
+
+        // Fill NaN if fill_values provided
+        if let Some(fv) = fill_values {
+            for i in 0..n_samples {
+                if col[i].is_nan() {
+                    col[i] = fv[i];
+                }
             }
         }
 
+        // Compute mean over non-NaN entries
+        let mut sum = 0.0f64;
+        let mut n_valid = 0u32;
+        for i in 0..n_samples {
+            let v = col[i];
+            if !v.is_nan() {
+                sum += v;
+                n_valid += 1;
+            }
+        }
         let mean = if n_valid > 0 { sum / n_valid as f64 } else { 0.0 };
         let scale = compute_scale(mean, norm);
 

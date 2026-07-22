@@ -4,7 +4,7 @@ use schnellfmm::simulate::{
     simulate, write_covariates, write_ground_truth, write_latent_u, write_lfmm_format,
     write_plink, write_r_comparison_script, SimConfig,
 };
-use schnellfmm::{fit_lfmm2, Lfmm2Config, OutputConfig, SnpNorm};
+use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, OutputConfig, SnpNorm};
 use ndarray::Array2;
 use ndarray_linalg::SVD;
 use std::fs;
@@ -108,6 +108,8 @@ fn test_lfmm2_quick() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
 
     // Simulate
@@ -161,6 +163,8 @@ fn test_lfmm2_large() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
 
     // Simulate
@@ -228,6 +232,8 @@ fn test_reproducibility() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
 
     let sim = simulate(&sim_config);
@@ -302,6 +308,8 @@ fn test_different_seeds_differ() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
 
     let d = sim_config.d;
@@ -564,6 +572,8 @@ fn test_parallel_matches_sequential() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
     let d = sim.x.ncols();
     let cov_names = default_cov_names(d);
@@ -752,6 +762,8 @@ fn test_subset_rate_end_to_end() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
 
     let sim = simulate(&sim_config);
@@ -822,6 +834,8 @@ fn test_subset_indices_end_to_end() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
 
     let sim = simulate(&sim_config);
@@ -897,6 +911,8 @@ fn test_output_config_writes_results() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
 
     let sim = simulate(&sim_config);
@@ -1430,6 +1446,8 @@ fn test_normalization_modes_end_to_end() {
             progress: false,
             norm: mode,
             scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
         };
         let out_path = dir.path().join(format!("results_{}.tsv", idx));
         let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
@@ -1933,6 +1951,8 @@ fn test_k_sensitivity() {
                 progress: false,
                 norm: SnpNorm::Eigenstrat,
                 scale_cov: false,
+                impute: ImputeStrategy::Mean,
+                nmf: None,
             };
             let out_path = dir.path().join(format!("results_k{}_kt{}.tsv", k_run, k_true));
             let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
@@ -2044,6 +2064,8 @@ fn test_variance_decomposition() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
 
     let (output_path, cov_names) = test_output_setup(dir.path(), sim.x.ncols());
@@ -2136,6 +2158,8 @@ fn test_variance_decomposition_signal_levels() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
 
     for &ls in &latent_scales {
@@ -2258,6 +2282,8 @@ fn test_variance_decomposition_with_noise() {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
+        impute: ImputeStrategy::Mean,
+        nmf: None,
     };
 
     let d = sim.x.ncols();

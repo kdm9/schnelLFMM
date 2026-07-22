@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::bed::{BedFile, BimRecord, SubsetSpec};
-use crate::parallel::parallel_stream;
+use crate::parallel::{parallel_stream, ImputeConfig};
 use crate::precompute::Precomputed;
 use crate::progress::make_progress_bar;
 use crate::Lfmm2Config;
@@ -32,6 +32,10 @@ pub struct TestResults {
     pub u_hat: Array2<f64>,
     /// Genomic inflation factor
     pub gif: f64,
+    /// NMF cross-validation MAE per iteration (only when NMF imputation is used).
+    pub nmf_cv: Option<Vec<f64>>,
+    /// Mean imputation CV MAE for comparison (only when NMF imputation is used).
+    pub nmf_cv_mean: Option<f64>,
 }
 
 /// Streaming histogram for estimating the median of t² values per trait.
@@ -168,6 +172,7 @@ pub fn test_associations_fused(
     pre: &Precomputed,
     config: &Lfmm2Config,
     output: &OutputConfig,
+    impute: ImputeConfig,
 ) -> Result<TestResults> {
     let n = y_full.n_samples;
     let p = y_full.n_snps;
@@ -241,7 +246,7 @@ pub fn test_associations_fused(
     let pb = make_progress_bar(n_chunks as u64, "Association tests", config.progress);
 
     {
-        parallel_stream(y_full, &subset, chunk_size, config.n_workers, config.norm, |_worker_id, block| {
+        parallel_stream(y_full, &subset, chunk_size, config.n_workers, config.norm, impute, |_worker_id, block| {
             let chunk = block.data.slice(ndarray::s![.., ..block.n_cols]);
             let chunk_cols = block.n_cols;
 
@@ -324,6 +329,8 @@ pub fn test_associations_fused(
     Ok(TestResults {
         u_hat: u_hat.to_owned(),
         gif: avg_gif,
+        nmf_cv: None,
+        nmf_cv_mean: None,
     })
 }
 
@@ -431,7 +438,7 @@ fn coalesce_output(
 /// U^T U or C^T C singular. Rather than crashing, we add ε·I where
 /// ε = 1e-8 · max(diag(A)). This is small enough to not affect well-conditioned
 /// results (relative perturbation ~1e-8) but prevents hard failures.
-fn safe_inv(a: &Array2<f64>, name: &str) -> Result<Array2<f64>> {
+pub(crate) fn safe_inv(a: &Array2<f64>, name: &str) -> Result<Array2<f64>> {
     match a.clone().inv_into() {
         Ok(inv) => Ok(inv),
         Err(_) => {
