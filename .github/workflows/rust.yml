@@ -30,6 +30,8 @@ jobs:
         docker run --rm \
           -e RUST_TOOLCHAIN \
           -e OPENBLAS_TARGET \
+          -e OPENSSL_VENDORED=1 \
+          -e OPENSSL_STATIC=1 \
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           quay.io/pypa/manylinux2014_x86_64 \
