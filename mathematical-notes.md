@@ -87,6 +87,8 @@ $$
 
 and its inverse $D_\lambda^{-1}$ with entries $d_\lambda^{-1}[j] = 1 / d_\lambda[j]$.
 
+**Note (square-root convention).** Caye et al. (2019) define $D_\lambda$ *without* the square root, $d_\lambda[j] = \lambda / (\lambda + \sigma_j^2)$, which is the weighting that arises exactly when profiling the ridge objective: $\|Y - XB^T - W\|_F^2 + \lambda\|B\|_2^2$ minimised over $B$ gives the residual maker $I - H_\lambda = Q\, \mathrm{diag}(\lambda/(\lambda+\sigma_j^2))\, Q^T$. We instead follow the LEA reference implementation (`LEA::lfmm2()`), which uses the square-root form above. At the default $\lambda = 10^{-5}$ both conventions shrink the covariate directions by many orders of magnitude and give indistinguishable results; the difference only becomes relevant for substantially larger $\lambda$.
+
 Define the operator $M \in \mathbb{R}^{n \times n}$:
 
 $$
@@ -117,13 +119,22 @@ When `--nmf-impute` is active, before latent factor estimation, a Non-negative M
 
 ### 4.1 Model
 
-Let $Y^{\text{est}} \in \mathbb{R}^{n \times p_{\text{est}}}$ denote the genotype matrix for the estimation subset. The NMF approximates:
+Let $Y^{\text{est}} \in \mathbb{R}^{n \times p_{\text{est}}}$ denote the **raw** genotype matrix for the estimation subset: dosages in $\{0, 1, 2\}$, **uncentered and unscaled**. The NMF approximates:
 
 $$
 Y^{\text{est}} \approx W H
 $$
 
-where $W \in \mathbb{R}^{n \times K}$ (sample loadings, non-negative) and $H \in \mathbb{R}^{K \times p_{\text{est}}}$ (SNP loadings, non-negative). The genotype values are centered during decoding, so the NMF operates on centered data (with missing entries filled by the reconstruction before centering).
+where $W \in \mathbb{R}^{n \times K}$ (sample loadings, non-negative) and $H \in \mathbb{R}^{K \times p_{\text{est}}}$ (SNP loadings, non-negative).
+
+**Why raw dosages.** Two constraints dictate this choice:
+
+1. The Lee–Seung multiplicative updates (§4.3) are only valid for a non-negative target matrix. Raw dosages are naturally non-negative; centered genotypes are not.
+2. The factorisation is *applied* on the raw scale: on-the-fly imputation (§8) estimates $H_c$ from raw dosages and inserts the reconstruction $W H_c$ as raw-scale fills before centering. Training on the same scale keeps the training and application phases consistent.
+
+(An earlier version of this software trained the NMF on centered data: the non-negativity premise was violated, the train/apply scales were inconsistent, and the NMF-phase CV benchmark was structurally biased against the non-negative reconstruction. Training on raw dosages resolves all three issues.)
+
+The downstream LFMM steps are unaffected by this choice: after NMF filling, genotypes are centered (± Eigenstrat scaling) exactly as with mean imputation.
 
 ### 4.2 Initialization (Random Probe)
 
@@ -131,7 +142,7 @@ Initial values $W^{(0)}$ and $H^{(0)}$ are obtained via a randomized probing pro
 
 1. Generate a random Gaussian sketch matrix $\Omega \in \mathbb{R}^{n \times (K+10)}$ with entries $\omega_{ij} \sim \mathcal{N}(0, 1)$, seeded by $\text{seed} + 10^6$.
 
-2. Compute the sketch $Z = Y_{\text{est}}^T \Omega \in \mathbb{R}^{p_{\text{est}} \times (K+10)}$ via a streaming pass (mean-imputed genotypes).
+2. Compute the sketch $Z = Y_{\text{est}}^T \Omega \in \mathbb{R}^{p_{\text{est}} \times (K+10)}$ via a streaming pass (mean-imputed raw dosages, uncentered).
 
 3. Compute the thin SVD of $Z$ (only $V_t$ needed): $Z = U_Z \Sigma_Z V_Z^T$.
 
@@ -141,13 +152,21 @@ Initial values $W^{(0)}$ and $H^{(0)}$ are obtained via a randomized probing pro
 
    $$H^{(0)}_{\text{chunk}} = \max(0, (W^{(0)T} W^{(0)})^{-1} W^{(0)T} Y_{\text{chunk}})$$
 
-   using mean-imputed genotypes.
+   using mean-imputed raw dosages.
 
 Both $W^{(0)}$ and $H^{(0)}$ are clamped to $[\varepsilon, \infty)$ with $\varepsilon = 10^{-16}$, then $W$ is L1-normalized column-wise with $H$ rescaled accordingly to preserve the product $WH$.
 
 ### 4.3 Multiplicative Updates
 
-For each iteration $t = 0, \ldots, n_{\text{iter}}-1$, the NMF alternates between a forward pass (updating $W$) and a backward pass (updating $H$). Missing genotypes are filled with the current reconstruction $W^{(t)} H^{(t)}_{\text{chunk}}$ before each pass (EM-like approach).
+For each iteration $t = 0, \ldots, n_{\text{iter}}-1$, the NMF alternates between a forward pass (updating $W$) and a backward pass (updating $H$). Missing genotypes are filled with the **current** reconstruction before every pass (EM-like E-step): the fill matrix is rebuilt from the latest $(W, H)$ at the start of each forward and each backward pass, so the filled target matrix is always
+
+$$
+\tilde{Y}^{(t)}_{ij} = \begin{cases} y_{ij} & \text{if observed} \\ (W H)_{ij} & \text{if missing} \end{cases}
+$$
+
+on the raw dosage scale, with $(W, H)$ taken at their most recent values. Since $\tilde{Y}^{(t)} \ge 0$ elementwise (observed dosages are $0,1,2$ and $WH \ge 0$), the Lee–Seung updates below are valid and decrease the Frobenius error monotonically.
+
+Default $n_{\text{iter}} = 10$: multiplicative NMF converges slowly, and the per-iteration CV curve (§4.4) should be monitored for convergence.
 
 #### Forward Pass (Update W)
 
@@ -183,23 +202,22 @@ After each NMF iteration $t$, a cross-validation error is computed to track conv
 
 For each chunk:
 
-- Decode centered genotypes **without** NMF fill (mean-impute for missing), yielding $Y^{\text{centered}} \in \mathbb{R}^{n \times p_c}$.
-- Compute the NMF reconstruction: $\hat{Y} = W^{(t)} H_c$ where $H_c$ is a slice of the full $H^{(t)}$.
-- For each masked position $(i,j)$ where $Y^{\text{centered}}_{ij}$ is observed (non-NaN):
+- Decode **raw** genotypes (no fill, no centering), yielding $Y^{\text{raw}} \in \{0, 1, 2, \text{NaN}\}^{n \times p_c}$.
+- Compute the NMF reconstruction: $\hat{Y} = W^{(t)} H_c$ where $H_c$ is a slice of the full $H^{(t)}$ (raw dosage scale).
+- Compute the per-SNP mean $\bar{y}_j$ over observed entries (the mean-imputation baseline prediction).
+- For each masked position $(i,j)$ where $Y^{\text{raw}}_{ij}$ is observed (non-NaN):
 
   $$
-  e^{\text{nmf}}_{ij} = |Y^{\text{centered}}_{ij} - \hat{Y}_{ij}|
+  e^{\text{nmf}}_{ij} = |Y^{\text{raw}}_{ij} - \hat{Y}_{ij}|
   $$
 
   $$
-  e^{\text{mean}}_{ij} = |Y^{\text{centered}}_{ij} - 0| = |Y^{\text{centered}}_{ij}|
+  e^{\text{mean}}_{ij} = |Y^{\text{raw}}_{ij} - \bar{y}_j|
   $$
 
-  (after centering, mean imputation yields 0).
+- Report $\text{MAE}_{\text{nmf}} = \sum e^{\text{nmf}}_{ij} / N_{\text{masked}}$ and $\text{MAE}_{\text{mean}}$ aggregated across chunks. Both errors are evaluated on the **same mask** (a paired comparison) and on the raw dosage scale — the scale on which the factorisation is applied — so the comparison is unbiased.
 
-- Report $\text{MAE}_{\text{nmf}} = \sum e^{\text{nmf}}_{ij} / N_{\text{masked}}$ and $\text{MAE}_{\text{mean}}$ aggregated across chunks.
-
-**Important caveat:** This CV uses the global $H^{(t)}$ which was jointly optimized with $W^{(t)}$ on these same SNPs. This measures the NMF convergence but does *not* evaluate the actual imputation pipeline used during GWAS testing (which uses the per-chunk NLS estimate, see §9).
+**Important caveat:** This CV uses the global $H^{(t)}$ which was jointly optimized with $W^{(t)}$ on these same SNPs. It is an *in-sample* convergence diagnostic and does *not* evaluate the actual imputation pipeline used during GWAS testing (which uses the per-chunk NLS estimate, see §9). The GWAS-phase CV (§9) is the honest accuracy estimate.
 
 ---
 
@@ -252,7 +270,7 @@ For each iteration:
 
 5. QR decompose the accumulated $Z$ to update $Q_z$.
 
-This alternation sharpens the approximation of the left singular subspace, improving by a factor of $(\sigma_{K+1}/\sigma_K)^{2 n_{\text{power}}}$ per iteration.
+This alternation sharpens the approximation of the left singular subspace: each power iteration contracts the subspace error by a factor of roughly $(\sigma_{K+1}/\sigma_K)^2$, giving a total contraction of $(\sigma_{K+1}/\sigma_K)^{2 n_{\text{power}}}$ after $n_{\text{power}}$ iterations.
 
 **Step 2: Project and Recover**
 
@@ -314,6 +332,12 @@ $$
 $$
 
 The betas are written directly to disk as chunk fragments; no $p$-dimensional array is held in RAM.
+
+### 6.3 Remark: relation to the paper's Eq. 4 and to the Step-4 test statistic
+
+The paper defines $\hat{B}^T = (X^T X + \lambda I)^{-1} X^T (Y - \hat{W})$ with $\hat{W} = \hat{U}\hat{V}^T$ the rank-$K$ reconstruction of $Y$. We instead project out the whole estimated latent subspace via $(I - P_U)Y$. The two agree when $\hat{V}^T$ equals the OLS fit of $Y$ onto the columns of $\hat{U}$, which holds approximately when the rank-$K$ SVD captures the latent signal well: $(I - P_U)Y$ removes *every* component of $Y$ lying in $\operatorname{col}(\hat{U})$, whereas $Y - \hat{W}$ removes only the fitted rank-$K$ component.
+
+Note also that the Step-3 effect sizes $\hat{\beta}_j$ and the Step-4 t-statistics (§7) arise from **different estimators**: Step 3 is ridge regression of $(I - P_U) y_j$ on $X$ alone, whereas Step 4 is joint OLS of $y_j$ on $[\mathbf{1} \; X \; U_{\text{hat}}]$. The two coincide when $X \perp U_{\text{hat}}$ and $\lambda \to 0$, but not in general — in particular not when covariates correlate with population structure, which is precisely the setting LFMM addresses. Consequently the reported `beta` column does not exactly satisfy $t = \beta / \mathrm{SE}(\beta)$: the t-statistic derives from the Step-4 joint fit. (The LEA reference has the same split: effect sizes from the ridge-residualised fit, z-scores from a per-locus `lm`.)
 
 ---
 
@@ -387,17 +411,22 @@ where $F_{t_{\text{df}}}$ is the CDF. Zero-variance (monomorphic) SNPs yield $t 
 
 ### 7.5 Variance Decomposition
 
-The total sum of squares for SNP $j$ is partitioned into three components:
+The total sum of squares for SNP $j$ is partitioned by a **sequential (Type-I) decomposition** with term order $[\mathbf{1}, X, U_{\text{hat}}]$:
 
 $$
 \text{TSS}_j = \|y_j\|^2 = \text{SS}_{\text{cov}}(j) + \text{SS}_{\text{latent}}(j) + \text{RSS}_j
 $$
 
-where
+where, writing $H_X = X (X^T X)^{-1} X^T$ for the orthogonal projector onto $\operatorname{col}(X)$ (since $X$ is centered, $H_X y_j$ is exactly the OLS fit of $y_j$ on $[\mathbf{1} \; X]$),
 
-$$\text{SS}_{\text{cov}}(j) = \|X \hat{\beta}_j\|^2, \quad \text{SS}_{\text{latent}}(j) = \|C \hat{\theta}_j - \mathbf{1}\hat{\alpha}_j - X\hat{\beta}_j\|^2$$
+$$
+\text{SS}_{\text{cov}}(j) = \|H_X y_j\|^2, \qquad
+\text{SS}_{\text{latent}}(j) = \|C \hat{\theta}_j\|^2 - \|H_X y_j\|^2 = \text{TSS}_j - \text{RSS}_j - \text{SS}_{\text{cov}}(j)
+$$
 
-and the $R^2$ fractions are $r^2_{\text{cov}} = \text{SS}_{\text{cov}} / \text{TSS}$, etc. These are reported per-SNP in the output.
+and the $R^2$ fractions are $r^2_{\text{cov}} = \text{SS}_{\text{cov}} / \text{TSS}$, etc. The identity is **exact** (up to floating-point error): because $H_X y_j \in \operatorname{col}(C)$ and the OLS residual $\hat{\varepsilon}_j$ is orthogonal to $\operatorname{col}(C)$, the fitted vector decomposes orthogonally as $\|C\hat{\theta}_j\|^2 = \|H_X y_j\|^2 + \|C\hat{\theta}_j - H_X y_j\|^2$, so the three reported fractions sum to 1. Monomorphic SNPs ($\text{TSS} \approx 0$) report all zeros.
+
+**Ordering caveat:** as with any sequential decomposition, variance jointly explainable by $X$ and $U_{\text{hat}}$ is attributed to $X$, the term entering first. $r^2_{\text{cov}}$ is thus the *marginal* variance explained by the covariates (ignoring the latent factors), while $r^2_{\text{latent}}$ is the *additional* variance explained by the latent factors beyond the covariates. These are reported per-SNP in the output.
 
 ---
 
@@ -423,7 +452,7 @@ For each chunk $c$ of $Y_{\text{full}}$, with $W \in \mathbb{R}^{n \times K}$ fi
 
 - **Pass 2:** Re-decode from raw bytes. For each SNP column, NaN entries are filled with the corresponding $\hat{Y}_{ij}$ values **before** centering and normalization. Then standard centering (± Eigenstrat scaling) is applied.
 
-This means genotypes imputed via NMF participate in the centering mean computation (the column mean is computed over all entries including NMF-filled ones). The fill values are on the raw genotype scale $\{0, 1, 2\}$.
+This means genotypes imputed via NMF participate in the centering mean computation (the column mean is computed over all entries including NMF-filled ones). The fill values are on the raw genotype scale $\{0, 1, 2\}$ — the same scale on which the NMF was trained (§4), so training and application are consistent.
 
 ---
 
@@ -482,13 +511,13 @@ A streaming histogram over $t^2 \in [0, 100]$ with bin width $0.001$ (100,000 bi
 
 ### 10.2 GIF Computation
 
-Under the null hypothesis and proper calibration, each $t^2$ follows approximately a scaled $\chi^2_1$ distribution. The median of a $\chi^2_1$ distribution is approximately $0.4549$. The GIF for trait $m$ is:
+Under the null hypothesis and proper calibration, each $t^2$ follows approximately a scaled $\chi^2_1$ distribution. The median of a $\chi^2_1$ distribution is approximately $0.4549$. The raw GIF estimate for trait $m$ is:
 
 $$
-\text{GIF}_m = \frac{\text{median}(t^2_m)}{0.4549}
+\text{GIF}^{\text{raw}}_m = \frac{\text{median}(t^2_m)}{0.4549}
 $$
 
-with $\text{GIF}_m$ clamped to a minimum of 1.0. The average GIF across all $d$ traits is $\overline{\text{GIF}} = \frac{1}{d} \sum_{m=1}^d \text{GIF}_m$.
+For calibration, the divisor is clamped to a minimum of 1.0: $\text{GIF}_m = \max(\text{GIF}^{\text{raw}}_m, 1)$, since dividing by $\sqrt{\text{GIF}} < 1$ would inflate $|z|$ and make the calibration anti-conservative. The average of the *unclamped* estimates, $\overline{\text{GIF}}^{\text{raw}} = \frac{1}{d} \sum_{m=1}^d \text{GIF}^{\text{raw}}_m$, is reported in the summary output as a diagnostic (deflation below 1 is itself informative about model fit).
 
 ### 10.3 GIF Calibration of p-values
 
@@ -503,6 +532,8 @@ p^{\text{cal}}_{j,m} = 2 \cdot \Phi(-|z_{j,m}|)
 $$
 
 where $\Phi$ is the standard normal CDF. This is equivalent to dividing the test statistic by the GIF estimate to correct for inflation.
+
+**Reporting note.** The output's `p_*` columns are these GIF-calibrated p-values, while the `t_*` columns are the raw (uncalibrated) t-statistics of §7.4. Hence $p \ne 2\, F_{t_{\text{df}}}(-|t|)$ for the printed values whenever $\text{GIF}_m > 1$; the uncalibrated p-value can be recovered from the printed $t$ directly. The `beta_*` columns are the Step-3 ridge effect sizes — see the §6.3 remark for why they need not satisfy $t = \beta/\mathrm{SE}$ exactly.
 
 ---
 
@@ -560,8 +591,8 @@ All passes over genotype data are fully streaming: at any point, only one chunk 
 
 | Phase | Strategy | Method |
 |-------|----------|--------|
-| NMF training (estimation subset) | `NmfInRam` | $W H_c$ with precomputed $H$ |
+| NMF training (estimation subset) | `NmfRawInRam` | $W H_c$ raw-scale fills with precomputed $H$ (EM-like, refreshed per pass) |
 | RSVD (estimation subset) | `NmfInRam` or `Mean` | Same; NMF fill if enabled |
 | GWAS testing (all SNPs) | `NmfOnTheFly` or `Mean` | $H_c = \max(0, W^{\dagger} Y_c)$, then $W H_c$ fill |
-| NMF CV (estimation subset) | $W H_c$ direct | Compares centered $W H$ vs centered truth |
+| NMF CV (estimation subset) | $W H_c$ direct | Compares raw-scale $W H$ vs raw truth (paired with column-mean baseline) |
 | GWAS CV (all SNPs) | `NmfOnTheFly` with LOO mask | Compares $W H_c^{\text{cv}}$ vs raw truth on held-out positions |

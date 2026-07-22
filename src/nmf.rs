@@ -7,7 +7,7 @@ use rand_distr::Distribution;
 use std::sync::Mutex;
 
 use crate::bed::{BedFile, SnpNorm, SubsetSpec};
-use crate::parallel::{parallel_stream, ImputeConfig};
+use crate::parallel::{parallel_stream, ImputeConfig, PerWorkerAccumulator};
 use crate::progress::make_progress_bar;
 
 /// Configuration for Non-negative Matrix Factorisation imputation.
@@ -15,7 +15,8 @@ use crate::progress::make_progress_bar;
 pub struct NmfConfig {
     /// Number of NMF components (default = LFMM2 K).
     pub k: usize,
-    /// Multiplicative update iterations (default: 3).
+    /// Multiplicative update iterations (default: 10). Multiplicative NMF
+    /// converges slowly; watch the per-iteration CV MAE for convergence.
     pub n_iter: usize,
     /// Small constant for numerical stability in denominators.
     pub eps: f64,
@@ -27,8 +28,6 @@ pub struct NmfConfig {
     pub chunk_size: usize,
     /// Number of worker threads.
     pub n_workers: usize,
-    /// SNP normalization mode (passed through to decode).
-    pub norm: SnpNorm,
     /// Show progress bars.
     pub progress: bool,
     /// Base RNG seed; iteration t uses seed + t for masking.
@@ -39,12 +38,11 @@ impl Default for NmfConfig {
     fn default() -> Self {
         NmfConfig {
             k: 5,
-            n_iter: 3,
+            n_iter: 10,
             eps: 1e-16,
             cv_rate: 0.0005,
             chunk_size: 10_000,
             n_workers: 0,
-            norm: SnpNorm::CenterOnly,
             progress: false,
             seed: 42,
         }
@@ -58,10 +56,10 @@ pub struct NmfEstResult {
     /// SNP factor matrix: K x p_est, non-negative, held in RAM.
     pub h_full: Array2<f64>,
     /// Per-iteration cross-validation MAE (mean absolute error on masked
-    /// genotypes). Length = n_iter.
+    /// genotypes, raw dosage scale {0,1,2}). Length = n_iter.
     pub cv_mae_per_iter: Vec<f64>,
     /// Mean-imputation MAE computed on the same mask as the final NMF
-    /// iteration, for direct comparison.
+    /// iteration (paired comparison), raw dosage scale.
     pub cv_mae_mean_impute: f64,
     /// Total number of masked positions across all iterations.
     pub total_mask_count: u64,
@@ -69,10 +67,16 @@ pub struct NmfEstResult {
 
 /// Perform NMF on the estimation subset, producing W and H_est.
 ///
-/// Uses streaming multiplicative updates over the BedFile subset.
-/// Missing genotypes are filled with the current W @ H reconstruction
-/// before each update (EM-like approach). A small random fraction of
-/// observed genotypes is held out per iteration to compute CV error.
+/// The factorisation is trained on RAW dosages {0,1,2}: these are naturally
+/// non-negative (required for the Lee-Seung multiplicative updates) and match
+/// the scale on which W and H are later applied — on-the-fly imputation fills
+/// are inserted as raw dosages before centering (see notes §8).
+///
+/// Uses streaming multiplicative updates over the BedFile subset. Missing
+/// genotypes are filled with the CURRENT W @ H reconstruction, rebuilt before
+/// every pass (EM-like E-step). A small random fraction of observed genotypes
+/// is held out per iteration to compute a cross-validation error on the raw
+/// scale, paired against the mean-imputation baseline on the same mask.
 pub fn nmf_impute_estimation(
     bed: &BedFile,
     subset: &SubsetSpec,
@@ -98,21 +102,26 @@ pub fn nmf_impute_estimation(
     normalize_w(&mut w, &mut h_full, config.eps);
 
     let mut cv_mae_per_iter = Vec::with_capacity(config.n_iter);
+    let mut cv_mae_mean_impute = 0.0;
     let mut total_mask_count = 0u64;
-
-    // Build the ImputeConfig for NMF decoding during iterations.
-    // This uses NmfInRam so that decode fills NaN with W @ H_chunk values.
-    let impute_nmf = ImputeConfig::NmfInRam {
-        w: w.clone(),
-        h_full: h_full.clone(),
-    };
 
     for iter in 0..config.n_iter {
         let mask_seed = config.seed + iter as u64;
 
+        // EM-like E-step: missing genotypes are filled with the CURRENT
+        // reconstruction W @ H, rebuilt before every pass. The fill config
+        // owns cloned arrays, so it is reconstructed each pass.
+        let impute_fwd = ImputeConfig::NmfRawInRam {
+            w: w.clone(),
+            h_full: h_full.clone(),
+        };
+
         // --- Forward pass: update W ---
-        let num_w = Mutex::new(Array2::<f64>::zeros((n, k)));
-        let hh_acc = Mutex::new(Array2::<f64>::zeros((k, k)));
+        // Per-worker accumulators: the floating-point reduction order is fixed
+        // regardless of worker scheduling, so results are bitwise reproducible.
+        let n_w = config.n_workers.max(1);
+        let num_w_acc = PerWorkerAccumulator::new(n_w, (n, k));
+        let hh_acc = PerWorkerAccumulator::new(n_w, (k, k));
 
         {
             let label = format!("NMF iter {}/{} (fwd)", iter + 1, config.n_iter);
@@ -120,8 +129,8 @@ pub fn nmf_impute_estimation(
 
             parallel_stream(
                 bed, subset, config.chunk_size, config.n_workers,
-                config.norm, impute_nmf.clone(),
-                |_worker_id, block| {
+                SnpNorm::CenterOnly, impute_fwd.clone(), // ignored by raw decode
+                |worker_id, block| {
                     let chunk = block.data.slice(s![.., ..block.n_cols]);
                     let chunk_cols = block.n_cols;
 
@@ -130,11 +139,11 @@ pub fn nmf_impute_estimation(
 
                     // numerator_W = Y_chunk @ H_chunk^T  (n x K)
                     let num_partial = chunk.dot(&h_chunk.t());
-                    num_w.lock().unwrap().scaled_add(1.0, &num_partial);
+                    *num_w_acc.get_mut(worker_id) += &num_partial;
 
                     // H_chunk @ H_chunk^T  (K x K)
                     let hh_partial = h_chunk.dot(&h_chunk.t());
-                    *hh_acc.lock().unwrap() += &hh_partial;
+                    *hh_acc.get_mut(worker_id) += &hh_partial;
 
                     pb.inc(1);
                 },
@@ -143,8 +152,8 @@ pub fn nmf_impute_estimation(
         }
 
         // Update W = W ⊙ num_W ⊘ (W @ HH + ε)
-        let num_w = num_w.into_inner().unwrap();
-        let hh_sum = hh_acc.into_inner().unwrap();
+        let num_w = num_w_acc.sum();
+        let hh_sum = hh_acc.sum();
         let denom_w = w.dot(&hh_sum);
         let eps = config.eps;
 
@@ -163,6 +172,13 @@ pub fn nmf_impute_estimation(
         let wt_w = w.t().dot(&w);
         let p_snps = h_full.ncols();
 
+        // Rebuild the fill config with the updated W (and current H) so the
+        // backward pass also imputes from the current reconstruction.
+        let impute_bwd = ImputeConfig::NmfRawInRam {
+            w: w.clone(),
+            h_full: h_full.clone(),
+        };
+
         {
             let label = format!("NMF iter {}/{} (bwd)", iter + 1, config.n_iter);
             let pb = make_progress_bar(n_chunks, &label, config.progress);
@@ -174,7 +190,7 @@ pub fn nmf_impute_estimation(
 
             parallel_stream(
                 bed, subset, config.chunk_size, config.n_workers,
-                config.norm, impute_nmf.clone(),
+                SnpNorm::CenterOnly, impute_bwd.clone(), // ignored by raw decode
                 |_worker_id, block| {
                     let chunk = block.data.slice(s![.., ..block.n_cols]);
                     let chunk_cols = block.n_cols;
@@ -207,29 +223,20 @@ pub fn nmf_impute_estimation(
         // Re-normalize W after backward pass
         normalize_w(&mut w, &mut h_full, eps);
 
-        // Compute CV error for this iteration
-        let (mae, count) = compute_cv_error_masked(
+        // Compute CV error for this iteration (raw scale, paired mask)
+        let (mae, mean_mae, count) = compute_cv_error_masked(
             bed, subset, &w, &h_full, mask_seed, config,
         )?;
         cv_mae_per_iter.push(mae);
+        cv_mae_mean_impute = mean_mae;
         total_mask_count += count;
 
         if config.progress {
             eprintln!(
-                "  NMF iter {}: cv_mae = {:.6} (n_masked = {})",
-                iter + 1, mae, count,
+                "  NMF iter {}: cv_mae = {:.6} (mean-impute = {:.6}, n_masked = {})",
+                iter + 1, mae, mean_mae, count,
             );
         }
-    }
-
-    // Compute mean imputation CV error for comparison
-    let cv_mae_mean_impute = compute_mean_impute_cv(bed, subset, config)?;
-
-    if config.progress {
-        eprintln!(
-            "  Mean impute cv_mae = {:.6}",
-            cv_mae_mean_impute,
-        );
     }
 
     Ok(NmfEstResult {
@@ -263,11 +270,12 @@ fn normalize_w(w: &mut Array2<f64>, h: &mut Array2<f64>, eps: f64) {
     }
 }
 
-/// Initialize W and H via a random probe sketch.
+/// Initialize W and H via a random probe sketch on raw dosages.
 ///
 /// W_init = |Omega @ Vt[:K, :]^T| (absolute value of approximate left
-/// singular vectors). H_init = max(0, W_pinv @ Y) via one backward pass
-/// with mean imputation.
+/// singular vectors of the raw, mean-imputed genotype matrix).
+/// H_init = max(0, W_pinv @ Y) via one backward pass with mean imputation,
+/// also on the raw dosage scale.
 fn init_from_random_probe(
     bed: &BedFile,
     subset: &SubsetSpec,
@@ -293,8 +301,8 @@ fn init_from_random_probe(
 
         parallel_stream(
             bed, subset, chunk_size, config.n_workers,
-            config.norm,
-            ImputeConfig::Mean,
+            SnpNorm::CenterOnly, // ignored by raw decode
+            ImputeConfig::MeanRaw,
             |_worker_id, block| {
                 let chunk = block.data.slice(s![.., ..block.n_cols]);
                 let z_block = chunk.t().dot(&omega_ref);
@@ -334,8 +342,8 @@ fn init_from_random_probe(
 
         parallel_stream(
             bed, subset, chunk_size, config.n_workers,
-            config.norm,
-            ImputeConfig::Mean,
+            SnpNorm::CenterOnly, // ignored by raw decode
+            ImputeConfig::MeanRaw,
             |_worker_id, block| {
                 let chunk = block.data.slice(s![.., ..block.n_cols]);
                 let chunk_cols = block.n_cols;
@@ -353,11 +361,21 @@ fn init_from_random_probe(
     Ok((w_probe_abs, h_init))
 }
 
-/// Compute cross-validation error on masked genotypes using NMF reconstruction.
+/// Compute cross-validation error on masked genotypes, on the raw dosage
+/// scale {0,1,2}.
 ///
-/// Decodes centered genotype values, then masks a random subset and compares
-/// the NMF reconstruction W@H against the centered truth.
-/// Mean-imputation baseline: centered mean is 0, so error = |centered_val|.
+/// Decodes raw genotypes (no fill, no centering), masks a random subset of
+/// observed positions, and compares on the same masked positions:
+///   - NMF reconstruction error: |g - (W H)_ij|
+///   - Mean-imputation baseline: |g - col_mean_j| (mean over observed entries)
+///
+/// Returns (nmf_mae, mean_impute_mae, n_masked).
+///
+/// Note: H was trained on these same SNPs, so this is an in-sample
+/// convergence diagnostic rather than an honest imputation-accuracy estimate
+/// (the GWAS-phase CV measures the deployed on-the-fly pipeline). The paired
+/// mask makes the NMF-vs-mean comparison unbiased, and the raw scale matches
+/// the scale on which the factorisation is applied.
 fn compute_cv_error_masked(
     bed: &BedFile,
     subset: &SubsetSpec,
@@ -365,7 +383,7 @@ fn compute_cv_error_masked(
     h_full: &Array2<f64>,
     mask_seed: u64,
     config: &NmfConfig,
-) -> Result<(f64, u64)> {
+) -> Result<(f64, f64, u64)> {
     let n_output = bed.n_samples;
     let chunk_size = config.chunk_size;
     let cv_rate = config.cv_rate;
@@ -375,20 +393,36 @@ fn compute_cv_error_masked(
     let n_physical = bed.n_physical_samples;
     let sample_keep = bed.sample_keep.as_deref();
 
-    let mut total_err = 0.0f64;
+    let mut nmf_err = 0.0f64;
+    let mut mean_err = 0.0f64;
     let mut total_cnt = 0u64;
 
     for (chunk_seq, chunk_indices) in indices.chunks(chunk_size).enumerate() {
         let n_cols = chunk_indices.len();
 
-        // Decode centered values (mean imputation, no NMF fill)
-        let mut y_centered = Array2::<f64>::zeros((n_output, n_cols));
+        // Decode raw genotypes {0,1,2,NaN}: no fill, no centering
+        let mut y_raw = Array2::<f64>::zeros((n_output, n_cols));
         {
-            let out_view = y_centered.view_mut();
-            crate::bed::decode_bed_chunk_into(
+            let out_view = y_raw.view_mut();
+            crate::bed::decode_raw_bed_chunk_into(
                 &bed.mmap[3..], bps, n_physical, chunk_indices,
-                out_view, config.norm, sample_keep, None,
+                out_view, sample_keep,
             );
+        }
+
+        // Column means over observed entries (mean-imputation baseline)
+        let mut col_mean = vec![0.0f64; n_cols];
+        for col in 0..n_cols {
+            let mut sum = 0.0;
+            let mut n_obs = 0u32;
+            for row in 0..n_output {
+                let v = y_raw[(row, col)];
+                if !v.is_nan() {
+                    sum += v;
+                    n_obs += 1;
+                }
+            }
+            col_mean[col] = if n_obs > 0 { sum / n_obs as f64 } else { 0.0 };
         }
 
         let start = chunk_seq * chunk_size;
@@ -403,79 +437,21 @@ fn compute_cv_error_masked(
             for row in 0..n_output {
                 let r: f64 = unif_dist.sample(&mut mask_rng);
                 if r < cv_rate {
-                    let val = y_centered[(row, col)];
+                    let val = y_raw[(row, col)];
                     if val.is_nan() {
                         continue;
                     }
-                    // val is centered true genotype; recon is NMF's centered prediction
-                    // Mean-impute baseline would be 0 (centered mean), so NMF beats it when |val - recon| < |val|
-                    total_err += (val - recon[(row, col)]).abs();
+                    nmf_err += (val - recon[(row, col)]).abs();
+                    mean_err += (val - col_mean[col]).abs();
                     total_cnt += 1;
                 }
             }
         }
     }
 
-    let mae = if total_cnt > 0 { total_err / total_cnt as f64 } else { 0.0 };
-    Ok((mae, total_cnt))
-}
-
-/// Compute mean-imputation cross-validation error on centered data.
-///
-/// Mean imputation gives 0 after centering, so the error on each masked
-/// position is |centered_val|.
-fn compute_mean_impute_cv(
-    bed: &BedFile,
-    subset: &SubsetSpec,
-    config: &NmfConfig,
-) -> Result<f64> {
-    let cv_rate = config.cv_rate;
-    let chunk_size = config.chunk_size;
-    let n_output = bed.n_samples;
-
-    let indices = crate::parallel::subset_indices(subset, bed.n_snps);
-    let bps = bed.bytes_per_snp();
-    let n_physical = bed.n_physical_samples;
-    let sample_keep = bed.sample_keep.as_deref();
-
-    let mut total_err = 0.0f64;
-    let mut total_cnt = 0u64;
-
-    let cv_seed = config.seed.wrapping_add(999_999);
-
-    for (chunk_seq, chunk_indices) in indices.chunks(chunk_size).enumerate() {
-        let n_cols = chunk_indices.len();
-
-        // Decode centered values
-        let mut y_centered = Array2::<f64>::zeros((n_output, n_cols));
-        {
-            let out_view = y_centered.view_mut();
-            crate::bed::decode_bed_chunk_into(
-                &bed.mmap[3..], bps, n_physical, chunk_indices,
-                out_view, config.norm, sample_keep, None,
-            );
-        }
-
-        let mut mask_rng = ChaCha8Rng::seed_from_u64(cv_seed + chunk_seq as u64);
-        let unif_dist = rand_distr::Uniform::new(0.0f64, 1.0);
-
-        for col in 0..n_cols {
-            for row in 0..n_output {
-                let r: f64 = unif_dist.sample(&mut mask_rng);
-                if r < cv_rate {
-                    let val = y_centered[(row, col)];
-                    if val.is_nan() {
-                        continue;
-                    }
-                    // Mean imputation → 0 after centering, error = |val|
-                    total_err += val.abs();
-                    total_cnt += 1;
-                }
-            }
-        }
-    }
-
-    Ok(if total_cnt > 0 { total_err / total_cnt as f64 } else { 0.0 })
+    let nmf_mae = if total_cnt > 0 { nmf_err / total_cnt as f64 } else { 0.0 };
+    let mean_mae = if total_cnt > 0 { mean_err / total_cnt as f64 } else { 0.0 };
+    Ok((nmf_mae, mean_mae, total_cnt))
 }
 
 #[cfg(test)]

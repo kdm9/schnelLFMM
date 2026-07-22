@@ -34,7 +34,8 @@ pub struct OutputConfig<'a> {
 pub struct TestResults {
     /// Estimated latent factors: n × K
     pub u_hat: Array2<f64>,
-    /// Genomic inflation factor
+    /// Genomic inflation factor: average of the *unclamped* per-trait estimates
+    /// (diagnostic). P-value calibration uses per-trait GIFs clamped to >= 1.0.
     pub gif: f64,
     /// NMF cross-validation MAE per iteration (only when NMF imputation is used).
     pub nmf_cv: Option<Vec<f64>>,
@@ -102,25 +103,31 @@ impl TsqHistogram {
     }
 
     /// Compute per-trait GIF from the histogram medians.
-    /// Returns (gif_per_trait, avg_gif).
+    /// Returns (gif_per_trait, avg_gif_raw):
+    ///
+    /// - `gif_per_trait`: clamped to a minimum of 1.0, used for p-value
+    ///   calibration. Deflation (GIF < 1) would make calibration
+    ///   anti-conservative (dividing t by sqrt(GIF) < 1 inflates |z|).
+    /// - `avg_gif_raw`: average of the *unclamped* per-trait estimates,
+    ///   reported as a diagnostic (deflation is itself informative).
     fn compute_gif(&self) -> (Vec<f64>, f64) {
         let d = self.counts.len();
         let mut gif_per_trait = Vec::with_capacity(d);
-        let mut total_gif = 0.0;
+        let mut total_gif_raw = 0.0;
 
         for j in 0..d {
             let median_t_sq = self.median_for_trait(j);
-            let gif = if median_t_sq < 1e-10 {
+            let gif_raw = if median_t_sq < 1e-10 {
                 1.0
             } else {
                 median_t_sq / 0.4549
             };
-            gif_per_trait.push(gif);
-            total_gif += gif;
+            gif_per_trait.push(gif_raw.max(1.0));
+            total_gif_raw += gif_raw;
         }
 
-        let avg_gif = total_gif / d as f64;
-        (gif_per_trait, avg_gif)
+        let avg_gif_raw = total_gif_raw / d as f64;
+        (gif_per_trait, avg_gif_raw)
     }
 
     /// Walk bins to find the median for a given trait.
@@ -217,7 +224,7 @@ pub fn test_associations_fused(
     let df = (n - 1 - d - k) as f64;
 
     let timer = Timer::new("OLS hat");
-    let (i_minus_pu, xtr, c, ctc_inv, h) = crate::with_multithreaded_blas(config.n_workers, || -> Result<_> {
+    let (i_minus_pu, xtr, c, ctc_inv, h, hx) = crate::with_multithreaded_blas(config.n_workers, || -> Result<_> {
         // Precompute P_U = U_hat (U^T U)^{-1} U^T (n × n).
         let utu = u_hat.t().dot(u_hat);
         let utu_inv = safe_inv(&utu, "U_hat^T U_hat")?;
@@ -245,7 +252,14 @@ pub fn test_associations_fused(
         // H = (C^T C)^{-1} C^T - the OLS hat matrix for coefficient estimation
         let h = ctc_inv.dot(&c.t());
 
-        Ok((i_minus_pu, xtr, c, ctc_inv, h))
+        // H_X = X (X^T X)^{-1} X^T (n × n): projector onto col(X), used for the
+        // sequential (Type-I) variance decomposition. X is centered, so
+        // col(X) ⊥ 1 and H_X y is exactly the OLS fit of y on [1 | X].
+        let xtx = x.t().dot(x);
+        let xtx_inv = safe_inv(&xtx, "X^T X for sequential R^2")?;
+        let hx = x.dot(&xtx_inv).dot(&x.t());
+
+        Ok((i_minus_pu, xtr, c, ctc_inv, h, hx))
     })?;
     timer.finish();
 
@@ -292,11 +306,12 @@ pub fn test_associations_fused(
             let fitted = c.dot(&coefs); // n × chunk_cols
             let residuals = &chunk - &fitted; // n × chunk_cols
 
-            // Variance decomposition: split fitted into covariate and latent parts.
-            // Covariate coefficients are at indices 1..1+d (index 0 is intercept).
-            let coefs_x = coefs.slice(ndarray::s![1..1 + d, ..]);
-            let fitted_x = x.dot(&coefs_x); // n × chunk_cols
-            // fitted_u = fitted - fitted_x - intercept (avoids a second matmul)
+            // Sequential (Type-I) variance decomposition with order [1, X, U]:
+            // fitted_x is the OLS fit of each y_j on [1 | X] alone. Since
+            // col(fitted_x) ⊆ col(C) and residuals ⊥ col(C), the exact identity
+            //   TSS = SS_cov + SS_latent + RSS
+            // holds, with SS_cov = ||fitted_x||², SS_latent = ||fitted||² - ||fitted_x||².
+            let fitted_x = hx.dot(&chunk); // n × chunk_cols
 
             let mut local_tstats = Array2::<f64>::zeros((chunk_cols, d));
             let mut local_r2_cov = vec![0.0f64; chunk_cols];
@@ -314,14 +329,14 @@ pub fn test_associations_fused(
                     local_tstats[(col_in_chunk, j)] = t;
                 }
 
-                // Variance decomposition
+                // Variance decomposition (exact partition of TSS)
                 let tss: f64 = y_col.dot(&y_col);
                 if tss > 1e-300 {
                     let fx_col = fitted_x.column(col_in_chunk);
                     let ss_cov: f64 = fx_col.dot(&fx_col);
-                    // fitted_u = fitted - fitted_x for this column
-                    let fu_col = &fitted.column(col_in_chunk) - &fx_col;
-                    let ss_latent: f64 = fu_col.dot(&fu_col);
+                    // SS_latent = ||fitted||² - ||fitted_x||² = (TSS - RSS) - SS_cov.
+                    // Clamp tiny negative values from floating-point error.
+                    let ss_latent: f64 = (tss - rss - ss_cov).max(0.0);
                     local_r2_cov[col_in_chunk] = ss_cov / tss;
                     local_r2_latent[col_in_chunk] = ss_latent / tss;
                     local_r2_resid[col_in_chunk] = rss / tss;

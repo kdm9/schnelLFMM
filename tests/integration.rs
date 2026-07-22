@@ -4,7 +4,7 @@ use schnellfmm::simulate::{
     simulate, write_covariates, write_ground_truth, write_latent_u, write_lfmm_format,
     write_plink, write_r_comparison_script, SimConfig,
 };
-use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, OutputConfig, SnpNorm};
+use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, NmfConfig, OutputConfig, SnpNorm};
 use ndarray::Array2;
 use ndarray_linalg::SVD;
 use std::fs;
@@ -2351,4 +2351,231 @@ fn test_variance_decomposition_with_noise() {
         "Adding random noise should decrease r2_latent: original={:.4}, noisy={:.4}",
         mean_latent_orig, mean_latent_noisy,
     );
+}
+
+/// Mask a fraction of genotypes as missing (255 sentinel → PLINK 0b01).
+fn mask_genotypes(sim: &schnellfmm::simulate::SimData, miss_rate: f64, seed: u64) -> schnellfmm::simulate::SimData {
+    use rand::prelude::*;
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+    let mut masked = sim.genotypes.clone();
+    let mut n_masked = 0u64;
+    for v in masked.iter_mut() {
+        if rng.gen::<f64>() < miss_rate {
+            *v = 255;
+            n_masked += 1;
+        }
+    }
+    eprintln!(
+        "Masked {} / {} genotypes as missing ({:.1}%)",
+        n_masked,
+        sim.genotypes.len(),
+        100.0 * n_masked as f64 / sim.genotypes.len() as f64,
+    );
+    schnellfmm::simulate::SimData {
+        genotypes: masked,
+        x: sim.x.clone(),
+        u_true: sim.u_true.clone(),
+        b_true: sim.b_true.clone(),
+        causal_indices: sim.causal_indices.clone(),
+        allele_freqs: sim.allele_freqs.clone(),
+    }
+}
+
+fn nmf_test_config(k: usize, n_iter: usize, n_workers: usize) -> Lfmm2Config {
+    Lfmm2Config {
+        k,
+        lambda: 1e-5,
+        chunk_size: 2_000,
+        oversampling: 10,
+        n_power_iter: 2,
+        seed: 42,
+        n_workers,
+        progress: false,
+        norm: SnpNorm::Eigenstrat,
+        scale_cov: false,
+        impute: ImputeStrategy::Nmf,
+        nmf: Some(NmfConfig {
+            k,
+            n_iter,
+            eps: 1e-16,
+            cv_rate: 0.005,
+            chunk_size: 2_000,
+            n_workers,
+            progress: false,
+            seed: 42,
+        }),
+    }
+}
+
+/// End-to-end test of the NMF imputation path on simulated data with
+/// population structure and MCAR-missing genotypes.
+///
+/// Validates the redesigned raw-dosage NMF:
+/// - the pipeline runs with ImputeStrategy::Nmf and produces valid output
+/// - training-phase CV MAE (raw scale, paired mask) beats the mean-imputation
+///   baseline by the final iteration
+/// - the honest GWAS-phase CV (the actual on-the-fly estimator, evaluated on
+///   held-out raw genotypes) beats mean imputation
+///
+/// Note: LEA cross-comparison (run_lea_comparison.R) intentionally uses
+/// ImputeStrategy::Mean — LEA's lfmm2 does not accept missing genotypes.
+#[test]
+fn test_nmf_imputation_end_to_end() {
+    let sim_config = SimConfig {
+        n_samples: 200,
+        n_snps: 10_000,
+        n_causal: 20,
+        k: 3,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.5,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 424242,
+    };
+
+    let sim = simulate(&sim_config);
+    let sim_miss = mask_genotypes(&sim, 0.05, 777);
+
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim_miss).unwrap();
+    let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+
+    let n_iter = 8;
+    let config = nmf_test_config(3, n_iter, 2);
+
+    let d = sim.x.ncols();
+    let cov_names = default_cov_names(d);
+    let out_path = dir.path().join("results.tsv");
+    let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
+
+    // NMF training-phase CV: one value per iteration, all finite and non-negative
+    let nmf_cv = results.nmf_cv.as_ref().expect("nmf_cv missing");
+    assert_eq!(nmf_cv.len(), n_iter, "expected {} CV values", n_iter);
+    for (i, &mae) in nmf_cv.iter().enumerate() {
+        assert!(mae.is_finite() && mae >= 0.0, "nmf_cv[{}] invalid: {}", i, mae);
+    }
+    let mean_cv = results.nmf_cv_mean.expect("nmf_cv_mean missing");
+    eprintln!("NMF train CV per iter: {:?}", nmf_cv);
+    eprintln!("Mean-impute train CV (paired): {:.6}", mean_cv);
+
+    // By the final iteration, NMF must beat mean imputation (paired, same mask)
+    let final_mae = *nmf_cv.last().unwrap();
+    assert!(
+        final_mae < mean_cv,
+        "NMF train CV ({:.6}) should beat mean-impute baseline ({:.6})",
+        final_mae, mean_cv,
+    );
+
+    // Honest GWAS-phase CV: the deployed on-the-fly estimator must beat mean
+    // imputation on held-out raw genotypes
+    let gwas_mae = results.nmf_gwas_cv_mae.expect("nmf_gwas_cv_mae missing");
+    let gwas_mean = results.nmf_gwas_cv_mean_mae.expect("nmf_gwas_cv_mean_mae missing");
+    let gwas_count = results.nmf_gwas_cv_count.expect("nmf_gwas_cv_count missing");
+    eprintln!(
+        "GWAS-phase CV: nmf = {:.6}, mean = {:.6} (n = {})",
+        gwas_mae, gwas_mean, gwas_count,
+    );
+    assert!(gwas_count > 1_000, "too few GWAS CV positions: {}", gwas_count);
+    assert!(
+        gwas_mae < gwas_mean,
+        "GWAS NMF CV ({:.6}) should beat mean imputation ({:.6})",
+        gwas_mae, gwas_mean,
+    );
+
+    // Output validity: all SNPs present, p-values in [0,1], finite betas/t
+    let pr = read_results_tsv(&out_path);
+    assert_eq!(pr.p_values.len(), sim_config.n_snps);
+    for i in 0..sim_config.n_snps {
+        for j in 0..d {
+            let pv = pr.p_values[i][j];
+            assert!(pv >= 0.0 && pv <= 1.0, "p-value out of range at ({}, {}): {}", i, j, pv);
+            assert!(pr.effect_sizes[i][j].is_finite(), "beta not finite at ({}, {})", i, j);
+            assert!(pr.t_stats[i][j].is_finite(), "t not finite at ({}, {})", i, j);
+        }
+    }
+
+    // Latent factors finite, GIF sane
+    for v in results.u_hat.iter() {
+        assert!(v.is_finite(), "non-finite U_hat entry");
+    }
+    eprintln!("GIF: {:.4}", results.gif);
+    assert!(results.gif > 0.5 && results.gif < 2.0, "GIF out of range: {:.4}", results.gif);
+
+    // Association signal should survive imputation: causal SNPs enriched for
+    // small p-values relative to null SNPs
+    let p = sim_config.n_snps;
+    let causal_mean_neglog: f64 = sim.causal_indices.iter()
+        .map(|&i| -pr.p_values[i][0].max(1e-300).log10())
+        .sum::<f64>() / sim.causal_indices.len() as f64;
+    let null_count = p - sim.causal_indices.len();
+    let null_mean_neglog: f64 = (0..p)
+        .filter(|i| !sim.causal_indices.contains(i))
+        .map(|i| -pr.p_values[i][0].max(1e-300).log10())
+        .sum::<f64>() / null_count as f64;
+    eprintln!(
+        "mean -log10(p): causal = {:.3}, null = {:.3}",
+        causal_mean_neglog, null_mean_neglog,
+    );
+    assert!(
+        causal_mean_neglog > null_mean_neglog,
+        "causal SNPs should be enriched for small p-values: {:.3} vs {:.3}",
+        causal_mean_neglog, null_mean_neglog,
+    );
+}
+
+/// The NMF path must be bitwise reproducible at fixed seed with multiple
+/// worker threads (per-worker accumulators give a fixed reduction order).
+#[test]
+fn test_nmf_determinism_multithreaded() {
+    let sim_config = SimConfig {
+        n_samples: 100,
+        n_snps: 3_000,
+        n_causal: 5,
+        k: 2,
+        d: 2,
+        effect_size: 1.0,
+        latent_scale: 1.0,
+        noise_std: 1.0,
+        covariate_r2: 0.3,
+        seed: 99,
+    };
+
+    let sim = simulate(&sim_config);
+    let sim_miss = mask_genotypes(&sim, 0.05, 555);
+    let d = sim.x.ncols();
+
+    let run = |tag: &str| -> (PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        write_plink(dir.path(), "sim", &sim_miss).unwrap();
+        let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+        let config = nmf_test_config(2, 4, 2);
+        let out_path = dir.path().join(format!("results_{}.tsv", tag));
+        let cov_names = default_cov_names(d);
+        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+        fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
+        (out_path, dir)
+    };
+
+    let (out1, _dir1) = run("a");
+    let (out2, _dir2) = run("b");
+
+    let p1 = read_results_tsv(&out1);
+    let p2 = read_results_tsv(&out2);
+    assert_eq!(p1.p_values.len(), p2.p_values.len());
+    for i in 0..p1.p_values.len() {
+        for j in 0..d {
+            assert!(
+                (p1.p_values[i][j] - p2.p_values[i][j]).abs() < 1e-15,
+                "p-value mismatch at ({}, {}): {} vs {}",
+                i, j, p1.p_values[i][j], p2.p_values[i][j],
+            );
+            assert!(
+                (p1.t_stats[i][j] - p2.t_stats[i][j]).abs() < 1e-12,
+                "t-stat mismatch at ({}, {}): {} vs {}",
+                i, j, p1.t_stats[i][j], p2.t_stats[i][j],
+            );
+        }
+    }
 }

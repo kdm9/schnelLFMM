@@ -34,6 +34,40 @@ pub enum ImputeConfig {
         w: Array2<f64>,
         w_pinv: Array2<f64>,
     },
+    /// Mean imputation on the raw dosage scale {0,1,2}: fill NaN with the
+    /// per-SNP mean over observed entries, with NO centering or scaling.
+    /// NMF training requires a non-negative target matrix.
+    MeanRaw,
+    /// NMF fill on the raw dosage scale: fill NaN with the current
+    /// reconstruction W @ H_chunk (raw scale), with NO centering or scaling.
+    /// Used for NMF training (the EM-like E-step).
+    NmfRawInRam {
+        w: Array2<f64>,
+        h_full: Array2<f64>,
+    },
+}
+
+/// Fill NaN entries of each column with the per-column mean over observed
+/// entries (columns with no observed entries get 0). Operates in place on
+/// the first `n_cols` columns of `data`.
+fn fill_missing_with_column_means(data: &mut Array2<f64>, n_cols: usize, n_rows: usize) {
+    for col in 0..n_cols {
+        let mut sum = 0.0;
+        let mut n_obs = 0u32;
+        for row in 0..n_rows {
+            let v = data[(row, col)];
+            if !v.is_nan() {
+                sum += v;
+                n_obs += 1;
+            }
+        }
+        let mean = if n_obs > 0 { sum / n_obs as f64 } else { 0.0 };
+        for row in 0..n_rows {
+            if data[(row, col)].is_nan() {
+                data[(row, col)] = mean;
+            }
+        }
+    }
 }
 
 /// Per-worker accumulator for forward passes that sum partial results.
@@ -226,23 +260,7 @@ pub fn parallel_stream<F>(
                                 );
                             }
                             // Fill NaN with column means
-                            for col in 0..n_cols {
-                                let mut sum = 0.0;
-                                let mut n_obs = 0u32;
-                                for row in 0..n_out {
-                                    let v = block.data[(row, col)];
-                                    if !v.is_nan() {
-                                        sum += v;
-                                        n_obs += 1;
-                                    }
-                                }
-                                let mean = if n_obs > 0 { sum / n_obs as f64 } else { 0.0 };
-                                for row in 0..n_out {
-                                    if block.data[(row, col)].is_nan() {
-                                        block.data[(row, col)] = mean;
-                                    }
-                                }
-                            }
+                            fill_missing_with_column_means(&mut block.data, n_cols, n_out);
                             // H_chunk = max(0, W_pinv @ Y_filled)
                             let y_view = block.data.slice(ndarray::s![.., ..n_cols]);
                             let h_chunk_raw = w_pinv.dot(&y_view);
@@ -261,6 +279,44 @@ pub fn parallel_stream<F>(
                                 sample_keep,
                                 Some(fill_values.view()),
                             );
+                        }
+                        ImputeConfig::MeanRaw => {
+                            // Raw decode → fill NaN with per-column mean.
+                            // No centering/scaling: NMF requires non-negative input.
+                            let out = block.data.slice_mut(ndarray::s![.., ..n_cols]);
+                            decode_raw_bed_chunk_into(
+                                &block.raw,
+                                bps,
+                                n_physical_samples,
+                                &local_indices[..n_cols],
+                                out,
+                                sample_keep,
+                            );
+                            fill_missing_with_column_means(&mut block.data, n_cols, n_out);
+                        }
+                        ImputeConfig::NmfRawInRam { w, h_full } => {
+                            // Raw decode → fill NaN with the current NMF
+                            // reconstruction W @ H_chunk (raw dosage scale).
+                            // No centering/scaling: NMF requires non-negative input.
+                            let out = block.data.slice_mut(ndarray::s![.., ..n_cols]);
+                            decode_raw_bed_chunk_into(
+                                &block.raw,
+                                bps,
+                                n_physical_samples,
+                                &local_indices[..n_cols],
+                                out,
+                                sample_keep,
+                            );
+                            let start = block.seq * chunk_size;
+                            let h_chunk = h_full.slice(ndarray::s![.., start..start + n_cols]);
+                            let fill_values = w.dot(&h_chunk);
+                            for col in 0..n_cols {
+                                for row in 0..n_out {
+                                    if block.data[(row, col)].is_nan() {
+                                        block.data[(row, col)] = fill_values[(row, col)];
+                                    }
+                                }
+                            }
                         }
                     }
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use ndarray::{Array1, Array2};
-use ndarray_linalg::{InverseInto, SVD};
+use ndarray_linalg::SVD;
 use crate::timer::Timer;
 
 /// Precomputed quantities from Step 0 of the LFMM2 algorithm.
@@ -70,12 +70,12 @@ pub fn precompute(x: &Array2<f64>, lambda: f64) -> Result<Precomputed> {
 
     // ridge_inv = (X^T X + λ I_d)^{-1}
     // Calcuate Xt X into mutable nxn, then add ridge to diag.
-    let mut xtx_ridge =  x.t().dot(x); 
+    let mut xtx_ridge =  x.t().dot(x);
     for j in 0..d {
         xtx_ridge[(j, j)] += lambda;
     }
-    // Finally matrix invert
-    let ridge_inv = xtx_ridge.inv_into()?;
+    // Finally matrix invert (with Tikhonov fallback if numerically singular)
+    let ridge_inv = crate::testing::safe_inv(&xtx_ridge, "X^T X + λI (ridge)")?;
     timer.finish();
 
     Ok(Precomputed {

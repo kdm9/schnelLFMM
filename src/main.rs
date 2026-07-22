@@ -92,8 +92,9 @@ struct Cli {
     #[arg(long)]
     nmf_k: Option<usize>,
 
-    /// NMF multiplicative update iterations (default: 3).
-    #[arg(long, default_value = "3")]
+    /// NMF multiplicative update iterations (default: 10). Monitor the
+    /// per-iteration CV MAE in the summary file to check convergence.
+    #[arg(long, default_value = "10")]
     nmf_iter: usize,
 
     /// Fraction of genotypes held out per NMF iteration for CV (default: 0.0005).
@@ -172,7 +173,6 @@ fn main() -> Result<()> {
     };
 
     let config_progress = std::io::stderr().is_terminal();
-    let config_norm = cli.norm;
     let config = Lfmm2Config {
         k: cli.k,
         lambda: cli.lambda,
@@ -198,7 +198,6 @@ fn main() -> Result<()> {
                 cv_rate: cli.nmf_cv_rate,
                 chunk_size: cli.chunk_size,
                 n_workers: cli.threads,
-                norm: config_norm,
                 progress: config_progress,
                 seed: cli.seed,
             })
