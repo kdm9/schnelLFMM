@@ -11,8 +11,8 @@ described in [Caye et al. (2019)](https://academic.oup.com/mbe/article/36/4/852/
 and implemented in the [LEA R package
 ](https://bioconductor.org/packages//release/bioc/html/LEA.html). This tool is
 a reimplementation of the LFMM2 model in Rust that uses a randomised streaming
-SVD and association approach to both accelerate computation, and reduce memory
-usage for large datasets.
+approach to both compute genome blocks in parallel, and reduce memory usage
+for colossal datasets.
 
 
 schnelLFMM fits the model $\mathbf{Y} = \mathbf{X} \mathbf{B}^\top + \mathbf{U}
@@ -21,35 +21,19 @@ $\mathbf{X}$ contains environmental variables/phenotypes, $\mathbf{U}
 \mathbf{V}^\top$ captures latent population structure, and $\mathbf{B}$ holds
 the per-SNP effect sizes to be tested.
 
-schnelLFMM scales to billions of SNPs by streaming PLINK .bed files from disk,
+schnelLFMM scales to massive SNP datasets by streaming PLINK .bed files from disk,
 so that the genotype matrix is never fully loaded into RAM. Even on smaller
-datasets, it dramatically outpeforms LEA, taking only about 2 seconds to run a
+datasets, it dramatically outperforms LEA, taking only about 2 seconds to run a
 single-trait GWAS in Arabidopsis, compared to a few minutes for LEA.
 
-
-### Differences to R's LEA::lfmm2()
-
-Overall, our implementation tries to closely follow Caye et al's paper and
-implementation in the R package LEA. However, there are some differences to
-increase scalability.
-
-Firstly, we accept standard PLINK 1.9 BED+FAM files for genotypes. No other
-reformatting of genotypes should be needed, and analyses leading to GEA or GWAS
-can use standard PLINK tooling for efficiency.
-
-We estimate genotype latent factors ($\mathbf{U}$) using randomised SVD. We use
-the Halko-Martinsson-Tropp algorithm (https://arxiv.org/abs/0909.4061) which
-computes only a sparse subset of the SVD, and allows streaming over the BED
-file without loading $\mathbf{Y}$ into memory.
-
-We then compute the effect sizes $\mathbf{B}$ with ridge regression and do
-per-locus statistical tests in an addtional streaming pass over SNPs. We
-finally do a per-trait GIF correction of test statistics to avoid inflated
-p-values.
-
-These multiple passes of the BED file might seem inefficient, however with
-modern SSDs computation time will vastly exceed the IO speed, so the overall
-contribution to runtime is worth the vastly improved memory efficiency.
+Optionally, we support non-negative matrix factorisation-based data imputation.
+In summary, this imputes missing SNPs based on the expected population
+differences, as estimated by the NNMF algorithm. Conceptually, this is similar
+to STRUCTURE and ADMIXTURE, where each sample's genotypes are modeled as a
+mixture of ancestral population allele states combined according to the
+sample's admixture proportions. We use NNMF to impute genotypes by first
+estimating the sample's admixture proportions (by fitting NNMF: $Y = W H$),
+then use these to predict any missing genotypes per SNP.
 
 
 ## Install
@@ -105,8 +89,12 @@ schnellfmm -b all_snps.bed -c pheno.tsv -k 20 \
 | `--scale-cov` | off | Scale covariates to unit variance |
 | `--chunk-size` | `10000` | SNPs per processing chunk |
 | `--power-iter` | `2` | Number of RSVD power iterations |
-| `--oversampling` | `10` | How many addtional singular values should be estimated during RSVD? |
+| `--oversampling` | `10` | How many additional singular values should be estimated during RSVD? |
 | `--seed` | `42` | RNG seed |
+| `--nmf-impute` | off | Use NMF low-rank imputation for missing genotypes (default: mean imputation) |
+| `--nmf-k` | same as `-k` | NMF rank (number of ancestral components) |
+| `--nmf-iter` | `10` | NMF multiplicative update iterations; monitor the per-iteration CV MAE in the summary file for convergence |
+| `--nmf-cv-rate` | `0.0005` | Fraction of genotypes held out per NMF iteration for cross-validation |
 | `-v, --verbose` | off | Verbose progress output |
 
 ### Example
@@ -117,6 +105,31 @@ We have an example in `examples/ath` that reanalyses the days to flowering at
 ### Output
 
 Results are written to `<out>.tsv` (per-SNP effect sizes, t-statistics, and
-calibrated p-values for each trait, and a total $R^2$ for covariates, latent
-factors, and residual variation) and `<out>.summary.txt` with a summary of run
-arguments and details.
+calibrated p-values for each trait, plus per-SNP $R^2$ fractions for
+covariates, latent factors, and residual variation) and `<out>.summary.txt`
+with a summary of run arguments and details (including NMF cross-validation
+errors when `--nmf-impute` is used).
+
+## Differences to R's LEA::lfmm2()
+
+Overall, our implementation tries to closely follow Caye et al's paper and
+implementation in the R package LEA. However, there are some differences to
+increase scalability.
+
+Firstly, we accept standard PLINK 1.9 BED+FAM files for genotypes. No other
+reformatting of genotypes should be needed, and analyses leading to GEA or GWAS
+can use standard PLINK tooling for efficiency.
+
+We estimate genotype latent factors ($\mathbf{U}$) using randomised SVD. We use
+the Halko-Martinsson-Tropp algorithm (https://arxiv.org/abs/0909.4061) which
+computes only a sparse subset of the SVD, and allows streaming over the BED
+file without loading $\mathbf{Y}$ into memory.
+
+We then compute the effect sizes $\mathbf{B}$ with ridge regression and do
+per-locus statistical tests in an additional streaming pass over SNPs. We
+finally do a per-trait GIF correction of test statistics to avoid inflated
+p-values.
+
+These multiple passes of the BED file might seem inefficient, however with
+modern SSDs computation time will vastly exceed the IO speed, so the overall
+contribution to runtime is worth the vastly improved memory efficiency.
