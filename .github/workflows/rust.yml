@@ -109,6 +109,7 @@ jobs:
     - name: Set OPENBLAS env
       run: |
         echo "OPENBLAS_DIR=$(brew --prefix openblas)" >> $GITHUB_ENV
+        echo "LIBRARY_PATH=$(brew --prefix gcc)/lib/gcc/current:${LIBRARY_PATH:-}" >> $GITHUB_ENV
 
     - name: Build (arm64)
       run: cargo build --verbose --release --target aarch64-apple-darwin

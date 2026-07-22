@@ -11,5 +11,7 @@ rustup set profile minimal
 rustup toolchain install "${RUST_TOOLCHAIN}"
 rustup default "${RUST_TOOLCHAIN}"
 
+yum install -y openssl-devel
+
 cargo build --verbose --release
 cargo test --verbose --release
