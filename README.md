@@ -149,3 +149,10 @@ p-values.
 These multiple passes of the BED file might seem inefficient, however with
 modern SSDs computation time will vastly exceed the IO speed, so the overall
 contribution to runtime is worth the vastly improved memory efficiency.
+
+Our NMF imputation algorithm is inspired by those in LEA, rather than directly
+implementing their exact approach. This is mostly to avoid multiple full passes
+over the entire genome file (as opposed to the estimation subset). Provided the
+--est parameters (either the independent estimation BED or subsampling rate)
+produce a snp subset from which an accurate picture of genome-wide relatedness
+can be learnt, then there is should be no practical difference.
