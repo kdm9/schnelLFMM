@@ -35,7 +35,7 @@ pub fn with_multithreaded_blas<T>(n_workers: usize, f: impl FnOnce() -> T) -> T 
 }
 
 /// Imputation strategy for missing genotypes.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImputeStrategy {
     /// Current behaviour: impute missing to per-SNP mean (becomes 0 after centering).
     Mean,

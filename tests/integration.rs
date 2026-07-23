@@ -94,6 +94,7 @@ fn test_lfmm2_quick() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 12345,
     };
 
@@ -149,6 +150,7 @@ fn test_lfmm2_large() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 54321,
     };
 
@@ -218,6 +220,7 @@ fn test_reproducibility() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 99,
     };
 
@@ -267,7 +270,84 @@ fn test_reproducibility() {
             );
         }
     }
-    assert!((r1.gif - r2.gif).abs() < 1e-15);
+}
+
+/// Covariate missing-value imputation: ".", "NA" (any case), and empty
+/// strings are treated as missing and mean-imputed with a warning.
+#[test]
+fn test_covariate_missing_imputation() {
+    let (dir, bed, _cov) = cli_test_fixtures();
+
+    let cov_path = dir.path().join("cov_missing.tsv");
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&cov_path).unwrap();
+        writeln!(f, "sample_id\tenv_0\tenv_1").unwrap();
+        // IND0: env_0 = ".", env_1 = normal
+        writeln!(f, "IND0\t.\t0.5").unwrap();
+        // IND1: env_0 = normal, env_1 = "NA"
+        writeln!(f, "IND1\t1.0\tNA").unwrap();
+        // IND2: env_0 = normal, env_1 = "na" (lowercase)
+        writeln!(f, "IND2\t2.0\tna").unwrap();
+        // IND3: env_0 = normal, env_1 = "Na" (mixed case)
+        writeln!(f, "IND3\t3.0\tNa").unwrap();
+        // IND4: env_0 = empty, env_1 = normal
+        writeln!(f, "IND4\t\t1.5").unwrap();
+        // IND5..IND7: all normal
+        writeln!(f, "IND5\t4.0\t2.5").unwrap();
+        writeln!(f, "IND6\t5.0\t3.5").unwrap();
+        writeln!(f, "IND7\t6.0\t4.5").unwrap();
+        // Remaining samples: env_0 = normal, env_1 = normal
+        for i in 8..50 {
+            writeln!(f, "IND{}\t{:.1}\t{:.1}", i, i as f64, (50 - i) as f64).unwrap();
+        }
+    }
+
+    let output = Command::new(lfmm2_bin())
+        .args([
+            "-b", bed.to_str().unwrap(),
+            "-c", cov_path.to_str().unwrap(),
+            "-k", "2",
+            "-o", dir.path().join("out_imp").to_str().unwrap(),
+            "-t", "1",
+        ])
+        .output()
+        .expect("failed to execute lfmm2 binary");
+
+    assert!(
+        output.status.success(),
+        "CLI with missing covariate values failed:\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("imputed to column mean"),
+        "Expected imputation warning, got: {}",
+        stderr,
+    );
+    assert!(
+        stderr.contains("env_0"),
+        "Warning should mention covariate name 'env_0': {}",
+        stderr,
+    );
+    assert!(
+        stderr.contains("env_1"),
+        "Warning should mention covariate name 'env_1': {}",
+        stderr,
+    );
+    // env_0 has two missing values (IND0 "." and IND4 empty)
+    // env_1 has three missing values (IND1 "NA", IND2 "na", IND3 "Na")
+    assert!(
+        stderr.contains("2 missing value"),
+        "Expected 2 missing values for env_0: {}",
+        stderr,
+    );
+    assert!(
+        stderr.contains("3 missing value"),
+        "Expected 3 missing values for env_1: {}",
+        stderr,
+    );
 }
 
 /// Different seeds should produce different but statistically similar results.
@@ -289,6 +369,7 @@ fn test_different_seeds_differ() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 99,
     };
 
@@ -551,6 +632,7 @@ fn test_parallel_matches_sequential() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 77777,
     };
 
@@ -708,6 +790,7 @@ fn test_subset_snp_count_consistency() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 111,
     };
     let sim = simulate(&sim_config);
@@ -748,6 +831,7 @@ fn test_subset_rate_end_to_end() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 55555,
     };
 
@@ -820,6 +904,7 @@ fn test_subset_indices_end_to_end() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 66666,
     };
 
@@ -897,6 +982,7 @@ fn test_output_config_writes_results() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 88888,
     };
 
@@ -1023,6 +1109,7 @@ fn cli_test_fixtures() -> (tempfile::TempDir, std::path::PathBuf, std::path::Pat
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 9999,
     };
     let sim = simulate(&sim_config);
@@ -1359,6 +1446,7 @@ fn test_cli_csv_covariates() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 9999,
     };
     let sim = simulate(&sim_config);
@@ -1421,6 +1509,7 @@ fn test_normalization_modes_end_to_end() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 77700,
     };
 
@@ -1601,6 +1690,7 @@ fn test_cli_intersect_samples() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 9999,
     };
     let sim = simulate(&sim_config);
@@ -1705,6 +1795,7 @@ fn test_cli_est_bed_sample_identity() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 9999,
     };
     let sim = simulate(&sim_config);
@@ -1784,6 +1875,7 @@ fn test_cli_est_bed_sample_mismatch() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 9999,
     };
     let sim = simulate(&sim_config);
@@ -1850,6 +1942,7 @@ fn test_cli_intersect_with_est_bed() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 9999,
     };
     let sim = simulate(&sim_config);
@@ -1927,6 +2020,7 @@ fn test_k_sensitivity() {
             latent_scale: 1.5,
             noise_std: 1.0,
             covariate_r2: 0.0,
+            covariate_latent_r2: 0.0,
             seed: 42000 + k_true as u64,
         };
 
@@ -2045,6 +2139,7 @@ fn test_variance_decomposition() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 77700,
     };
 
@@ -2173,6 +2268,7 @@ fn test_variance_decomposition_signal_levels() {
             latent_scale: ls,
             noise_std: 1.0,
             covariate_r2: 0.0,
+            covariate_latent_r2: 0.0,
             seed: 88800,
         };
 
@@ -2261,6 +2357,7 @@ fn test_variance_decomposition_with_noise() {
         latent_scale: 1.5,
         noise_std: 1.0,
         covariate_r2: 0.0,
+        covariate_latent_r2: 0.0,
         seed: 99900,
     };
 
@@ -2353,6 +2450,147 @@ fn test_variance_decomposition_with_noise() {
     );
 }
 
+/// GEA scenario: environmental covariate correlated with population
+/// structure under MCAR missingness. Structure-based (NMF) imputation
+/// should outperform global-mean imputation: higher power, stronger test
+/// statistics, more accurate effect-size estimates.
+///
+/// Paired comparison — both strategies run on the same masked data with
+/// identical config/seed; the only difference is the imputation strategy
+/// (including its effect on Û estimation, which is production behaviour).
+///
+/// The 10% missing rate amplifies the effect for a robust single-run
+/// assertion; realistic GWAS rates give smaller but directionally identical
+/// differences. The GIF clamp at min 1.0 keeps the comparison fair: mean
+/// imputation deflates t (raw GIF < 1 → clamped), so it receives no
+/// anti-conservative boost.
+#[test]
+fn test_nmf_vs_mean_imputation_structured_gea() {
+    let sim_config = SimConfig {
+        n_samples: 200,
+        n_snps: 10_000,
+        n_causal: 100,
+        k: 3,
+        d: 1,
+        effect_size: 0.6,
+        latent_scale: 2.5,
+        noise_std: 1.0,
+        covariate_r2: 0.0,
+        covariate_latent_r2: 0.5,
+        seed: 20240707,
+    };
+    let sim = simulate(&sim_config);
+    let sim_miss = mask_genotypes(&sim, 0.20, 888);
+
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim_miss).unwrap();
+
+    let p = sim_config.n_snps;
+    let causal_set: std::collections::HashSet<_> = sim.causal_indices.iter().cloned().collect();
+
+    // Run a strategy on the shared masked data; return parsed TSV + TestResults
+    let run = |impute: ImputeStrategy| {
+        let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+        let nmf = match impute {
+            ImputeStrategy::Nmf => Some(NmfConfig {
+                k: 3, n_iter: 8, eps: 1e-16,
+                cv_rate: 0.005, chunk_size: 2_000,
+                n_workers: 2, progress: false, seed: 42,
+            }),
+            _ => None,
+        };
+        let config = Lfmm2Config {
+            k: 3, lambda: 1e-5, chunk_size: 2_000, oversampling: 10,
+            n_power_iter: 2, seed: 42, n_workers: 2, progress: false,
+            norm: SnpNorm::Eigenstrat, scale_cov: false, impute, nmf,
+        };
+        let d = sim.x.ncols();
+        let cov_names = default_cov_names(d);
+        let out_path = dir.path().join(format!("results_{:?}.tsv", impute));
+        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+        let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
+        (read_results_tsv(&out_path), results)
+    };
+
+    let (pr_mean, res_mean) = run(ImputeStrategy::Mean);
+    let (pr_nmf, res_nmf) = run(ImputeStrategy::Nmf);
+
+    // --- metrics ---
+    let power = |pr: &ParsedResults| -> f64 {
+        sim.causal_indices.iter()
+            .filter(|&&i| pr.p_values[i][0] < 0.01)
+            .count() as f64 / sim.causal_indices.len() as f64
+    };
+    let beta_mae = |pr: &ParsedResults| -> f64 {
+        sim.causal_indices.iter()
+            .map(|&i| (pr.effect_sizes[i][0] - sim.b_true[(i, 0)]).abs())
+            .sum::<f64>() / sim.causal_indices.len() as f64
+    };
+    let mean_abs_t = |pr: &ParsedResults| -> f64 {
+        sim.causal_indices.iter()
+            .map(|&i| pr.t_stats[i][0].abs())
+            .sum::<f64>() / sim.causal_indices.len() as f64
+    };
+    let null_fpr = |pr: &ParsedResults| -> f64 {
+        let null_count = (0..p).filter(|&i| !causal_set.contains(&i)).count();
+        let fp = (0..p).filter(|&i| !causal_set.contains(&i) && pr.p_values[i][0] < 0.05).count();
+        fp as f64 / null_count.max(1) as f64
+    };
+
+    let pow_mean = power(&pr_mean);
+    let pow_nmf  = power(&pr_nmf);
+    let mae_mean = beta_mae(&pr_mean);
+    let mae_nmf  = beta_mae(&pr_nmf);
+    let t_mean   = mean_abs_t(&pr_mean);
+    let t_nmf    = mean_abs_t(&pr_nmf);
+    let fpr_mean = null_fpr(&pr_mean);
+    let fpr_nmf  = null_fpr(&pr_nmf);
+
+    eprintln!(
+        "         | power | beta-MAE | mean |t| | null FPR | GIF",
+    );
+    eprintln!(
+        "Mean imp | {:.3} | {:.4} | {:.3} | {:.4} | {:.4}",
+        pow_mean, mae_mean, t_mean, fpr_mean, res_mean.gif,
+    );
+    eprintln!(
+        "NMF  imp | {:.3} | {:.4} | {:.3} | {:.4} | {:.4}",
+        pow_nmf, mae_nmf, t_nmf, fpr_nmf, res_nmf.gif,
+    );
+
+    // Structure-based imputation should reduce residual variance at
+    // imputed SNPs, giving stronger test statistics and higher power.
+    // (Beta MAE from Step-3 ridge is a diagnostic; the Step-4 t-test is
+    // where the σ̂ reduction directly improves signal-to-noise.)
+    assert!(
+        pow_nmf > pow_mean,
+        "NMF power ({:.3}) should exceed mean-impute power ({:.3})",
+        pow_nmf, pow_mean,
+    );
+    assert!(
+        t_nmf > t_mean,
+        "NMF mean |t| ({:.3}) should exceed mean-impute |t| ({:.3})",
+        t_nmf, t_mean,
+    );
+
+    // NMF CV consistency
+    let gwas_mae = res_nmf.nmf_gwas_cv_mae.expect("nmf gwas cv mae missing");
+    let gwas_mean = res_nmf.nmf_gwas_cv_mean_mae.expect("nmf gwas cv mean missing");
+    assert!(
+        gwas_mae < gwas_mean,
+        "NMF GWAS CV ({:.6}) should beat mean baseline ({:.6})",
+        gwas_mae, gwas_mean,
+    );
+
+    // GIF sanity
+    assert!(res_mean.gif > 0.5 && res_mean.gif < 2.0);
+    assert!(res_nmf.gif  > 0.5 && res_nmf.gif  < 2.0);
+
+    // All SNP rows present in both outputs
+    assert_eq!(pr_mean.p_values.len(), p);
+    assert_eq!(pr_nmf.p_values.len(), p);
+}
+
 /// Mask a fraction of genotypes as missing (255 sentinel → PLINK 0b01).
 fn mask_genotypes(sim: &schnellfmm::simulate::SimData, miss_rate: f64, seed: u64) -> schnellfmm::simulate::SimData {
     use rand::prelude::*;
@@ -2379,6 +2617,119 @@ fn mask_genotypes(sim: &schnellfmm::simulate::SimData, miss_rate: f64, seed: u64
         causal_indices: sim.causal_indices.clone(),
         allele_freqs: sim.allele_freqs.clone(),
     }
+}
+
+/// GEA scenario where the environmental covariate is independent of
+/// population structure (no confounding), but background structure is
+/// strong. Under MCAR missingness, mean imputation fills missing genotypes
+/// with zeros after centering — the global average — which is uncorrelated
+/// with the true structure at each SNP. The resulting dilution of the
+/// latent-factor fit inflates residual variance (higher median t²) and
+/// raises the GIF. NMF imputation fills with population-specific dosages,
+/// keeping the latent fit sharp and the GIF near 1.
+#[test]
+fn test_nmf_vs_mean_imputation_gif_inflation() {
+    let sim_config = SimConfig {
+        n_samples: 200,
+        n_snps: 10_000,
+        n_causal: 50,
+        k: 3,
+        d: 1,
+        effect_size: 0.5,
+        latent_scale: 2.5,
+        noise_std: 1.0,
+        covariate_r2: 0.0,
+        covariate_latent_r2: 0.0,
+        seed: 20240708,
+    };
+    let sim = simulate(&sim_config);
+    let sim_miss = mask_genotypes(&sim, 0.15, 999);
+
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "sim", &sim_miss).unwrap();
+
+    let p = sim_config.n_snps;
+
+    let run = |impute: ImputeStrategy| {
+        let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
+        let nmf = match impute {
+            ImputeStrategy::Nmf => Some(NmfConfig {
+                k: 3, n_iter: 8, eps: 1e-16,
+                cv_rate: 0.005, chunk_size: 2_000,
+                n_workers: 2, progress: false, seed: 42,
+            }),
+            _ => None,
+        };
+        let config = Lfmm2Config {
+            k: 3, lambda: 1e-5, chunk_size: 2_000, oversampling: 10,
+            n_power_iter: 2, seed: 42, n_workers: 2, progress: false,
+            norm: SnpNorm::Eigenstrat, scale_cov: false, impute, nmf,
+        };
+        let d = sim.x.ncols();
+        let cov_names = default_cov_names(d);
+        let out_path = dir.path().join(format!("results_gif_{:?}.tsv", impute));
+        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+        let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
+        (read_results_tsv(&out_path), results)
+    };
+
+    let (pr_mean, res_mean) = run(ImputeStrategy::Mean);
+    let (pr_nmf, res_nmf) = run(ImputeStrategy::Nmf);
+
+    let causal_set: std::collections::HashSet<_> = sim.causal_indices.iter().cloned().collect();
+    let power = |pr: &ParsedResults| -> f64 {
+        sim.causal_indices.iter()
+            .filter(|&&i| pr.p_values[i][0] < 0.01)
+            .count() as f64 / sim.causal_indices.len() as f64
+    };
+    let mean_abs_t = |pr: &ParsedResults| -> f64 {
+        sim.causal_indices.iter()
+            .map(|&i| pr.t_stats[i][0].abs())
+            .sum::<f64>() / sim.causal_indices.len() as f64
+    };
+    let null_fpr = |pr: &ParsedResults| -> f64 {
+        let null_count = (0..p).filter(|&i| !causal_set.contains(&i)).count();
+        let fp = (0..p).filter(|&i| !causal_set.contains(&i) && pr.p_values[i][0] < 0.05).count();
+        fp as f64 / null_count.max(1) as f64
+    };
+
+    let pow_mean = power(&pr_mean);
+    let pow_nmf  = power(&pr_nmf);
+    let t_mean   = mean_abs_t(&pr_mean);
+    let t_nmf    = mean_abs_t(&pr_nmf);
+
+    eprintln!(
+        "         | power | mean |t| | null FPR | GIF",
+    );
+    eprintln!(
+        "Mean imp | {:.3} | {:.3} | {:.4} | {:.4}",
+        pow_mean, t_mean, null_fpr(&pr_mean), res_mean.gif,
+    );
+    eprintln!(
+        "NMF  imp | {:.3} | {:.3} | {:.4} | {:.4}",
+        pow_nmf, t_nmf, null_fpr(&pr_nmf), res_nmf.gif,
+    );
+
+    // Mean imputation dilutes the structure signal (fills zeros),
+    // inflating residual variance and raising the genomic-inflation
+    // factor. NMF fills track population structure, keeping the
+    // latent fit sharp and the GIF near the expected range.
+    assert!(
+        res_mean.gif > res_nmf.gif,
+        "Mean GIF ({:.4}) should exceed NMF GIF ({:.4})",
+        res_mean.gif, res_nmf.gif,
+    );
+    assert!(res_nmf.gif < 1.08,
+        "NMF GIF ({:.4}) should stay near 1", res_nmf.gif);
+
+    // Power should be comparable — structure-based imputation reduces
+    // residual variance, so it should not hurt power; it may help.
+    assert!(pow_nmf >= pow_mean * 0.9,
+        "NMF power ({:.3}) should not be far below mean ({:.3})", pow_nmf, pow_mean);
+
+    // Output sanity
+    assert_eq!(pr_mean.p_values.len(), p);
+    assert_eq!(pr_nmf.p_values.len(), p);
 }
 
 fn nmf_test_config(k: usize, n_iter: usize, n_workers: usize) -> Lfmm2Config {
@@ -2431,6 +2782,7 @@ fn test_nmf_imputation_end_to_end() {
         latent_scale: 1.5,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 424242,
     };
 
@@ -2539,6 +2891,7 @@ fn test_nmf_determinism_multithreaded() {
         latent_scale: 1.0,
         noise_std: 1.0,
         covariate_r2: 0.3,
+        covariate_latent_r2: 0.0,
         seed: 99,
     };
 

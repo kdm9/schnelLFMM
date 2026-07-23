@@ -405,19 +405,23 @@ fn load_covariates(
             .iter()
             .enumerate()
             .map(|(j, s)| {
-                let v = s.trim().parse::<f64>().with_context(|| {
+                let trimmed = s.trim();
+                if trimmed.is_empty() || trimmed == "." || trimmed.eq_ignore_ascii_case("na") {
+                    return Ok(f64::NAN);
+                }
+                let v = trimmed.parse::<f64>().with_context(|| {
                     format!(
                         "Failed to parse value '{}' for covariate '{}' on line {} (sample '{}')",
-                        s.trim(),
+                        trimmed,
                         cov_names[j],
                         i + 2,
                         sample_id,
                     )
                 })?;
-                if !v.is_finite() {
+                if v.is_infinite() {
                     anyhow::bail!(
-                        "Non-finite value ({}) for covariate '{}' on line {} (sample '{}'): \
-                         NaN/Inf will propagate through all matrix operations",
+                        "Infinite value ({}) for covariate '{}' on line {} (sample '{}'): \
+                         Inf values will propagate through all matrix operations",
                         v,
                         cov_names[j],
                         i + 2,
@@ -518,9 +522,107 @@ fn load_covariates(
 
     // Build output matrix
     let flat: Vec<f64> = rows.into_iter().flatten().collect();
-    let x = Array2::from_shape_vec((matched, n_covs), flat)
+    let mut x = Array2::from_shape_vec((matched, n_covs), flat)
         .expect("row count × col count should match flattened length");
 
+    for j in 0..n_covs {
+        let mut sum = 0.0f64;
+        let mut n_obs = 0u64;
+        for i in 0..matched {
+            let v = x[(i, j)];
+            if !v.is_nan() {
+                sum += v;
+                n_obs += 1;
+            }
+        }
+        let n_missing = matched - n_obs as usize;
+        if n_missing == 0 {
+            continue;
+        }
+        let mean = if n_obs > 0 { sum / n_obs as f64 } else { 0.0 };
+        for i in 0..matched {
+            if x[(i, j)].is_nan() {
+                x[(i, j)] = mean;
+            }
+        }
+        eprintln!(
+            "  Warning: covariate '{}' has {} missing value(s) ('.', 'NA', or empty), \
+             imputed to column mean ({:.6})",
+            cov_names[j], n_missing, mean,
+        );
+    }
+
     Ok((cov_names, x, kept_indices))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use schnellfmm::bed::FamRecord;
+
+    fn make_fam_record(iid: &str) -> FamRecord {
+        FamRecord {
+            fid: "FAM".to_string(),
+            iid: iid.to_string(),
+            father: "0".to_string(),
+            mother: "0".to_string(),
+            sex: 0,
+            pheno: "-9".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_covariate_imputed_values_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        let cov_path = dir.path().join("cov.tsv");
+
+        // 5 samples, 2 covariates.
+        // env_0: IND0=".", IND1=1.0, IND2=4.0, IND3=5.0, IND4=6.0
+        //   observed mean = (1+4+5+6)/4 = 4.0
+        // env_1: IND0=0.5, IND1="NA", IND2="", IND3=3.5, IND4=4.5
+        //   observed mean = (0.5+3.5+4.5)/3 = 8.5/3
+        std::fs::write(
+            &cov_path,
+            "sample_id\tenv_0\tenv_1\n\
+             IND0\t.\t0.5\n\
+             IND1\t1.0\tNA\n\
+             IND2\t4.0\t\n\
+             IND3\t5.0\t3.5\n\
+             IND4\t6.0\t4.5\n",
+        )
+        .unwrap();
+
+        let fam: Vec<FamRecord> = ["IND0", "IND1", "IND2", "IND3", "IND4"]
+            .iter()
+            .map(|iid| make_fam_record(iid))
+            .collect();
+
+        let (cov_names, x, kept) =
+            load_covariates(&cov_path, &fam, false, false).unwrap();
+
+        assert_eq!(cov_names, vec!["env_0", "env_1"]);
+        assert_eq!(kept, vec![0, 1, 2, 3, 4]);
+        assert_eq!(x.shape(), &[5, 2]);
+
+        let mean_env0: f64 = (1.0 + 4.0 + 5.0 + 6.0) / 4.0;
+        assert!((x[(0, 0)] - mean_env0).abs() < 1e-12,
+            "IND0 env_0 imputed value {} != {}", x[(0, 0)], mean_env0);
+        for (i, expected) in [1.0, 4.0, 5.0, 6.0].iter().enumerate() {
+            assert!((x[(i + 1, 0)] - expected).abs() < 1e-12,
+                "IND{} env_0 value {} != {}", i+1, x[(i+1, 0)], expected);
+        }
+
+        let mean_env1: f64 = (0.5 + 3.5 + 4.5) / 3.0;
+        assert!((x[(0, 1)] - 0.5).abs() < 1e-12,
+            "IND0 env_1 value {} != 0.5", x[(0, 1)]);
+        assert!((x[(1, 1)] - mean_env1).abs() < 1e-12,
+            "IND1 env_1 imputed value {} != {}", x[(1, 1)], mean_env1);
+        assert!((x[(2, 1)] - mean_env1).abs() < 1e-12,
+            "IND2 env_1 imputed value {} != {}", x[(2, 1)], mean_env1);
+        assert!((x[(3, 1)] - 3.5).abs() < 1e-12,
+            "IND3 env_1 value {} != 3.5", x[(3, 1)]);
+        assert!((x[(4, 1)] - 4.5).abs() < 1e-12,
+            "IND4 env_1 value {} != 4.5", x[(4, 1)]);
+    }
 }
 

@@ -22,6 +22,12 @@ pub struct SimConfig {
     /// Column 0 is drawn iid N(0,1); columns j>0 are generated as
     /// r*X[:,0] + sqrt(1-r²)*Z_j with Z_j iid N(0,1), giving pairwise r² ≈ this value.
     pub covariate_r2: f64,
+    /// Target r² between covariate column 0 and latent factor column 0
+    /// (0.0 = independent). When > 0, column 0 is generated as
+    /// r*U[:,0] + sqrt(1-r²)*Z with Z iid N(0,1), simulating an environmental
+    /// covariate aligned with population structure (the classic GEA
+    /// confounding scenario). Values outside [0, 1] are not meaningful.
+    pub covariate_latent_r2: f64,
     pub seed: u64,
 }
 
@@ -58,10 +64,20 @@ pub fn simulate(config: &SimConfig) -> SimData {
     let v_true = Array2::from_shape_fn((p, k), |_| rng.sample(normal) * v_scale);
 
     // Generate X (n × d) - covariates with pairwise correlation ≈ covariate_r2
-    // Column 0: iid N(0,1)
+    // Column 0: N(0,1), optionally correlated with latent factor 0 at
+    //   r² = covariate_latent_r2 (environment aligned with population structure)
     // Columns j>0: r*X[:,0] + sqrt(1-r²)*Z_j giving pairwise r² ≈ covariate_r2
     let mut x = Array2::<f64>::zeros((n, d));
-    x.column_mut(0).mapv_inplace(|_| rng.sample(normal));
+    let r_lat = config.covariate_latent_r2.sqrt();
+    let r_lat_orth = (1.0 - config.covariate_latent_r2).sqrt();
+    {
+        // At covariate_latent_r2 = 0 this reduces to iid N(0,1) with the same
+        // number of RNG draws as before, preserving reproducibility.
+        let u0: Vec<f64> = u_true.column(0).to_vec();
+        for (i, val) in x.column_mut(0).iter_mut().enumerate() {
+            *val = r_lat * u0[i] + r_lat_orth * rng.sample(normal);
+        }
+    }
     let r = config.covariate_r2.sqrt();
     let r_orth = (1.0 - config.covariate_r2).sqrt();
     for j in 1..d {
