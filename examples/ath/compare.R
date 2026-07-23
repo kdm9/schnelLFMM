@@ -51,20 +51,17 @@ lea_results = read_tsv(lea_lfmm_file) |>
     mutate(chrom = sprintf("chr%d", chr)) |>
     glimpse()
 
-# --- AraGWAS ---
 h5f = H5Fopen("261.hdf5")
 
 aragwas = dplyr::bind_rows(h5f$pvalues, .id = "chrom") |>
     mutate(across(beta:variance_explained, as.numeric)) |>
     glimpse()
 
-# --- Rust LFMM-OOC ---
-lfmmooc = read_tsv(sprintf("ath_ft10_rs_k%d.tsv", LFMM_K)) |>
+schnellfmm = read_tsv(sprintf("ath_ft10_rs_k%d.tsv", LFMM_K)) |>
     mutate(chrom=sprintf("chr%d", chr)) |>
     glimpse()
 
-# --- Join all three ---
-all_results = lfmmooc |>
+all_results = schnellfmm |>
     transmute(chrom, pos, score_rs=-log10(p_FT10)) |>
     full_join(
         aragwas |> select(chrom, pos=positions, score_aragwas=scores),

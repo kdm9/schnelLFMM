@@ -48,3 +48,16 @@ time ../../target/release/schnellfmm \
     -t 12 \
     --norm center-only
 time Rscript compare.R $LFMM_K
+
+ LFMM_K=6
+time ../../target/release/schnellfmm \
+    #--nmf-impute \
+    #--nmf-iter 12 \
+    --est-rate 0.01 \
+    --bed 1k1g.bed \
+    --cov pheno_intersect.tsv \
+    --intersect-samples \
+    -k $LFMM_K \
+    --out ath_ft10_rs_k$LFMM_K_full-genome \
+    -t 24 \
+    --norm center-only
