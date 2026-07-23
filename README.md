@@ -14,7 +14,6 @@ a reimplementation of the LFMM2 model in Rust that uses a randomised streaming
 approach to both compute genome blocks in parallel, and reduce memory usage
 for colossal datasets.
 
-
 schnelLFMM fits the model $\mathbf{Y} = \mathbf{X} \mathbf{B}^\top + \mathbf{U}
 \mathbf{V}^\top + \mathbf{E}$ where $\mathbf{Y}$ is a genotype matrix,
 $\mathbf{X}$ contains environmental variables/phenotypes, $\mathbf{U}
@@ -51,6 +50,10 @@ estimation of fixed covariate effects. Conversely, global-mean imputation may
 leave some residual signal after population structure correction (as values
 don't follow population structure), and may induce error during estimation of
 fixed effects.
+
+
+Why schnelLFMM? Schnell is German for fast, and I can't help myself from making
+dumb punny tool names. Sorry.
 
 ## Install
 
