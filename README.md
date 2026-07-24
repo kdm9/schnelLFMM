@@ -1,7 +1,7 @@
 # schnelLFMM
 
 A fast streaming implementation of LFMM2 (Latent Factor Mixed Model) for GWAS
-and GEA.
+and GEA on large whole-genome datasets
 
 
 ## Overview
