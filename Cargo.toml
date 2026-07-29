@@ -1,6 +1,6 @@
 [package]
 name = "schnellfmm"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 
 [features]
@@ -31,8 +31,8 @@ approx = "0.5"
 tempfile = "3"
 
 [package.metadata.cross.build]
-default-target = "x86_64-unknown-linux-gnu"    # use this target if none is explicitly provided
-pre-build = [                                  # additional commands to run prior to building the package
+default-target = "x86_64-unknown-linux-gnu"
+pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH", 
     "apt-get update && apt-get --assume-yes install libssl-dev:$CROSS_DEB_ARCH libopenblas-dev:$CROSS_DEB_ARCH"
 ]
