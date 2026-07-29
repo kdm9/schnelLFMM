@@ -74,7 +74,7 @@ cat("Rust results loaded.\n")
 qq_expected <- function(pvals, main, col = "black") {
     pvals <- pvals[!is.na(pvals)]
     n     <- length(pvals)
-    expected <- -log10(rev(1:n/(n+1)))
+    expected <- -log10(rev(1:n / (n + 1)))
     observed <- sort(-log10(pvals))
     lim <- max(expected, observed)
     plot(expected, observed, pch = 20, cex = 0.3, col = col,
@@ -87,7 +87,6 @@ qq_expected <- function(pvals, main, col = "black") {
     gif <- median(chisq, na.rm = TRUE) / qchisq(0.5, df = 1)
     legend("topleft", legend = sprintf("GIF = %.3f", gif), bty = "n", cex = 0.9)
 }
-
 
 qq_vs <- function(pvals_x, pvals_y, xlab_text, ylab_text, main) {
     x <- -log10(sort(pvals_x))
@@ -193,11 +192,11 @@ for (j in 1:d) {
     cat(sprintf("  Covariate %d: rho = %.4f\n", j, rc))
 }
 
-cat("And just to check, did we stuff up and use the same file twice? all(rust pv == lea pv):")
-table(rust_pv == lea_pv)
+cat("Sanity check: all(rust_pv == lea_pv):")
+print(table(rust_pv == lea_pv))
 cat("\nhead(rust_pv):\n")
-head(rust_pv)
+print(head(rust_pv))
 cat("head(lea_pv):\n")
-head(lea_pv)
+print(head(lea_pv))
 
 cat(sprintf("\nAll outputs written with prefix '%s'.\n", prefix))

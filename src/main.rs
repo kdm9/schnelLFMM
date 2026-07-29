@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use schnellfmm::bed::{BedFile, SubsetSpec};
-use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, NmfConfig, OutputConfig, SnpNorm};
+use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, NmfConfig, OutputConfig, OutputFormat, SnpNorm};
 
 #[derive(Parser)]
 #[command(name = "lfmm2", about = "Latent Factor Mixed Model v2 - GWAS with latent confounders")]
@@ -33,6 +33,10 @@ struct Cli {
     /// Output prefix
     #[arg(short = 'o', long, default_value = "lfmm2_out")]
     out: String,
+
+    /// Output format: tsv (default) or parquet (zstd-compressed, DuckDB-ready)
+    #[arg(short = 'f', long, default_value = "tsv")]
+    format: OutputFormat,
 
     /// Worker threads (0 is treated as 1)
     #[arg(short = 't', long, default_value_t = default_threads())]
@@ -213,13 +217,24 @@ fn main() -> Result<()> {
     );
 
     // Run LFMM2 with streaming output
-    let results_path = PathBuf::from(format!("{}.tsv", cli.out));
+    let ext = match cli.format {
+        OutputFormat::Tsv => "tsv",
+        OutputFormat::Parquet => "parquet",
+    };
+    let results_path = PathBuf::from(format!("{}.{}", cli.out, ext));
     let summary_path = format!("{}.summary.txt", cli.out);
+
+    let fmt_name = match cli.format {
+        OutputFormat::Tsv => "TSV",
+        OutputFormat::Parquet => "Parquet",
+    };
+    eprintln!("Output format: {}", fmt_name);
 
     let output_config = OutputConfig {
         path: &results_path,
         bim: &bed.bim_records,
         cov_names: &cov_names,
+        format: cli.format,
     };
 
     let y_est = est_bed.as_ref().unwrap_or(&bed);

@@ -18,7 +18,7 @@ pub use parallel::ImputeConfig;
 use precompute::precompute;
 use rsvd::estimate_factors_streaming;
 use testing::{test_associations_fused, NmfGwasCvConfig, TestResults};
-pub use testing::OutputConfig;
+pub use testing::{OutputConfig, OutputFormat};
 
 extern "C" {
     fn openblas_set_num_threads(num_threads: std::ffi::c_int);

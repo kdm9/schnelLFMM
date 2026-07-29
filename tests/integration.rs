@@ -4,7 +4,7 @@ use schnellfmm::simulate::{
     simulate, write_covariates, write_ground_truth, write_latent_u, write_lfmm_format,
     write_plink, write_r_comparison_script, SimConfig,
 };
-use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, NmfConfig, OutputConfig, SnpNorm};
+use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, NmfConfig, OutputConfig, OutputFormat, SnpNorm};
 use ndarray::Array2;
 use ndarray_linalg::SVD;
 use std::fs;
@@ -127,7 +127,7 @@ fn test_lfmm2_quick() {
 
     // Run LFMM2
     let (output_path, cov_names) = test_output_setup(dir.path(), sim.x.ncols());
-    let output_config = OutputConfig { path: &output_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let output_config = OutputConfig { path: &output_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &output_config).unwrap();
 
     // Validation checks
@@ -193,7 +193,7 @@ fn test_lfmm2_large() {
     // Run LFMM2
     eprintln!("Running LFMM2...");
     let (output_path, cov_names) = test_output_setup(testdata, sim.x.ncols());
-    let output_config = OutputConfig { path: &output_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let output_config = OutputConfig { path: &output_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &output_config).unwrap();
 
     // Validation
@@ -246,14 +246,14 @@ fn test_reproducibility() {
     write_plink(dir1.path(), "sim", &sim).unwrap();
     let bed1 = BedFile::open(dir1.path().join("sim.bed")).unwrap();
     let (out1, cn1) = test_output_setup(dir1.path(), d);
-    let oc1 = OutputConfig { path: &out1, bim: &bed1.bim_records, cov_names: &cn1 };
+    let oc1 = OutputConfig { path: &out1, bim: &bed1.bim_records, cov_names: &cn1, format: OutputFormat::Tsv };
     let r1 = fit_lfmm2(&bed1, &SubsetSpec::All, &bed1, &sim.x, &config, &oc1).unwrap();
 
     let dir2 = tempfile::tempdir().unwrap();
     write_plink(dir2.path(), "sim", &sim).unwrap();
     let bed2 = BedFile::open(dir2.path().join("sim.bed")).unwrap();
     let (out2, cn2) = test_output_setup(dir2.path(), d);
-    let oc2 = OutputConfig { path: &out2, bim: &bed2.bim_records, cov_names: &cn2 };
+    let oc2 = OutputConfig { path: &out2, bim: &bed2.bim_records, cov_names: &cn2, format: OutputFormat::Tsv };
     let r2 = fit_lfmm2(&bed2, &SubsetSpec::All, &bed2, &sim.x, &config, &oc2).unwrap();
 
     // Compare TSV outputs
@@ -396,7 +396,7 @@ fn test_different_seeds_differ() {
     let d = sim_config.d;
     let cov_names = default_cov_names(d);
     let out1_path = dir.path().join("results1.tsv");
-    let oc1 = OutputConfig { path: &out1_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let oc1 = OutputConfig { path: &out1_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let r1 = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &base_config, &oc1).unwrap();
 
     let alt_config = Lfmm2Config {
@@ -404,7 +404,7 @@ fn test_different_seeds_differ() {
         ..base_config
     };
     let out2_path = dir.path().join("results2.tsv");
-    let oc2 = OutputConfig { path: &out2_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let oc2 = OutputConfig { path: &out2_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let r2 = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &alt_config, &oc2).unwrap();
 
     let p1 = read_results_tsv(&out1_path);
@@ -660,7 +660,7 @@ fn test_parallel_matches_sequential() {
     let d = sim.x.ncols();
     let cov_names = default_cov_names(d);
     let out_seq = dir.path().join("results_seq.tsv");
-    let oc_seq = OutputConfig { path: &out_seq, bim: &bed.bim_records, cov_names: &cov_names };
+    let oc_seq = OutputConfig { path: &out_seq, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let r_seq = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_seq, &oc_seq).unwrap();
 
     // Parallel run
@@ -669,7 +669,7 @@ fn test_parallel_matches_sequential() {
         ..config_seq
     };
     let out_par = dir.path().join("results_par.tsv");
-    let oc_par = OutputConfig { path: &out_par, bim: &bed.bim_records, cov_names: &cov_names };
+    let oc_par = OutputConfig { path: &out_par, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let r_par = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config_par, &oc_par).unwrap();
 
     // P-values should match within floating-point tolerance.
@@ -860,7 +860,7 @@ fn test_subset_rate_end_to_end() {
 
     // Run with Rate(0.5) — estimate on half the SNPs, test on all
     let out_rate = dir.path().join("results_rate.tsv");
-    let oc_rate = OutputConfig { path: &out_rate, bim: &bed.bim_records, cov_names: &cov_names };
+    let oc_rate = OutputConfig { path: &out_rate, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config, &oc_rate).unwrap();
     let p_rate = read_results_tsv(&out_rate);
 
@@ -878,7 +878,7 @@ fn test_subset_rate_end_to_end() {
 
     // P-values should differ from using All (different estimation subset → different U_hat)
     let out_all = dir.path().join("results_all.tsv");
-    let oc_all = OutputConfig { path: &out_all, bim: &bed.bim_records, cov_names: &cov_names };
+    let oc_all = OutputConfig { path: &out_all, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let _r_all = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc_all).unwrap();
     let p_all = read_results_tsv(&out_all);
     let mut any_diff = false;
@@ -934,7 +934,7 @@ fn test_subset_indices_end_to_end() {
     // Pick every 2nd SNP — same as Rate(0.5)
     let indices: Vec<usize> = (0..sim_config.n_snps).step_by(2).collect();
     let out_idx = dir.path().join("results_idx.tsv");
-    let oc_idx = OutputConfig { path: &out_idx, bim: &bed.bim_records, cov_names: &cov_names };
+    let oc_idx = OutputConfig { path: &out_idx, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let _r_indices = fit_lfmm2(
         &bed,
         &SubsetSpec::Indices(indices.clone()),
@@ -951,7 +951,7 @@ fn test_subset_indices_end_to_end() {
 
     // Since Rate(0.5) produces the same index set as step_by(2), results should match
     let out_rate = dir.path().join("results_rate.tsv");
-    let oc_rate = OutputConfig { path: &out_rate, bim: &bed.bim_records, cov_names: &cov_names };
+    let oc_rate = OutputConfig { path: &out_rate, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let _r_rate = fit_lfmm2(&bed, &SubsetSpec::Rate(0.5), &bed, &sim.x, &config, &oc_rate).unwrap();
     let p_rate = read_results_tsv(&out_rate);
 
@@ -1013,6 +1013,7 @@ fn test_output_config_writes_results() {
         path: &output_path,
         bim: &bed.bim_records,
         cov_names: &cov_names,
+        format: OutputFormat::Tsv,
     };
 
     let results = fit_lfmm2(
@@ -1539,7 +1540,7 @@ fn test_normalization_modes_end_to_end() {
         nmf: None,
         };
         let out_path = dir.path().join(format!("results_{}.tsv", idx));
-        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
         let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
 
         // Each mode should produce a valid GIF
@@ -2049,7 +2050,7 @@ fn test_k_sensitivity() {
                 nmf: None,
             };
             let out_path = dir.path().join(format!("results_k{}_kt{}.tsv", k_run, k_true));
-            let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+            let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
             let r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
             let pr = read_results_tsv(&out_path);
             gif_for_k.push(r.gif);
@@ -2164,7 +2165,7 @@ fn test_variance_decomposition() {
     };
 
     let (output_path, cov_names) = test_output_setup(dir.path(), sim.x.ncols());
-    let oc = OutputConfig { path: &output_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let oc = OutputConfig { path: &output_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let _r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
     let pr = read_results_tsv(&output_path);
     let p = sim_config.n_snps;
@@ -2278,7 +2279,7 @@ fn test_variance_decomposition_signal_levels() {
         let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
 
         let (out_path, cn) = test_output_setup(dir.path(), sim.x.ncols());
-        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cn };
+        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cn, format: OutputFormat::Tsv };
         let _r = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &lfmm_config, &oc).unwrap();
         let pr = read_results_tsv(&out_path);
         let p = sim_config.n_snps;
@@ -2386,7 +2387,7 @@ fn test_variance_decomposition_with_noise() {
     let d = sim.x.ncols();
     let cov_names = default_cov_names(d);
     let out_orig = dir_orig.path().join("results.tsv");
-    let oc_orig = OutputConfig { path: &out_orig, bim: &bed_orig.bim_records, cov_names: &cov_names };
+    let oc_orig = OutputConfig { path: &out_orig, bim: &bed_orig.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let _r_orig = fit_lfmm2(&bed_orig, &SubsetSpec::All, &bed_orig, &sim.x, &config, &oc_orig).unwrap();
     let pr_orig = read_results_tsv(&out_orig);
 
@@ -2422,7 +2423,7 @@ fn test_variance_decomposition_with_noise() {
 
     let bed_noisy = BedFile::open(dir_noisy.path().join("sim.bed")).unwrap();
     let out_noisy = dir_noisy.path().join("results.tsv");
-    let oc_noisy = OutputConfig { path: &out_noisy, bim: &bed_noisy.bim_records, cov_names: &cov_names };
+    let oc_noisy = OutputConfig { path: &out_noisy, bim: &bed_noisy.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let _r_noisy = fit_lfmm2(&bed_noisy, &SubsetSpec::All, &bed_noisy, &sim.x, &config, &oc_noisy).unwrap();
     let pr_noisy = read_results_tsv(&out_noisy);
 
@@ -2507,7 +2508,7 @@ fn test_nmf_vs_mean_imputation_structured_gea() {
         let d = sim.x.ncols();
         let cov_names = default_cov_names(d);
         let out_path = dir.path().join(format!("results_{:?}.tsv", impute));
-        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
         let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
         (read_results_tsv(&out_path), results)
     };
@@ -2668,7 +2669,7 @@ fn test_nmf_vs_mean_imputation_gif_inflation() {
         let d = sim.x.ncols();
         let cov_names = default_cov_names(d);
         let out_path = dir.path().join(format!("results_gif_{:?}.tsv", impute));
-        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
         let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
         (read_results_tsv(&out_path), results)
     };
@@ -2799,7 +2800,7 @@ fn test_nmf_imputation_end_to_end() {
     let d = sim.x.ncols();
     let cov_names = default_cov_names(d);
     let out_path = dir.path().join("results.tsv");
-    let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+    let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
 
     // NMF training-phase CV: one value per iteration, all finite and non-negative
@@ -2906,7 +2907,7 @@ fn test_nmf_determinism_multithreaded() {
         let config = nmf_test_config(2, 4, 2);
         let out_path = dir.path().join(format!("results_{}.tsv", tag));
         let cov_names = default_cov_names(d);
-        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names };
+        let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
         fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
         (out_path, dir)
     };
