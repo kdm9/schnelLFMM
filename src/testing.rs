@@ -2,9 +2,8 @@ use anyhow::{Context, Result};
 use ndarray::Array2;
 use ndarray_linalg::InverseInto;
 use statrs::distribution::{ContinuousCDF, Normal, StudentsT};
-use std::collections::BTreeMap;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
@@ -13,6 +12,10 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
+use parquet::column::writer::ColumnCloseResult;
+use parquet::file::metadata::ParquetMetaData;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::writer::SerializedFileWriter;
 use parquet::file::properties::WriterProperties;
 
 use rand::SeedableRng;
@@ -580,7 +583,7 @@ fn write_chunk_parquet(
     let file = std::fs::File::create(&path)
         .with_context(|| format!("Failed to create {}", path.display()))?;
     let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(Compression::LZ4)
         .build();
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
         .map_err(|e| anyhow::anyhow!("Failed to create parquet writer for {}: {}", path.display(), e))?;
@@ -797,17 +800,20 @@ fn coalesce_output_tsv(
 }
 
 // ---------------------------------------------------------------------------
-// Parquet coalescence (parallel: workers calibrate, main writes)
+// Parquet coalescence (per-worker Zstd-encoded .parquet + byte-level concat)
 // ---------------------------------------------------------------------------
 
 /// Coalesce chunk .parquet files into a single Zstd-compressed Parquet.
 ///
-/// Parallel over chunks: workers read chunks and calibrate p-values via
-/// `calibrate_batch` concurrently. Calibrated RecordBatches are sent to the
-/// main thread via a crossbeam channel. The main thread reorders by chunk
-/// sequence and writes row groups sequentially to ensure correct output
-/// ordering. Zstd compression runs in the main thread during row group
-/// encoding.
+/// Phase A (parallel): workers independently read LZ4 chunk files, calibrate
+/// p-values via `calibrate_batch`, and write Zstd-compressed calibrated
+/// output to per-worker temp .parquet files.  All Zstd work happens here,
+/// spread across workers.
+///
+/// Phase B (serial): the main thread concats per-worker files into the final
+/// output via row-group copy.  No decompression or re-encoding -- each column
+/// chunk's already-compressed bytes are copied directly.  I/O-bound, not
+/// CPU-bound.
 fn coalesce_output_parquet(
     output_path: &Path,
     cov_names: &[String],
@@ -825,7 +831,8 @@ fn coalesce_output_parquet(
 
     let n_workers = n_workers.min(n_chunks).max(1);
 
-    let (tx, rx) = crossbeam_channel::bounded::<(usize, RecordBatch)>(n_workers * 2);
+    // -- Phase A: workers write per-worker .parquet files with Zstd ----------
+    let (tx, rx) = crossbeam_channel::bounded::<(usize, PathBuf)>(n_workers);
 
     std::thread::scope(|s| {
         for w in 0..n_workers {
@@ -833,60 +840,113 @@ fn coalesce_output_parquet(
             let gif_sqrt = gif_sqrt.clone();
             let cov_names = cov_names_arc.clone();
             let chunk_dir = chunk_dir.clone();
+            let schema = output_schema.clone();
 
             s.spawn(move || {
+                let worker_path = chunk_dir.join(format!(".lfmm2_worker_{:02}.parquet", w));
+                let file = std::fs::File::create(&worker_path)
+                    .expect("create worker temp parquet");
+
+                let props = WriterProperties::builder()
+                    .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                    .build();
+                let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+                    .expect("create worker ArrowWriter");
+
                 let mut seq = w;
                 while seq < n_chunks {
                     let chunk_path = chunk_dir.join(format!("chunk_{:06}.parquet", seq));
-                    match read_parquet_to_batch(&chunk_path) {
-                        Ok(batch) => match calibrate_batch(&batch, &gif_sqrt, d, &cov_names) {
-                            Ok(calibrated) => {
-                                if tx.send((seq, calibrated)).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                panic!("calibrate chunk {}: {}", seq, e);
-                            }
-                        },
-                        Err(e) => {
-                            panic!("read chunk {}: {}", seq, e);
-                        }
-                    }
+                    let batch = read_parquet_to_batch(&chunk_path)
+                        .expect("read chunk parquet");
+                    let calibrated = calibrate_batch(&batch, &gif_sqrt, d, &cov_names)
+                        .expect("calibrate batch");
+                    writer.write(&calibrated)
+                        .expect("write worker row group");
                     seq += n_workers;
                 }
+
+                writer.close().expect("close worker ArrowWriter");
+
+                let _ = tx.send((w, worker_path));
             });
         }
         drop(tx);
 
-        let file = std::fs::File::create(output_path)
-            .with_context(|| format!("Failed to create {}", output_path.display()))
-            .unwrap();
-        let props = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
-            .build();
-        let mut writer = ArrowWriter::try_new(file, output_schema, Some(props)).unwrap();
-
-        let mut pending: BTreeMap<usize, RecordBatch> = BTreeMap::new();
-        let mut next_seq = 0usize;
-        let pb = make_progress_bar(n_chunks as u64, "Write output", progress);
-
-        for (seq, batch) in rx {
-            pending.insert(seq, batch);
-            while let Some(batch) = pending.remove(&next_seq) {
-                writer.write(&batch)
-                    .with_context(|| format!("Failed to write row group {}", next_seq))
-                    .unwrap();
-                pb.inc(1);
-                next_seq += 1;
-            }
+        // Collect worker paths
+        let mut worker_paths: Vec<PathBuf> = Vec::with_capacity(n_workers);
+        for (_w, path) in rx {
+            worker_paths.push(path);
         }
 
-        writer.close()
-            .map_err(|e| anyhow::anyhow!("Failed to finalise {}: {}", output_path.display(), e))
-            .unwrap();
-        pb.finish_and_clear();
+        // -- Phase B: byte-level concat of per-worker files ------------------
+        concat_parquet_files(&worker_paths, output_path)
+            .expect("failed to concat per-worker parquet files");
+
+        // Clean up worker temp files (chunk_dir is tempdir, but explicit cleanup
+        // ensures they are gone before we return)
+        for p in &worker_paths {
+            let _ = std::fs::remove_file(p);
+        }
+
+        if progress {
+            eprintln!("Output written to {}", output_path.display());
+        }
     });
+
+    Ok(())
+}
+
+/// Concatenate multiple Parquet files with identical schema into one.
+///
+/// Copies row groups byte-for-byte without decompression or re-encoding.
+fn concat_parquet_files(input_paths: &[PathBuf], output_path: &Path) -> Result<()> {
+    if input_paths.is_empty() {
+        anyhow::bail!("No input files to concatenate");
+    }
+
+    // Read metadata from each input file, then re-open for column reads
+    let mut metas: Vec<ParquetMetaData> = Vec::with_capacity(input_paths.len());
+    for p in input_paths {
+        let file = std::fs::File::open(p)
+            .with_context(|| format!("Failed to open {}", p.display()))?;
+        let reader = SerializedFileReader::new(file)
+            .with_context(|| format!("Failed to read {}", p.display()))?;
+        metas.push(reader.metadata().clone());
+        // reader (and its file handle) dropped here
+    }
+
+    let schema = metas[0].file_metadata().schema_descr().root_schema_ptr();
+    let props = Arc::new(WriterProperties::builder().build());
+    let file = std::fs::File::create(output_path)
+        .with_context(|| format!("Failed to create {}", output_path.display()))?;
+    let mut writer = SerializedFileWriter::new(file, schema, props)
+        .map_err(|e| anyhow::anyhow!("Failed to create SerializedFileWriter: {}", e))?;
+
+    for (idx, meta) in metas.iter().enumerate() {
+        let mut data_file = std::fs::File::open(&input_paths[idx])
+            .with_context(|| format!("Failed to re-open {} for column reads", input_paths[idx].display()))?;
+
+        for rg in meta.row_groups() {
+            let mut rg_out = writer.next_row_group()
+                .map_err(|e| anyhow::anyhow!("Failed to create row group: {}", e))?;
+            for column in rg.columns() {
+                rg_out.append_column(&mut data_file, ColumnCloseResult {
+                    bytes_written: column.compressed_size() as u64,
+                    rows_written: rg.num_rows() as u64,
+                    metadata: column.clone(),
+                    bloom_filter: None,
+                    column_index: None,
+                    offset_index: None,
+                })
+                    .map_err(|e| anyhow::anyhow!("Failed to append column: {}", e))?;
+            }
+            rg_out.close()
+                .map_err(|e| anyhow::anyhow!("Failed to close row group: {}", e))?;
+        }
+    }
+
+    writer.close()
+        .map_err(|e| anyhow::anyhow!("Failed to close output: {}", e))?;
 
     Ok(())
 }

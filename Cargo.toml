@@ -24,10 +24,7 @@ byteorder = "1"
 tempfile = "3"
 indicatif = "0.18.4"
 arrow = { version = "54", default-features = false }
-parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd"] }
-
-[patch.crates-io]
-native-tls = {git = "https://github.com/rust-native-tls/rust-native-tls"}
+parquet = { version = "54", default-features = false, features = ["arrow", "lz4", "zstd"] }
 
 [dev-dependencies]
 approx = "0.5"
