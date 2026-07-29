@@ -4,6 +4,7 @@ use ndarray_linalg::InverseInto;
 use statrs::distribution::{ContinuousCDF, Normal, StudentsT};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, StringArray};
@@ -831,7 +832,26 @@ fn coalesce_output_parquet(
 
     let n_workers = n_workers.min(n_chunks).max(1);
 
-    // -- Phase A: workers write per-worker .parquet files with Zstd ----------
+    // Progress tracking for Phase A (parallel encoding)
+    let chunks_encoded = Arc::new(AtomicUsize::new(0));
+    let phase_a_finished = Arc::new(AtomicBool::new(false));
+    let progress_handle = if progress {
+        let chunks_encoded_th = chunks_encoded.clone();
+        let phase_a_finished_th = phase_a_finished.clone();
+        Some(std::thread::spawn(move || {
+            let pb = make_progress_bar(n_chunks as u64, "Calbrating p values", true);
+            while !phase_a_finished_th.load(Ordering::Acquire) {
+                pb.set_position(chunks_encoded_th.load(Ordering::Relaxed) as u64);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            pb.set_position(n_chunks as u64);
+            pb.finish_and_clear();
+        }))
+    } else {
+        None
+    };
+
+    // Calibrate & Encode:  workers write per-worker .parquet files with Zstd
     let (tx, rx) = crossbeam_channel::bounded::<(usize, PathBuf)>(n_workers);
 
     std::thread::scope(|s| {
@@ -841,6 +861,7 @@ fn coalesce_output_parquet(
             let cov_names = cov_names_arc.clone();
             let chunk_dir = chunk_dir.clone();
             let schema = output_schema.clone();
+            let chunks_encoded = chunks_encoded.clone();
 
             s.spawn(move || {
                 let worker_path = chunk_dir.join(format!(".lfmm2_worker_{:02}.parquet", w));
@@ -862,6 +883,7 @@ fn coalesce_output_parquet(
                         .expect("calibrate batch");
                     writer.write(&calibrated)
                         .expect("write worker row group");
+                    chunks_encoded.fetch_add(1, Ordering::Relaxed);
                     seq += n_workers;
                 }
 
@@ -878,8 +900,13 @@ fn coalesce_output_parquet(
             worker_paths.push(path);
         }
 
-        // -- Phase B: byte-level concat of per-worker files ------------------
-        concat_parquet_files(&worker_paths, output_path)
+        // Concate per-worker encoded output
+        if let Some(h) = progress_handle {
+            phase_a_finished.store(true, Ordering::Release);
+            h.join().expect("progress thread panicked");
+        }
+
+        concat_parquet_files(&worker_paths, output_path, progress)
             .expect("failed to concat per-worker parquet files");
 
         // Clean up worker temp files (chunk_dir is tempdir, but explicit cleanup
@@ -899,10 +926,12 @@ fn coalesce_output_parquet(
 /// Concatenate multiple Parquet files with identical schema into one.
 ///
 /// Copies row groups byte-for-byte without decompression or re-encoding.
-fn concat_parquet_files(input_paths: &[PathBuf], output_path: &Path) -> Result<()> {
+fn concat_parquet_files(input_paths: &[PathBuf], output_path: &Path, progress: bool) -> Result<()> {
     if input_paths.is_empty() {
         anyhow::bail!("No input files to concatenate");
     }
+
+    let pb = make_progress_bar(input_paths.len() as u64, "Concatenating", progress);
 
     // Read metadata from each input file, then re-open for column reads
     let mut metas: Vec<ParquetMetaData> = Vec::with_capacity(input_paths.len());
@@ -912,7 +941,6 @@ fn concat_parquet_files(input_paths: &[PathBuf], output_path: &Path) -> Result<(
         let reader = SerializedFileReader::new(file)
             .with_context(|| format!("Failed to read {}", p.display()))?;
         metas.push(reader.metadata().clone());
-        // reader (and its file handle) dropped here
     }
 
     let schema = metas[0].file_metadata().schema_descr().root_schema_ptr();
@@ -923,14 +951,14 @@ fn concat_parquet_files(input_paths: &[PathBuf], output_path: &Path) -> Result<(
         .map_err(|e| anyhow::anyhow!("Failed to create SerializedFileWriter: {}", e))?;
 
     for (idx, meta) in metas.iter().enumerate() {
-        let mut data_file = std::fs::File::open(&input_paths[idx])
+        let data_file = std::fs::File::open(&input_paths[idx])
             .with_context(|| format!("Failed to re-open {} for column reads", input_paths[idx].display()))?;
 
         for rg in meta.row_groups() {
             let mut rg_out = writer.next_row_group()
                 .map_err(|e| anyhow::anyhow!("Failed to create row group: {}", e))?;
             for column in rg.columns() {
-                rg_out.append_column(&mut data_file, ColumnCloseResult {
+                rg_out.append_column(&data_file, ColumnCloseResult {
                     bytes_written: column.compressed_size() as u64,
                     rows_written: rg.num_rows() as u64,
                     metadata: column.clone(),
@@ -943,7 +971,10 @@ fn concat_parquet_files(input_paths: &[PathBuf], output_path: &Path) -> Result<(
             rg_out.close()
                 .map_err(|e| anyhow::anyhow!("Failed to close row group: {}", e))?;
         }
+        pb.inc(1);
     }
+
+    pb.finish_and_clear();
 
     writer.close()
         .map_err(|e| anyhow::anyhow!("Failed to close output: {}", e))?;

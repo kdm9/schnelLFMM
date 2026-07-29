@@ -129,6 +129,17 @@ covariates, latent factors, and residual variation) and `<out>.summary.txt`
 with a summary of run arguments and details (including NMF cross-validation
 errors when `--nmf-impute` is used).
 
+Because these results can be quite large, schnelLFMM supports writing to
+parquet files instead of tsv. These files can be directly read by `nanoparquet`
+in R, or better yet `duckplyr` can use duckdb to do out-of-core
+filtering/manipulation on these datasets without even needing to read them all
+into RAM. To enable this, use `--format parquet`. NB: for efficiency, when
+writing to parquet files results are not necessarily sorted by genome position.
+`duckplyr` can return sorted results (potentially after filtering), or just
+sort it in R.
+
+
+
 ## Differences to R's LEA::lfmm2()
 
 Overall, our implementation tries to closely follow Caye et al's paper and
