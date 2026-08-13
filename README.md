@@ -34,23 +34,6 @@ sample's admixture proportions. We use NNMF to impute genotypes by first
 estimating the sample's admixture proportions (by fitting NNMF: $Y = W H$),
 then use these to predict any missing genotypes per SNP.
 
-Importantly, this imputation is limited in scope, in that we are only
-trying to enable and improve the association itself, not produce an accurate
-complete SNP matrix (use BEAGLE or other tools for that, where possible). Take
-a case of GEA across two diverged populations: at some SNP with a few missing
-calls, whose genotypes broadly follow population structure, we have two
-alternatives: we can fill missing values with the global mean, or fill with the
-population-specific mean values. If we fill with a global mean, we introduce
-more error as imputed values fall between the two population-level means,
-whereas if predict mean genotypes based on sample admixture proportions, then
-the imputed values follow underlying population structure. Given the
-mixed-effect LFMM term corrects for this background population structure, NMF
-effectively ensures that population-imputed values don't induce bias in the
-estimation of fixed covariate effects. Conversely, global-mean imputation may
-leave some residual signal after population structure correction (as values
-don't follow population structure), and may induce error during estimation of
-fixed effects.
-
 
 Why schnelLFMM? Schnell is German for fast, and I can't help myself from making
 dumb punny tool names. Sorry.
@@ -164,9 +147,32 @@ These multiple passes of the BED file might seem inefficient, however with
 modern SSDs computation time will vastly exceed the IO speed, so the overall
 contribution to runtime is worth the vastly improved memory efficiency.
 
+## NNMF
+
 Our NMF imputation algorithm is inspired by those in LEA, rather than directly
 implementing their exact approach. This is mostly to avoid multiple full passes
 over the entire genome file (as opposed to the estimation subset). Provided the
 --est parameters (either the independent estimation BED or subsampling rate)
 produce a snp subset from which an accurate picture of genome-wide relatedness
-can be learnt, then there is should be no practical difference.
+can be learnt, then there should be no practical difference.
+
+Importantly, this imputation is limited in scope, in that we are only
+trying to enable and improve the association itself, not produce an accurate
+complete SNP matrix (use BEAGLE or other tools for that, where possible). Take
+a case of GEA across two diverged populations: at some SNP with a few missing
+calls, whose genotypes broadly follow population structure, we have two
+alternatives: we can fill missing values with the global mean, or fill with the
+population-specific mean values. If we fill with a global mean, we introduce
+more error as imputed values fall between the two population-level means,
+whereas if predict mean genotypes based on sample admixture proportions, then
+the imputed values follow underlying population structure. Given the
+mixed-effect LFMM term corrects for this background population structure, NMF
+effectively ensures that population-imputed values don't induce bias in the
+estimation of fixed covariate effects. Conversely, global-mean imputation may
+leave some residual signal after population structure correction (as values
+don't follow population structure), and may induce error during estimation of
+fixed effects. In all cases, if you use NMF, check the summary file. If the
+imputation mean absolute error rate is lower with mean imputation than NMF during
+GWAS, the re-run with mean imputation. This can happen in populations with very
+little structure, where (for the purposes of NNMF) the correct K is 1, i.e.
+mean imputation.
