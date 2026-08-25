@@ -114,7 +114,7 @@ errors when `--nmf-impute` is used).
 
 Because these results can be quite large, schnelLFMM supports writing to
 parquet files instead of tsv. These files can be directly read by `nanoparquet`
-in R, or better yet `duckplyr` can use duckdb to do out-of-core
+in R, or better yet `duckplyr` can use DuckDB to do out-of-core
 filtering/manipulation on these datasets without even needing to read them all
 into RAM. To enable this, use `--format parquet`. NB: for efficiency, when
 writing to parquet files results are not necessarily sorted by genome position.
