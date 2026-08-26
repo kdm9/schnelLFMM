@@ -10,7 +10,7 @@ use schnellfmm::bed::{BedFile, SubsetSpec};
 use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, NmfConfig, OutputConfig, OutputFormat, SnpNorm};
 
 #[derive(Parser)]
-#[command(name = "lfmm2", about = "Latent Factor Mixed Model v2 - GWAS with latent confounders")]
+#[command(name = "schnelLFMM", about = "schnelLFMM: Latent Factor Mixed Models at scale", version = env!("CARGO_PKG_VERSION"))]
 #[command(group = ArgGroup::new("impute").args(&["mean_impute", "nmf_impute"]))]
 struct Cli {
     /// PLINK .bed file (with .bim/.fam)
