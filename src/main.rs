@@ -241,12 +241,18 @@ fn main() -> Result<()> {
     let results = fit_lfmm2(y_est, &est_subset, &bed, &x, &config, &output_config)?;
 
     eprintln!("GIF: {:.4}", results.gif);
+    for (name, g) in cov_names.iter().zip(results.gif_per_covariate.iter()) {
+        eprintln!("  GIF[{}]: {:.4}", name, g);
+    }
     eprintln!("Results written to {}", results_path.display());
 
     {
         let mut f = std::fs::File::create(&summary_path)
             .with_context(|| format!("Failed to create {}", summary_path))?;
         writeln!(f, "GIF: {:.6}", results.gif)?;
+        for (name, g) in cov_names.iter().zip(results.gif_per_covariate.iter()) {
+            writeln!(f, "GIF[{}]: {:.6}", name, g)?;
+        }
         writeln!(f, "n_samples: {}", bed.n_samples)?;
         writeln!(f, "n_snps: {}", bed.n_snps)?;
         writeln!(f, "K: {}", cli.k)?;

@@ -79,6 +79,9 @@ pub struct TestResults {
     /// Genomic inflation factor: average of the *unclamped* per-trait estimates
     /// (diagnostic). P-value calibration uses per-trait GIFs clamped to >= 1.0.
     pub gif: f64,
+    /// Per-covariate genomic inflation factors, *unclamped* (diagnostic), in the
+    /// same order as the covariate columns of X.
+    pub gif_per_covariate: Vec<f64>,
     /// NMF cross-validation MAE per iteration (only when NMF imputation is used).
     pub nmf_cv: Option<Vec<f64>>,
     /// Mean imputation CV MAE for comparison (only when NMF imputation is used).
@@ -149,17 +152,17 @@ impl TsqHistogram {
     }
 
     /// Compute per-trait GIF from the histogram medians.
-    /// Returns (gif_per_trait, avg_gif_raw):
+    /// Returns (gif_per_trait, gif_per_trait_raw):
     ///
     /// - `gif_per_trait`: clamped to a minimum of 1.0, used for p-value
     ///   calibration.  Deflation (GIF < 1) would make calibration
     ///   anti-conservative (dividing t by sqrt(GIF) < 1 inflates |z|).
-    /// - `avg_gif_raw`: average of the *unclamped* per-trait estimates,
-    ///   reported as a diagnostic (deflation is itself informative).
-    fn compute_gif(&self) -> (Vec<f64>, f64) {
+    /// - `gif_per_trait_raw`: the *unclamped* per-trait estimates, reported as
+    ///   a diagnostic (deflation is itself informative).
+    fn compute_gif(&self) -> (Vec<f64>, Vec<f64>) {
         let d = self.counts.len();
         let mut gif_per_trait = Vec::with_capacity(d);
-        let mut total_gif_raw = 0.0;
+        let mut gif_per_trait_raw = Vec::with_capacity(d);
 
         for j in 0..d {
             let median_t_sq = self.median_for_trait(j);
@@ -169,11 +172,10 @@ impl TsqHistogram {
                 median_t_sq / 0.4549
             };
             gif_per_trait.push(gif_raw.max(1.0));
-            total_gif_raw += gif_raw;
+            gif_per_trait_raw.push(gif_raw);
         }
 
-        let avg_gif_raw = total_gif_raw / d as f64;
-        (gif_per_trait, avg_gif_raw)
+        (gif_per_trait, gif_per_trait_raw)
     }
 
     /// Walk bins to find the median for a given trait.
@@ -502,7 +504,8 @@ pub fn test_associations_fused(
         };
 
     // GIF calibration via streaming histogram
-    let (gif_per_trait, avg_gif) = mtx_histogram.into_inner().unwrap().compute_gif();
+    let (gif_per_trait, gif_per_trait_raw) = mtx_histogram.into_inner().unwrap().compute_gif();
+    let avg_gif = gif_per_trait_raw.iter().sum::<f64>() / gif_per_trait_raw.len() as f64;
 
     // Coalesce chunk files into final output
     match output.format {
@@ -519,6 +522,7 @@ pub fn test_associations_fused(
     Ok(TestResults {
         u_hat: u_hat.to_owned(),
         gif: avg_gif,
+        gif_per_covariate: gif_per_trait_raw,
         nmf_cv: None,
         nmf_cv_mean: None,
         nmf_gwas_cv_mae,

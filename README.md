@@ -109,8 +109,10 @@ We have an example in `examples/ath` that reanalyses the days to flowering at
 Results are written to `<out>.tsv` (per-SNP effect sizes, t-statistics, and
 calibrated p-values for each trait, plus per-SNP $R^2$ fractions for
 covariates, latent factors, and residual variation) and `<out>.summary.txt`
-with a summary of run arguments and details (including NMF cross-validation
-errors when `--nmf-impute` is used).
+with a summary of run arguments and details: the overall genomic inflation
+factor (`GIF:`), the per-covariate GIFs (`GIF[<covariate>]:`, unclamped, so
+values below 1 indicate deflation), and NMF cross-validation errors when
+`--nmf-impute` is used.
 
 Because these results can be quite large, schnelLFMM supports writing to
 parquet files instead of tsv. These files can be directly read by `nanoparquet`
