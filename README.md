@@ -120,7 +120,6 @@ writing to parquet files results are not necessarily sorted by genome position.
 sort it in R.
 
 
-
 ## Differences to R's LEA::lfmm2()
 
 Overall, our implementation tries to closely follow Caye et al's paper and
@@ -148,56 +147,27 @@ contribution to runtime is worth the vastly improved memory efficiency.
 ## Latent-factor imputation
 
 Missing genotypes are filled with their fitted value under the latent-factor
-term of the LFMM model itself:
+term of the LFMM model itself. Importantly, this imputation is limited in
+scope, in that we are only trying to enable and improve the association itself,
+not produce an accurate complete SNP matrix (use BEAGLE or other tools for
+that, where possible). 
 
-$$\hat{y}_{ij} = \mathrm{clamp}\left(\bar{y}_j + \left(P_{\hat{U}}\left(Y^{\text{filled}} - \bar{y}\right)\right)_{ij},\ 0,\ 2\right),
-\qquad P_{\hat{U}} = \hat{U}(\hat{U}^T\hat{U})^{-1}\hat{U}^T$$
-
-No separate factorisation is trained — $\hat{U}$ is already computed for the
-latent-factor term. Because $\hat{U}$ is itself estimated from genotypes that
-need imputing, the pipeline takes one EM step: estimate $\hat{U}$ with mean
-imputation, re-estimate it over the estimation subset with the latent fill, then
-impute and test against the result. The cost is one extra round of factor
-estimation over the estimation subset (not the whole genome).
-
-Importantly, this imputation is limited in scope, in that we are only trying to
-enable and improve the association itself, not produce an accurate complete SNP
-matrix (use BEAGLE or other tools for that, where possible). Take a case of GEA
-across two diverged populations: at some SNP with a few missing calls, whose
-genotypes broadly follow population structure, we have two alternatives: we can
-fill missing values with the global mean, or fill with the population-specific
-mean values. If we fill with a global mean, we introduce more error as imputed
-values fall between the two population-level means, whereas if we predict
-genotypes from where each sample sits in the latent structure, the imputed
-values follow that structure. Given the mixed-effect LFMM term corrects for this
-background population structure, latent imputation effectively ensures that
-imputed values don't induce bias in the estimation of fixed covariate effects.
-Conversely, global-mean imputation may leave some residual signal after
-population structure correction (as values don't follow population structure),
-and may induce error during estimation of fixed effects.
-
-The fill projects onto $\mathrm{col}(\hat{U})$ **only** — never onto the full
-fitted model including the covariates $X$. Including $X$ would write the effect
-under test into the imputed genotypes; on simulated null data at 20%
-missingness that drives the GIF to 1.5 and the false-positive rate to 11%.
+Take a case of GEA across two diverged populations: at some SNP with a few
+missing calls, whose genotypes broadly follow population structure, we have two
+alternatives: we can fill missing values with the global mean, or fill with the
+population-specific mean values. If we fill with a global mean, we introduce
+more error as imputed values fall between the two population-level means,
+whereas if we predict genotypes from where each sample sits in the latent
+structure, the imputed values follow that structure. Given the mixed-effect
+LFMM term corrects for this background population structure, latent imputation
+effectively ensures that imputed values don't induce bias in the estimation of
+fixed covariate effects. Conversely, global-mean imputation may leave some
+residual signal after population structure correction (as values don't follow
+population structure), and may induce error during estimation of fixed effects.
 
 In all cases, check the summary file. `gwas_cv_mae` is the held-out mean
 absolute error of the imputer and `gwas_cv_mean_mae` is the mean-imputation
 baseline on the same positions; if the former is not lower, re-run with
 `--mean-impute`. This can happen in populations with very little structure,
-where the correct K for imputation purposes is 1, i.e. mean imputation.
-
-### A note on the previous NMF implementation
-
-Versions before 0.4.0 offered `--nmf-impute`, which trained a non-negative
-matrix factorisation $Y \approx WH$ on raw dosages. It was removed because it
-performed no better than mean imputation at moderate structure ($F_{ST}$
-5–25%): the initialisation took the entrywise absolute value of signed sketch
-vectors, which destroyed the between-population contrast (the initial basis
-captured 0.9% of the true structure — no better than random), and 10
-multiplicative updates could not recover from it. Separately, non-negativity on
-raw dosages spends one component on the per-SNP mean and biases each fit,
-costing over half the achievable gain even given a perfect basis. Non-negativity
-bought nothing downstream, since the fill is centered immediately afterwards.
-The signed rank-K projection above matches a fully converged NMF at a fraction
-of the cost, using a basis the pipeline already has.
+where the correct K for imputation purposes is 1, i.e. mean imputation,
+regardless of what the correct K for LFMM estimation is.
