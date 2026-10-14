@@ -72,6 +72,27 @@ pub struct OutputConfig<'a> {
     pub format: OutputFormat,
 }
 
+/// Held-out cross-validation report for an imputation strategy.
+///
+/// A random sample of *observed* genotypes is masked, predicted from the
+/// deployed estimator, and compared against the mean-imputation baseline on the
+/// same positions (a paired comparison, on the raw dosage scale {0,1,2}).
+pub struct ImputeCvReport {
+    /// Mean absolute error of the imputer on held-out genotypes.
+    pub mae: f64,
+    /// Mean absolute error of the mean-imputation baseline on the same positions.
+    pub mean_mae: f64,
+    /// Number of held-out positions evaluated.
+    pub count: u64,
+}
+
+impl ImputeCvReport {
+    /// True when the imputer failed to beat the mean-imputation baseline.
+    pub fn lost_to_mean(&self) -> bool {
+        self.count > 0 && self.mae >= self.mean_mae
+    }
+}
+
 /// Results from the LFMM2 association testing pass.
 pub struct TestResults {
     /// Estimated latent factors: n x K
@@ -82,28 +103,21 @@ pub struct TestResults {
     /// Per-covariate genomic inflation factors, *unclamped* (diagnostic), in the
     /// same order as the covariate columns of X.
     pub gif_per_covariate: Vec<f64>,
-    /// NMF cross-validation MAE per iteration (only when NMF imputation is used).
-    pub nmf_cv: Option<Vec<f64>>,
-    /// Mean imputation CV MAE for comparison (only when NMF imputation is used).
-    pub nmf_cv_mean: Option<f64>,
-    /// Per-block GWAS-phase CV MAE using the actual NmfOnTheFly estimator
-    /// (H_chunk = max(0, W_pinv @ Y)), same method used during GWAS scans.
-    pub nmf_gwas_cv_mae: Option<f64>,
-    /// Mean-imputation baseline MAE on the same held-out positions.
-    pub nmf_gwas_cv_mean_mae: Option<f64>,
-    /// Number of masked positions evaluated in the GWAS-phase CV.
-    pub nmf_gwas_cv_count: Option<u64>,
+    /// Held-out imputation accuracy measured during the GWAS pass, using the
+    /// same estimator that fills missing genotypes there. `None` under mean
+    /// imputation (there is nothing to compare against).
+    pub gwas_cv: Option<ImputeCvReport>,
 }
 
-/// Configuration for per-block NMF cross-validation during the GWAS pass.
+/// Configuration for per-block imputation cross-validation during the GWAS pass.
 ///
-/// Evaluates the same `H_chunk = max(0, W_pinv @ Y_imputed)` estimator
-/// used on-the-fly for imputing missing genotypes during association testing.
-pub struct NmfGwasCvConfig {
+/// Evaluates the same latent-factor projection used on-the-fly for imputing
+/// missing genotypes during association testing.
+pub struct ImputeGwasCvConfig {
     pub cv_rate: f64,
     pub seed: u64,
-    pub w: Array2<f64>,
-    pub w_pinv: Array2<f64>,
+    pub u: Array2<f64>,
+    pub utu_inv: Array2<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +273,7 @@ pub fn test_associations_fused(
     config: &Lfmm2Config,
     output: &OutputConfig,
     impute: ImputeConfig,
-    nmf_gwas_cv: Option<NmfGwasCvConfig>,
+    gwas_cv_cfg: Option<ImputeGwasCvConfig>,
 ) -> Result<TestResults> {
     let n = y_full.n_samples;
     let p = y_full.n_snps;
@@ -341,9 +355,9 @@ pub fn test_associations_fused(
     let n_chunks = p.div_ceil(chunk_size);
     let pb = make_progress_bar(n_chunks as u64, "Association tests", config.progress);
 
-    // Per-block CV state using the same NmfOnTheFly estimator
-    let nmf_cv_acc: Option<std::sync::Arc<std::sync::Mutex<(f64, f64, u64)>>> =
-        nmf_gwas_cv.as_ref().map(|_| {
+    // Per-block CV state using the same latent-factor estimator
+    let cv_acc: Option<std::sync::Arc<std::sync::Mutex<(f64, f64, u64)>>> =
+        gwas_cv_cfg.as_ref().map(|_| {
             std::sync::Arc::new(Mutex::new((0.0f64, 0.0f64, 0u64)))
         });
     let cv_bps = y_full.bytes_per_snp();
@@ -421,8 +435,8 @@ pub fn test_associations_fused(
 
             pb.inc(1);
 
-            // Per-block NMF CV using the on-the-fly estimator (same as GWAS imputation)
-            if let (Some(ref cv_cfg), Some(ref acc)) = (&nmf_gwas_cv, &nmf_cv_acc) {
+            // Per-block CV using the same estimator that fills the GWAS pass
+            if let (Some(ref cv_cfg), Some(ref acc)) = (&gwas_cv_cfg, &cv_acc) {
                 let n_cols = block.n_cols;
                 let cv_indices: Vec<usize> = (0..n_cols).collect();
 
@@ -454,6 +468,9 @@ pub fn test_associations_fused(
                 }
 
                 if !mask_positions.is_empty() {
+                    // Leave-out column means: held-out positions are NaN here,
+                    // so they are excluded from the baseline they are scored against.
+                    let mut means = vec![0.0f64; n_cols];
                     for col in 0..n_cols {
                         let mut sum = 0.0;
                         let mut n_obs = 0u32;
@@ -462,6 +479,7 @@ pub fn test_associations_fused(
                             if !v.is_nan() { sum += v; n_obs += 1; }
                         }
                         let mean = if n_obs > 0 { sum / n_obs as f64 } else { 0.0 };
+                        means[col] = mean;
                         for row in 0..n {
                             if masked[(row, col)].is_nan() {
                                 masked[(row, col)] = mean;
@@ -469,20 +487,19 @@ pub fn test_associations_fused(
                         }
                     }
 
-                    let h_raw = cv_cfg.w_pinv.dot(&masked);
-                    let h_chunk: Array2<f64> = h_raw.mapv(|v| v.max(0.0));
-                    let pred = cv_cfg.w.dot(&h_chunk);
+                    let pred = crate::parallel::latent_fill_values(
+                        &masked.view(), &means, &cv_cfg.u, &cv_cfg.utu_inv,
+                    );
 
-                    let mut nmf_err = 0.0f64;
+                    let mut impute_err = 0.0f64;
                     let mut mean_err = 0.0f64;
                     for &(row, col, true_val) in &mask_positions {
-                        nmf_err += (true_val - pred[(row, col)]).abs();
-                        mean_err += (true_val - masked[(row, col)]).abs();
-                        // masked[(row, col)] is the column-mean fill for this position
+                        impute_err += (true_val - pred[(row, col)]).abs();
+                        mean_err += (true_val - means[col]).abs();
                     }
 
                     let mut acc_guard = acc.lock().unwrap();
-                    acc_guard.0 += nmf_err;
+                    acc_guard.0 += impute_err;
                     acc_guard.1 += mean_err;
                     acc_guard.2 += mask_positions.len() as u64;
                 }
@@ -492,16 +509,14 @@ pub fn test_associations_fused(
     pb.finish_and_clear();
 
     // Extract GWAS-phase CV results from the shared accumulator
-    let (nmf_gwas_cv_mae, nmf_gwas_cv_mean_mae, nmf_gwas_cv_count) =
-        match nmf_cv_acc {
-            Some(acc) => {
-                let (nmf_err, mean_err, count) = *acc.lock().unwrap();
-                let nmf_mae = if count > 0 { nmf_err / count as f64 } else { 0.0 };
-                let mean_mae = if count > 0 { mean_err / count as f64 } else { 0.0 };
-                (Some(nmf_mae), Some(mean_mae), Some(count))
-            }
-            None => (None, None, None),
-        };
+    let gwas_cv = cv_acc.map(|acc| {
+        let (impute_err, mean_err, count) = *acc.lock().unwrap();
+        ImputeCvReport {
+            mae: if count > 0 { impute_err / count as f64 } else { 0.0 },
+            mean_mae: if count > 0 { mean_err / count as f64 } else { 0.0 },
+            count,
+        }
+    });
 
     // GIF calibration via streaming histogram
     let (gif_per_trait, gif_per_trait_raw) = mtx_histogram.into_inner().unwrap().compute_gif();
@@ -523,11 +538,7 @@ pub fn test_associations_fused(
         u_hat: u_hat.to_owned(),
         gif: avg_gif,
         gif_per_covariate: gif_per_trait_raw,
-        nmf_cv: None,
-        nmf_cv_mean: None,
-        nmf_gwas_cv_mae,
-        nmf_gwas_cv_mean_mae,
-        nmf_gwas_cv_count,
+        gwas_cv,
     })
 }
 
@@ -1070,6 +1081,25 @@ mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
     use ndarray::array;
+
+    #[test]
+    fn test_impute_cv_report_lost_to_mean() {
+        // Strictly better than the baseline: no warning.
+        let better = ImputeCvReport { mae: 0.48, mean_mae: 0.53, count: 1000 };
+        assert!(!better.lost_to_mean());
+
+        // Worse than the baseline: warn.
+        let worse = ImputeCvReport { mae: 0.55, mean_mae: 0.53, count: 1000 };
+        assert!(worse.lost_to_mean());
+
+        // Exactly tied counts as a loss (no benefit to justify the extra pass).
+        let tied = ImputeCvReport { mae: 0.53, mean_mae: 0.53, count: 1000 };
+        assert!(tied.lost_to_mean());
+
+        // No held-out positions: nothing was measured, so never warn.
+        let empty = ImputeCvReport { mae: 0.0, mean_mae: 0.0, count: 0 };
+        assert!(!empty.lost_to_mean());
+    }
 
     #[test]
     fn test_median() {

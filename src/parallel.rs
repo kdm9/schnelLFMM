@@ -20,37 +20,38 @@ pub struct SnpBlock {
 /// Imputation strategy for the streaming decode step.
 #[derive(Clone)]
 pub enum ImputeConfig {
-    /// Current behaviour: fill NaN with per-SNP mean (zero after centering).
+    /// Fill NaN with the per-SNP mean (zero after centering).
     Mean,
-    /// NMF with pre-computed H: fill NaN with W @ H_chunk before centering.
-    /// W is n × K, h_full is K × p (or K × p_est), indexed by chunk offset.
-    NmfInRam {
-        w: Array2<f64>,
-        h_full: Array2<f64>,
-    },
-    /// NMF on-the-fly: compute H_chunk = max(0, W_pinv @ Y_filled) within each chunk,
-    /// then fill NaN with W @ H_chunk. Used in the testing pass.
-    NmfOnTheFly {
-        w: Array2<f64>,
-        w_pinv: Array2<f64>,
-    },
-    /// Mean imputation on the raw dosage scale {0,1,2}: fill NaN with the
-    /// per-SNP mean over observed entries, with NO centering or scaling.
-    /// NMF training requires a non-negative target matrix.
-    MeanRaw,
-    /// NMF fill on the raw dosage scale: fill NaN with the current
-    /// reconstruction W @ H_chunk (raw scale), with NO centering or scaling.
-    /// Used for NMF training (the EM-like E-step).
-    NmfRawInRam {
-        w: Array2<f64>,
-        h_full: Array2<f64>,
+    /// Latent-factor imputation: fill NaN with the fitted value under the
+    /// latent-factor term alone,
+    ///
+    ///   fill = clamp(mu_j + (P_U (Y_filled - mu))_ij, 0, 2),
+    ///   P_U  = U (U^T U)^{-1} U^T
+    ///
+    /// where `u` is the LFMM latent factor estimate U_hat (n × K) and
+    /// `utu_inv` is (U^T U)^{-1}, inverted once up front.
+    ///
+    /// The basis is `col(U_hat)` ONLY.  It must never be widened to include the
+    /// covariate matrix X: doing so writes the effect under test into the
+    /// imputed genotypes, which inflates the GIF to ~1.5 and the null
+    /// false-positive rate to ~0.11 at 20% missingness (see
+    /// `test_impute_does_not_inflate_null_calibration`).  U_hat need not be
+    /// orthonormal - a projection is basis-independent.
+    LatentFill {
+        u: Array2<f64>,
+        utu_inv: Array2<f64>,
     },
 }
 
 /// Fill NaN entries of each column with the per-column mean over observed
 /// entries (columns with no observed entries get 0). Operates in place on
-/// the first `n_cols` columns of `data`.
-fn fill_missing_with_column_means(data: &mut Array2<f64>, n_cols: usize, n_rows: usize) {
+/// the first `n_cols` columns of `data`, and returns the per-column means.
+fn fill_missing_with_column_means(
+    data: &mut Array2<f64>,
+    n_cols: usize,
+    n_rows: usize,
+) -> Vec<f64> {
+    let mut means = vec![0.0f64; n_cols];
     for col in 0..n_cols {
         let mut sum = 0.0;
         let mut n_obs = 0u32;
@@ -62,12 +63,44 @@ fn fill_missing_with_column_means(data: &mut Array2<f64>, n_cols: usize, n_rows:
             }
         }
         let mean = if n_obs > 0 { sum / n_obs as f64 } else { 0.0 };
+        means[col] = mean;
         for row in 0..n_rows {
             if data[(row, col)].is_nan() {
                 data[(row, col)] = mean;
             }
         }
     }
+    means
+}
+
+/// Compute the latent-factor fill values for one decoded chunk.
+///
+/// `y_filled` is the raw-scale chunk (n × n_cols) with missing entries already
+/// replaced by the column means in `means`.  Returns
+/// `clamp(mu + U (U^T U)^{-1} U^T (y_filled - mu), 0, 2)` on the dosage scale.
+pub(crate) fn latent_fill_values(
+    y_filled: &ndarray::ArrayView2<f64>,
+    means: &[f64],
+    u: &Array2<f64>,
+    utu_inv: &Array2<f64>,
+) -> Array2<f64> {
+    let n_cols = y_filled.ncols();
+
+    debug_assert_eq!(means.len(), n_cols);
+
+    // Centre on the observed column means.
+    let mut centered = y_filled.to_owned();
+    for (col, &m) in means.iter().enumerate() {
+        centered.column_mut(col).mapv_inplace(|v| v - m);
+    }
+
+    // coefs = (U^T U)^{-1} U^T A   (K × n_cols), then fill = U coefs + mu.
+    let coefs = utu_inv.dot(&u.t().dot(&centered));
+    let mut fill = u.dot(&coefs);
+    for (col, &m) in means.iter().enumerate() {
+        fill.column_mut(col).mapv_inplace(|v| (v + m).clamp(0.0, 2.0));
+    }
+    fill
 }
 
 /// Per-worker accumulator for forward passes that sum partial results.
@@ -230,24 +263,8 @@ pub fn parallel_stream<F>(
                                 None,
                             );
                         }
-                        ImputeConfig::NmfInRam { w, h_full } => {
-                            let start = block.seq * chunk_size;
-                            let h_chunk = h_full.slice(ndarray::s![.., start..start + n_cols]);
-                            let fill_values = w.dot(&h_chunk);
-                            let out_view = block.data.slice_mut(ndarray::s![.., ..n_cols]);
-                            decode_bed_chunk_into(
-                                &block.raw,
-                                bps,
-                                n_physical_samples,
-                                &local_indices[..n_cols],
-                                out_view,
-                                norm,
-                                sample_keep,
-                                Some(fill_values.view()),
-                            );
-                        }
-                        ImputeConfig::NmfOnTheFly { w, w_pinv } => {
-                            // Pass 1: raw decode → fill NaN with mean → compute H_chunk
+                        ImputeConfig::LatentFill { u, utu_inv } => {
+                            // Pass 1: raw decode -> mean-fill -> latent-factor fit.
                             {
                                 let out = block.data.slice_mut(ndarray::s![.., ..n_cols]);
                                 decode_raw_bed_chunk_into(
@@ -259,15 +276,12 @@ pub fn parallel_stream<F>(
                                     sample_keep,
                                 );
                             }
-                            // Fill NaN with column means
-                            fill_missing_with_column_means(&mut block.data, n_cols, n_out);
-                            // H_chunk = max(0, W_pinv @ Y_filled)
+                            let means =
+                                fill_missing_with_column_means(&mut block.data, n_cols, n_out);
                             let y_view = block.data.slice(ndarray::s![.., ..n_cols]);
-                            let h_chunk_raw = w_pinv.dot(&y_view);
-                            let h_chunk: Array2<f64> = h_chunk_raw.mapv(|v| v.max(0.0));
-                            let fill_values = w.dot(&h_chunk);
+                            let fill_values = latent_fill_values(&y_view, &means, u, utu_inv);
 
-                            // Pass 2: final decode with NMF fill (overwrites block.data)
+                            // Pass 2: final decode with the latent fill (overwrites block.data)
                             let out2 = block.data.slice_mut(ndarray::s![.., ..n_cols]);
                             decode_bed_chunk_into(
                                 &block.raw,
@@ -279,44 +293,6 @@ pub fn parallel_stream<F>(
                                 sample_keep,
                                 Some(fill_values.view()),
                             );
-                        }
-                        ImputeConfig::MeanRaw => {
-                            // Raw decode → fill NaN with per-column mean.
-                            // No centering/scaling: NMF requires non-negative input.
-                            let out = block.data.slice_mut(ndarray::s![.., ..n_cols]);
-                            decode_raw_bed_chunk_into(
-                                &block.raw,
-                                bps,
-                                n_physical_samples,
-                                &local_indices[..n_cols],
-                                out,
-                                sample_keep,
-                            );
-                            fill_missing_with_column_means(&mut block.data, n_cols, n_out);
-                        }
-                        ImputeConfig::NmfRawInRam { w, h_full } => {
-                            // Raw decode → fill NaN with the current NMF
-                            // reconstruction W @ H_chunk (raw dosage scale).
-                            // No centering/scaling: NMF requires non-negative input.
-                            let out = block.data.slice_mut(ndarray::s![.., ..n_cols]);
-                            decode_raw_bed_chunk_into(
-                                &block.raw,
-                                bps,
-                                n_physical_samples,
-                                &local_indices[..n_cols],
-                                out,
-                                sample_keep,
-                            );
-                            let start = block.seq * chunk_size;
-                            let h_chunk = h_full.slice(ndarray::s![.., start..start + n_cols]);
-                            let fill_values = w.dot(&h_chunk);
-                            for col in 0..n_cols {
-                                for row in 0..n_out {
-                                    if block.data[(row, col)].is_nan() {
-                                        block.data[(row, col)] = fill_values[(row, col)];
-                                    }
-                                }
-                            }
                         }
                     }
 

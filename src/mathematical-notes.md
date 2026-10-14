@@ -1,4 +1,4 @@
-# Mathematical Notes: LFMM2 with NMF Imputation
+# Mathematical Notes: LFMM2 with Latent-Factor Imputation
 
 ## 1. Genotype Encoding and Preprocessing
 
@@ -34,13 +34,11 @@ This yields approximately unit-variance genotypes under Hardy-Weinberg equilibri
 
 ### 1.3 Missing Data Strategies
 
-The software supports three imputation strategies for handling missing genotypes (NaN entries in the raw decode):
+The software supports two imputation strategies for handling missing genotypes (NaN entries in the raw decode):
 
 1. **Mean imputation** (`ImputeConfig::Mean`): Missing values are filled with the column mean before centering — after centering, these become exactly 0.
 
-2. **NMF in-RAM** (`ImputeConfig::NmfInRam`): Missing values are filled with the NMF reconstruction $W H_{\text{chunk}}$ before centering, where $W$ and $H$ were pre-computed during the estimation phase.
-
-3. **NMF on-the-fly** (`ImputeConfig::NmfOnTheFly`): $H_{\text{chunk}}$ is estimated per chunk as $\max(0, W^{\dagger} Y_{\text{filled}})$, then missing values are filled with $W H_{\text{chunk}}$ before centering (see §8).
+2. **Latent-factor imputation** (`ImputeConfig::LatentFill`): Missing values are filled with their fitted value under the latent-factor term, $\text{clamp}(\bar{y}_j + (P_{\hat{U}}(Y^{\text{filled}} - \bar{y}))_{ij}, 0, 2)$, before centering (see §4 and §8).
 
 ---
 
@@ -113,111 +111,46 @@ If any matrix inversion fails (near-singularity from collinear covariates or ove
 
 ---
 
-## 4. NMF Imputation of Missing Genotypes
+## 4. Latent-Factor Imputation of Missing Genotypes
 
-When `--nmf-impute` is active, before latent factor estimation, a Non-negative Matrix Factorisation is performed on the estimation SNP subset to learn a low-rank representation for imputing missing genotypes.
+When `--latent-impute` is active, missing genotypes are filled with their fitted value under the latent-factor term of the LFMM model itself. No separate factorisation is trained: the basis is $\hat{U}$, which the pipeline already computes for Steps 1–2.
 
 ### 4.1 Model
 
-Let $Y^{\text{est}} \in \mathbb{R}^{n \times p_{\text{est}}}$ denote the **raw** genotype matrix for the estimation subset: dosages in $\{0, 1, 2\}$, **uncentered and unscaled**. The NMF approximates:
+For SNP column $j$ with per-SNP mean $\bar{y}_j$ over *observed* entries, let $Y^{\text{filled}}$ be the chunk with missing entries replaced by $\bar{y}_j$. The fill is the orthogonal projection of the centered column onto $\text{col}(\hat{U})$, returned to the dosage scale and clamped to the valid dosage range:
 
 $$
-Y^{\text{est}} \approx W H
+\hat{y}_{ij} = \text{clamp}\!\left(\bar{y}_j + \left(P_{\hat{U}} \left(Y^{\text{filled}} - \bar{y}\right)\right)_{ij},\; 0,\; 2\right),
+\qquad
+P_{\hat{U}} = \hat{U}(\hat{U}^T \hat{U})^{-1}\hat{U}^T .
 $$
 
-where $W \in \mathbb{R}^{n \times K}$ (sample loadings, non-negative) and $H \in \mathbb{R}^{K \times p_{\text{est}}}$ (SNP loadings, non-negative).
+$\hat{U}$ need not be orthonormalised — a projection is invariant to the choice of basis for $\text{col}(\hat{U})$ — and $(\hat{U}^T \hat{U})^{-1}$ is $K \times K$, inverted once up front rather than per chunk.
 
-**Why raw dosages.** Two constraints dictate this choice:
+### 4.2 The basis must be $\text{col}(\hat{U})$ alone
 
-1. The Lee–Seung multiplicative updates (§4.3) are only valid for a non-negative target matrix. Raw dosages are naturally non-negative; centered genotypes are not.
-2. The factorisation is *applied* on the raw scale: on-the-fly imputation (§8) estimates $H_c$ from raw dosages and inserts the reconstruction $W H_c$ as raw-scale fills before centering. Training on the same scale keeps the training and application phases consistent.
+**The projection basis must never be widened to include $X$.** Imputing with the full fitted model $[\mathbf{1} \mid X \mid \hat{U}]$ writes the effect under test into the imputed genotypes, which is circular: measured on simulated null data ($n = 400$, $F_{ST} = 0.10$, $\text{corr}(X, \text{structure}) = 0.6$, 20% missing), it drives the GIF to 1.50 and the null false-positive rate at $\alpha = 0.05$ to 0.107. Projecting onto $\text{col}(\hat{U})$ alone gives GIF 1.03 and FPR 0.050. This invariant is pinned by `test_impute_does_not_inflate_null_calibration`.
 
-(An earlier version of this software trained the NMF on centered data: the non-negativity premise was violated, the train/apply scales were inconsistent, and the NMF-phase CV benchmark was structurally biased against the non-negative reconstruction. Training on raw dosages resolves all three issues.)
+An explicit intercept column is unnecessary: the chunk is centered on $\bar{y}_j$ before projection, so the mean is already carried outside the projection.
 
-The downstream LFMM steps are unaffected by this choice: after NMF filling, genotypes are centered (± Eigenstrat scaling) exactly as with mean imputation.
+### 4.3 One EM step
 
-### 4.2 Initialization (Random Probe)
+$\hat{U}$ is itself estimated from genotypes that need imputing, so the pipeline takes a single EM step:
 
-Initial values $W^{(0)}$ and $H^{(0)}$ are obtained via a randomized probing procedure (cf. Nyström-like):
+1. Estimate $\hat{U}^{(1)}$ by RSVD (§5) with mean imputation.
+2. Re-run the RSVD over the estimation subset with `LatentFill` using $\hat{U}^{(1)}$, giving $\hat{U}^{(2)}$.
+3. The GWAS pass imputes from, and tests against, $\hat{U}^{(2)}$.
 
-1. Generate a random Gaussian sketch matrix $\Omega \in \mathbb{R}^{n \times (K+10)}$ with entries $\omega_{ij} \sim \mathcal{N}(0, 1)$, seeded by $\text{seed} + 10^6$.
+The fill alone (without step 2) already delivers the full imputation-accuracy gain; the re-estimation is what restores calibration. Measured GIF on the simulation above: 1.065 mean-imputed, 1.053 with fill but no re-estimation, 1.032 after re-estimation. A second EM step was tested and gains essentially nothing (1.029), so the step count is fixed at one and is not exposed as an option.
 
-2. Compute the sketch $Z = Y_{\text{est}}^T \Omega \in \mathbb{R}^{p_{\text{est}} \times (K+10)}$ via a streaming pass (mean-imputed raw dosages, uncentered).
+### 4.4 Why not NMF
 
-3. Compute the thin SVD of $Z$ (only $V_t$ needed): $Z = U_Z \Sigma_Z V_Z^T$.
+Earlier versions trained a non-negative matrix factorisation $Y \approx W H$ on raw dosages and imputed with $W H_c$. It was removed in 0.4.0 because it performed no better than mean imputation at moderate structure ($F_{ST}$ 5–25%), for two compounding reasons:
 
-4. Take $W^{(0)}_{\text{probe}} = \Omega V_Z[:, 1:K]^T \in \mathbb{R}^{n \times K}$, then set $W^{(0)} = |W^{(0)}_{\text{probe}}|$ (entrywise absolute value, enforcing non-negativity).
+- **Initialization.** $W^{(0)} = |\Omega V_Z[:, 1{:}K]|$ used a sketch with no power iterations, and the entrywise absolute value folds signed contrast singular vectors onto the all-positive direction. Measured, $\text{col}(W^{(0)})$ captured 0.9% of the true population structure — with $K/n = 1.25\%$, no better than $K$ random directions. The default 10 multiplicative updates reached 7.6%; roughly 100 were needed to reach 99%.
+- **Parameterisation.** Non-negativity on raw dosages spends one component representing the per-SNP mean, and the $\max(0, \cdot)$ clamp biases each per-SNP fit. Handed the *true* top-$K$ subspace, the non-negative raw-scale path recovered +1.2% / +3.6% MAE over the mean baseline at $F_{ST}$ 0.05 / 0.10, versus +4.1% / +8.7% for the same subspace fit signed on centered data.
 
-5. Initialize $H^{(0)}$ via one backward pass over the estimation subset:
-
-   $$H^{(0)}_{\text{chunk}} = \max(0, (W^{(0)T} W^{(0)})^{-1} W^{(0)T} Y_{\text{chunk}})$$
-
-   using mean-imputed raw dosages.
-
-Both $W^{(0)}$ and $H^{(0)}$ are clamped to $[\varepsilon, \infty)$ with $\varepsilon = 10^{-16}$, then $W$ is L1-normalized column-wise with $H$ rescaled accordingly to preserve the product $WH$.
-
-### 4.3 Multiplicative Updates
-
-For each iteration $t = 0, \ldots, n_{\text{iter}}-1$, the NMF alternates between a forward pass (updating $W$) and a backward pass (updating $H$). Missing genotypes are filled with the **current** reconstruction before every pass (EM-like E-step): the fill matrix is rebuilt from the latest $(W, H)$ at the start of each forward and each backward pass, so the filled target matrix is always
-
-$$
-\tilde{Y}^{(t)}_{ij} = \begin{cases} y_{ij} & \text{if observed} \\ (W H)_{ij} & \text{if missing} \end{cases}
-$$
-
-on the raw dosage scale, with $(W, H)$ taken at their most recent values. Since $\tilde{Y}^{(t)} \ge 0$ elementwise (observed dosages are $0,1,2$ and $WH \ge 0$), the Lee–Seung updates below are valid and decrease the Frobenius error monotonically.
-
-Default $n_{\text{iter}} = 10$: multiplicative NMF converges slowly, and the per-iteration CV curve (§4.4) should be monitored for convergence.
-
-#### Forward Pass (Update W)
-
-For each chunk $c$, decode genotypes with NMF fill, yielding $Y_c \in \mathbb{R}^{n \times p_c}$. Compute:
-
-$$
-N_W \leftarrow N_W + Y_c H_c^T, \qquad HH \leftarrow HH + H_c H_c^T
-$$
-
-After streaming all chunks, update $W$ element-wise:
-
-$$
-W_{ik}^{(t+1)} \leftarrow W_{ik}^{(t)} \cdot \frac{(N_W)_{ik}}{(W^{(t)} HH + \varepsilon)_{ik}}
-$$
-
-Clamp all entries to $[\varepsilon, \infty)$. Then L1-normalize columns of $W$ and rescale rows of $H$:
-
-For each $k$: $\alpha_k = \sum_i W_{ik}$, then $W_{:,k} \leftarrow W_{:,k} / \alpha_k$, $H_{k,:} \leftarrow H_{k,:} \cdot \alpha_k$.
-
-#### Backward Pass (Update H)
-
-First compute $W^T W \in \mathbb{R}^{K \times K}$. For each chunk, recompute $Y_c$ (with updated $W$ used for NMF fill) and update column $c$ of $H$ element-wise:
-
-$$
-(H_c)_{k} \leftarrow (H_c)_{k} \cdot \frac{(W^T Y_c)_{k}}{(W^T W H_c + \varepsilon)_{k}}
-$$
-
-Clamp all entries to $[\varepsilon, \infty)$, then renormalize $W$ as in the forward pass.
-
-### 4.4 Cross-Validation (NMF Phase)
-
-After each NMF iteration $t$, a cross-validation error is computed to track convergence. A random mask is generated (seed = $\text{seed} + t$) holding out a fraction $\text{cv\_rate}$ (default $5 \times 10^{-4}$) of *observed* (non-missing) genotype positions.
-
-For each chunk:
-
-- Decode **raw** genotypes (no fill, no centering), yielding $Y^{\text{raw}} \in \{0, 1, 2, \text{NaN}\}^{n \times p_c}$.
-- Compute the NMF reconstruction: $\hat{Y} = W^{(t)} H_c$ where $H_c$ is a slice of the full $H^{(t)}$ (raw dosage scale).
-- Compute the per-SNP mean $\bar{y}_j$ over observed entries (the mean-imputation baseline prediction).
-- For each masked position $(i,j)$ where $Y^{\text{raw}}_{ij}$ is observed (non-NaN):
-
-  $$
-  e^{\text{nmf}}_{ij} = |Y^{\text{raw}}_{ij} - \hat{Y}_{ij}|
-  $$
-
-  $$
-  e^{\text{mean}}_{ij} = |Y^{\text{raw}}_{ij} - \bar{y}_j|
-  $$
-
-- Report $\text{MAE}_{\text{nmf}} = \sum e^{\text{nmf}}_{ij} / N_{\text{masked}}$ and $\text{MAE}_{\text{mean}}$ aggregated across chunks. Both errors are evaluated on the **same mask** (a paired comparison) and on the raw dosage scale — the scale on which the factorisation is applied — so the comparison is unbiased.
-
-**Important caveat:** This CV uses the global $H^{(t)}$ which was jointly optimized with $W^{(t)}$ on these same SNPs. It is an *in-sample* convergence diagnostic and does *not* evaluate the actual imputation pipeline used during GWAS testing (which uses the per-chunk NLS estimate, see §9). The GWAS-phase CV (§9) is the honest accuracy estimate.
+Non-negativity bought nothing downstream, since the fill is centered immediately afterwards (§1.2); it was required only by the Lee–Seung multiplicative updates. A fully converged NMF merely matched the signed rank-$K$ projection that $\hat{U}$ supplies for free.
 
 ---
 
@@ -430,71 +363,71 @@ and the $R^2$ fractions are $r^2_{\text{cov}} = \text{SS}_{\text{cov}} / \text{T
 
 ---
 
-## 8. NMF On-The-Fly Imputation (GWAS Phase)
+## 8. Latent-Factor Imputation (GWAS Phase)
 
-During the GWAS/testing phase, when NMF imputation is used, the genotype matrix $Y_{\text{full}} \in \mathbb{R}^{n \times p}$ (all SNPs, not just the estimation subset) must be imputed. Since $H$ was only estimated for the estimation subset ($p_{\text{est}}$ SNPs), the SNP loadings $H$ for the full set ($p$ SNPs) are not available. Instead, $H$ is estimated per chunk on-the-fly.
+During the GWAS/testing phase the genotype matrix $Y_{\text{full}} \in \mathbb{R}^{n \times p}$ (all SNPs, not just the estimation subset) must be imputed. Because the fill is a projection onto a fixed $n$-dimensional subspace, nothing per-SNP has to be carried over from the estimation phase — the per-chunk coefficients are computed on the fly.
 
-### 8.1 Per-Chunk NLS Estimation
+### 8.1 Per-Chunk Procedure
 
-For each chunk $c$ of $Y_{\text{full}}$, with $W \in \mathbb{R}^{n \times K}$ fixed from the NMF training phase:
+For each chunk $c$ of $Y_{\text{full}}$, with $\hat{U} \in \mathbb{R}^{n \times K}$ fixed from §4.3:
 
-- **Pass 1:** Raw-decode genotypes to $\{0, 1, 2, \text{NaN}\}$. Fill missing (NaN) entries with the per-column mean computed from observed entries, yielding $Y^{\text{filled}}_c \in \mathbb{R}^{n \times p_c}$.
+- **Pass 1:** Raw-decode genotypes to $\{0, 1, 2, \text{NaN}\}$. Fill NaN entries with the per-column mean $\bar{y}_j$ over observed entries, giving $Y^{\text{filled}}_c$.
 
-- **Estimate $H_c$** via non-negative constrained least squares:
+- **Fit the latent coefficients:**
 
-  $$H_c^{\text{raw}} = W^{\dagger} Y^{\text{filled}}_c = (W^T W)^{-1} W^T Y^{\text{filled}}_c$$
+  $$C_c = (\hat{U}^T \hat{U})^{-1} \hat{U}^T \left(Y^{\text{filled}}_c - \bar{y}\right) \in \mathbb{R}^{K \times p_c}$$
 
-  $$H_c = \max(0, H_c^{\text{raw}}) \quad \text{(element-wise clamping)}$$
+- **Compute fill values:** $\hat{Y}_c = \text{clamp}(\hat{U} C_c + \bar{y},\, 0,\, 2)$, on the raw dosage scale.
 
-  where $W^{\dagger} = (W^T W)^{-1} W^T \in \mathbb{R}^{K \times n}$ is the Moore-Penrose pseudoinverse (since $W$ has full column rank), precomputed after NMF training.
+- **Pass 2:** Re-decode from raw bytes. NaN entries are filled with the corresponding $\hat{Y}_{ij}$ **before** centering and normalization; then standard centering (± Eigenstrat scaling) is applied.
 
-- **Compute fill values:** $\hat{Y}_c = W H_c \in \mathbb{R}^{n \times p_c}$.
+As with any fill, imputed genotypes participate in the centering mean computation — the column mean used for centering is taken over all entries including the filled ones, which differs slightly from the $\bar{y}_j$ used to build the fill.
 
-- **Pass 2:** Re-decode from raw bytes. For each SNP column, NaN entries are filled with the corresponding $\hat{Y}_{ij}$ values **before** centering and normalization. Then standard centering (± Eigenstrat scaling) is applied.
+### 8.2 Shrinkage toward the mean
 
-This means genotypes imputed via NMF participate in the centering mean computation (the column mean is computed over all entries including NMF-filled ones). The fill values are on the raw genotype scale $\{0, 1, 2\}$ — the same scale on which the NMF was trained (§4), so training and application are consistent.
+The per-chunk fit sees $\bar{y}_j$ at the missing positions rather than the (unknown) true dosage. Writing $P = P_{\hat{U}}$, the prediction at a missing entry $(i,j)$ relates to the leave-one-out fit by
+
+$$
+\hat{y}^{\text{fill}}_{ij} = (1 - P_{ii})\, \hat{y}^{\text{LOO}}_{ij} + P_{ii}\, \bar{y}_j ,
+$$
+
+i.e. it is shrunk toward the mean-imputation baseline with weight $P_{ii}$, which averages $K/n$. This is a mild and *conservative* approximation: it can only pull the estimate back toward the mean baseline, never past it. It is also why latent imputation degrades gracefully to parity, rather than to a loss, when there is no structure to exploit.
+
+No further regularisation is applied. Ridge shrinkage on $C_c$ was tested and monotonically erodes the gain (penalty 1 / 5 / 20 gives +5.3% / +2.0% / +0.6% versus +8.7% unregularised at $F_{ST} = 0.10$); $K/n$ is small enough that the unregularised projection is the right estimator.
 
 ---
 
-## 9. GWAS-Phase Cross-Validation
+## 9. Held-Out Imputation Cross-Validation
 
-Since the NMF-phase CV (§4.4) evaluates $W H^{(t)}$ using the jointly-optimized $H^{(t)}$, it does not reflect the actual on-the-fly imputation pipeline used during GWAS. Therefore, a separate per-block cross-validation is performed during the GWAS pass.
+Imputation accuracy is measured during the GWAS pass, using exactly the estimator that fills genotypes there. This is an honest held-out estimate: the evaluated positions are masked before the coefficients are fitted, so they cannot leak into their own prediction.
 
-### 9.1 Per-Block NCV Procedure
+### 9.1 Per-Block Procedure
 
 For each chunk $c$ during the GWAS streaming pass:
 
-1. **Raw decode** genotypes from `block.raw` into $Y^{\text{raw}}_c \in \mathbb{R}^{n \times p_c}$ with values in $\{0, 1, 2, \text{NaN}\}$.
+1. **Raw decode** genotypes from `block.raw` into $Y^{\text{raw}}_c \in \{0, 1, 2, \text{NaN}\}^{n \times p_c}$.
 
-2. **Generate mask:** For each entry $(i, j)$ where $Y^{\text{raw}}_{ij}$ is observed (non-NaN), with probability $\text{cv\_rate}$ (default $5 \times 10^{-4}$), the entry is selected for cross-validation. Seed: $\text{seed} + \text{chunk\_seq}$.
+2. **Generate mask:** each *observed* entry is selected with probability $\text{cv\_rate}$ (default $5 \times 10^{-4}$). Seed: $\text{seed} + \text{chunk\_seq}$.
 
-3. **Create leave-out matrix** $Y^{\text{masked}}_c$ as a copy of $Y^{\text{raw}}_c$ with masked positions set to NaN.
+3. **Create leave-out matrix** $Y^{\text{masked}}_c$: a copy of $Y^{\text{raw}}_c$ with masked positions set to NaN.
 
-4. **Mean-impute** $Y^{\text{masked}}_c$: for each column, replace all NaN entries (truly missing + CV-masked) with the column mean computed from the remaining observed entries (LOO basis — the masked positions are NaN and thus excluded from the mean).
+4. **Mean-impute** $Y^{\text{masked}}_c$: per column, replace all NaN entries (truly missing + masked) with the mean over the remaining observed entries. Masked positions are excluded from this mean, so the baseline they are scored against does not see them.
 
-5. **Estimate $H$** using the same on-the-fly method as §8.1 but on the masked matrix:
+5. **Fit and predict** with the §8.1 estimator on the masked matrix:
 
-   $$H^{\text{cv}}_c = \max(0, W^{\dagger} Y^{\text{masked}}_c)$$
+   $$\hat{Y}^{\text{cv}}_c = \text{clamp}\!\left(\hat{U} (\hat{U}^T \hat{U})^{-1} \hat{U}^T \left(Y^{\text{masked}}_c - \bar{y}\right) + \bar{y},\; 0,\; 2\right)$$
 
-6. **Predict:** $\hat{Y}^{\text{cv}}_c = W H^{\text{cv}}_c$.
-
-7. **Compute errors on masked positions** (on the raw genotype scale $\{0, 1, 2\}$):
+6. **Score on masked positions** (raw dosage scale), paired against the mean-imputation baseline:
 
    $$
-   e^{\text{nmf}}_{\text{gwas}} = \sum_{(i,j) \in \text{mask}} |Y^{\text{raw}}_{ij} - \hat{Y}^{\text{cv}}_{ij}|
+   e^{\text{impute}} = \sum_{(i,j) \in \text{mask}} \left|Y^{\text{raw}}_{ij} - \hat{Y}^{\text{cv}}_{ij}\right|,
+   \qquad
+   e^{\text{mean}} = \sum_{(i,j) \in \text{mask}} \left|Y^{\text{raw}}_{ij} - \bar{y}_j\right|
    $$
 
-   $$
-   e^{\text{mean}}_{\text{gwas}} = \sum_{(i,j) \in \text{mask}} |Y^{\text{raw}}_{ij} - \bar{Y}^{\text{col}(j)}|
-   $$
+7. Accumulate across chunks; after the pass, report $\text{MAE} = e / N_{\text{masked}}$ for each.
 
-   where $\bar{Y}^{\text{col}(j)}$ is the LOO column mean (mean-imputation baseline prediction).
-
-8. Accumulate across all chunks. After the GWAS pass completes:
-
-   $$ \text{MAE}^{\text{nmf}}_{\text{gwas}} = \frac{\sum e^{\text{nmf}}_{\text{gwas}}}{N_{\text{masked}}}, \quad \text{MAE}^{\text{mean}}_{\text{gwas}} = \frac{\sum e^{\text{mean}}_{\text{gwas}}}{N_{\text{masked}}} $$
-
-These values are reported in the summary output alongside the NMF-phase CV metrics.
+Both are evaluated on the same positions (a paired comparison) and on the raw dosage scale — the scale on which the fill is applied. The two MAEs and the count are written to the summary file as `gwas_cv_mae`, `gwas_cv_mean_mae` and `gwas_cv_count`. If the imputer fails to beat the baseline, a warning is printed to stderr and recorded as `impute_warning` in the summary; the requested imputation strategy is used either way (there is no automatic fallback).
 
 ---
 
@@ -543,47 +476,44 @@ The full LFMM2 pipeline proceeds as follows:
 
 1. **Load data:** Read BED, FAM, BIM, and covariate files. Align and subset samples.
 
-2. **(Optional) NMF imputation on estimation subset:**
-   - Initialize $W$ and $H$ via random probe (§4.2).
-   - Stream multiplicative updates for $n_{\text{iter}}$ iterations (§4.3).
-   - After each iteration, compute $\text{MAE}_{\text{nmf}}$ and $\text{MAE}_{\text{mean}}$ on masked genotypes (§4.4).
-   - Precompute $W^{\dagger} = (W^T W)^{-1} W^T$ for later on-the-fly imputation.
+2. **Step 0:** Precompute SVD of $X$, build $M = D_\lambda Q^T$, $\text{ridge\_inv}$, and $D_\lambda^{-1}$ (§3).
 
-3. **Step 0:** Precompute SVD of $X$, build $M = D_\lambda Q^T$, $\text{ridge\_inv}$, and $D_\lambda^{-1}$ (§3).
-
-4. **Steps 1-2 (Latent factor estimation via RSVD):**
+3. **Steps 1-2 (Latent factor estimation via RSVD):**
    - Generate random sketch matrix $\Omega$.
    - Compute initial sketch $Z = Y_{\text{est}}^T (M^T \Omega)$.
    - QR decompose to get $Q_z$.
    - Run $n_{\text{power}}$ power iterations (forward $M Y_{\text{est}} Q_z$, QR, backward $Y_{\text{est}}^T (M^T Q_{\text{aqz}})$, QR).
-   - Final projection $B = M Y_{\text{est}} Q_z$, SVD, recover $U_{\text{hat}}$ (§5).
+   - Final projection $B = M Y_{\text{est}} Q_z$, SVD, recover $\hat{U}$ (§5).
+
+4. **(If `--latent-impute`) One EM step:** repeat step 3 over the estimation subset with `LatentFill` using $\hat{U}^{(1)}$, giving $\hat{U}^{(2)}$ (§4.3). Precompute $(\hat{U}^T \hat{U})^{-1}$ for per-chunk fits.
 
 5. **Fused Steps 3-4 (GWAS/testing):**
    - Precompute OLS hat matrices: $I - P_U$, $X_t R$, $H = (C^T C)^{-1} C^T$.
    - For each chunk $c$:
-     - **(If NMF)** Impute via $H_c = \max(0, W^{\dagger} Y_c^{\text{filled}})$ then $W H_c$ fills NaNs before centering (§8).
+     - **(If latent impute)** Fit $C_c = (\hat{U}^T\hat{U})^{-1}\hat{U}^T(Y_c^{\text{filled}} - \bar{y})$, fill NaNs with $\text{clamp}(\hat{U} C_c + \bar{y}, 0, 2)$ before centering (§8).
      - Compute $\hat{B}_c$ (effect sizes) via ridge regression on residualised genotypes (§6).
      - Compute $\hat{\Theta}_c$ (full OLS coefficients) and $t_{j,m}$ statistics (§7).
      - Compute $r^2$ variance decomposition.
-     - **(If NMF CV)** Compute GWAS-level cross-validation errors using the same on-the-fly estimator on held-out positions (§9).
+     - **(If latent impute)** Compute held-out imputation CV on masked positions with the same estimator (§9).
      - Feed $t^2$ values into streaming histogram for GIF estimation (§10).
-     - Write per-chunk results to temporary binary files.
+     - Write per-chunk results to temporary parquet fragments.
 
 6. **Post-processing:**
    - Compute GIF from histogram medians (§10.2).
-   - Read back chunk files, calibrate p-values with GIF (§10.3), and write final TSV output.
-   - Write summary file with CV metrics, GIF, and diagnostics.
+   - Read back chunk files, calibrate p-values with GIF (§10.3), and write final output.
+   - Write summary file with GIF (overall and per covariate), CV metrics, and diagnostics.
 
 ### Computational Complexity
 
 | Step | Passes over Y | Memory (RAM) |
 |------|--------------|--------------|
 | SVD of X | 0 (in-core) | $O(nd + d^2)$ |
-| NMF init | 2 passes | $O(np_{\text{est}})$ (full H) |
-| NMF updates | $2 n_{\text{iter}}$ passes | $O(np_{\text{est}})$ (full H) |
 | RSVD | $3 + 2 n_{\text{power}}$ passes | $O(nK + p_{\text{est}} K)$ |
+| Latent-impute EM step | $3 + 2 n_{\text{power}}$ more passes over $Y_{\text{est}}$ | $O(nK + p_{\text{est}} K)$ |
 | GWAS fused | 1 pass | $O(n(1+d+K) + p_c d)$ per chunk |
 | GWAS CV | 0 extra passes | $O(nK + p_c K)$ in process_fn |
+
+The latent-imputation EM step costs one extra round of factor estimation over the *estimation subset* only (typically LD-pruned, and small next to the full GWAS scan); the GWAS pass itself costs one extra decode per chunk.
 
 All passes over genotype data are fully streaming: at any point, only one chunk of $\text{chunk\_size}$ SNPs (default 10,000) is held in RAM.
 
@@ -591,8 +521,7 @@ All passes over genotype data are fully streaming: at any point, only one chunk 
 
 | Phase | Strategy | Method |
 |-------|----------|--------|
-| NMF training (estimation subset) | `NmfRawInRam` | $W H_c$ raw-scale fills with precomputed $H$ (EM-like, refreshed per pass) |
-| RSVD (estimation subset) | `NmfInRam` or `Mean` | Same; NMF fill if enabled |
-| GWAS testing (all SNPs) | `NmfOnTheFly` or `Mean` | $H_c = \max(0, W^{\dagger} Y_c)$, then $W H_c$ fill |
-| NMF CV (estimation subset) | $W H_c$ direct | Compares raw-scale $W H$ vs raw truth (paired with column-mean baseline) |
-| GWAS CV (all SNPs) | `NmfOnTheFly` with LOO mask | Compares $W H_c^{\text{cv}}$ vs raw truth on held-out positions |
+| RSVD, first pass (estimation subset) | `Mean` | Column-mean fill; zero after centering |
+| RSVD, EM step (estimation subset) | `LatentFill` | $\text{clamp}(\bar{y} + P_{\hat{U}}(Y^{\text{filled}} - \bar{y}), 0, 2)$ with $\hat{U}^{(1)}$ |
+| GWAS testing (all SNPs) | `LatentFill` or `Mean` | Same fill with $\hat{U}^{(2)}$, or column mean |
+| GWAS CV (all SNPs) | `LatentFill` on a masked copy | Scores the fill against raw truth on held-out positions, paired with the column-mean baseline |

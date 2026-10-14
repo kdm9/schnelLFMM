@@ -4,7 +4,7 @@ use schnellfmm::simulate::{
     simulate, write_covariates, write_ground_truth, write_latent_u, write_lfmm_format,
     write_plink, write_r_comparison_script, SimConfig,
 };
-use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, NmfConfig, OutputConfig, OutputFormat, SnpNorm};
+use schnellfmm::{fit_lfmm2, ImputeStrategy, LatentImputeConfig, Lfmm2Config, OutputConfig, OutputFormat, SnpNorm};
 use ndarray::Array2;
 use ndarray_linalg::SVD;
 use std::fs;
@@ -110,7 +110,7 @@ fn test_lfmm2_quick() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
 
     // Simulate
@@ -166,7 +166,7 @@ fn test_lfmm2_large() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
 
     // Simulate
@@ -236,7 +236,7 @@ fn test_reproducibility() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
 
     let sim = simulate(&sim_config);
@@ -390,7 +390,7 @@ fn test_different_seeds_differ() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
 
     let d = sim_config.d;
@@ -655,7 +655,7 @@ fn test_parallel_matches_sequential() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
     let d = sim.x.ncols();
     let cov_names = default_cov_names(d);
@@ -847,7 +847,7 @@ fn test_subset_rate_end_to_end() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
 
     let sim = simulate(&sim_config);
@@ -920,7 +920,7 @@ fn test_subset_indices_end_to_end() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
 
     let sim = simulate(&sim_config);
@@ -998,7 +998,7 @@ fn test_output_config_writes_results() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
 
     let sim = simulate(&sim_config);
@@ -1537,7 +1537,7 @@ fn test_normalization_modes_end_to_end() {
             norm: mode,
             scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
         };
         let out_path = dir.path().join(format!("results_{}.tsv", idx));
         let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
@@ -2047,7 +2047,7 @@ fn test_k_sensitivity() {
                 norm: SnpNorm::Eigenstrat,
                 scale_cov: false,
                 impute: ImputeStrategy::Mean,
-                nmf: None,
+                latent_impute: None,
             };
             let out_path = dir.path().join(format!("results_k{}_kt{}.tsv", k_run, k_true));
             let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
@@ -2161,7 +2161,7 @@ fn test_variance_decomposition() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
 
     let (output_path, cov_names) = test_output_setup(dir.path(), sim.x.ncols());
@@ -2255,7 +2255,7 @@ fn test_variance_decomposition_signal_levels() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
 
     for &ls in &latent_scales {
@@ -2381,7 +2381,7 @@ fn test_variance_decomposition_with_noise() {
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
         impute: ImputeStrategy::Mean,
-        nmf: None,
+        latent_impute: None,
     };
 
     let d = sim.x.ncols();
@@ -2452,7 +2452,7 @@ fn test_variance_decomposition_with_noise() {
 }
 
 /// GEA scenario: environmental covariate correlated with population
-/// structure under MCAR missingness. Structure-based (NMF) imputation
+/// structure under MCAR missingness. Structure-based (latent-factor) imputation
 /// should outperform global-mean imputation: higher power, stronger test
 /// statistics, more accurate effect-size estimates.
 ///
@@ -2466,7 +2466,7 @@ fn test_variance_decomposition_with_noise() {
 /// imputation deflates t (raw GIF < 1 → clamped), so it receives no
 /// anti-conservative boost.
 #[test]
-fn test_nmf_vs_mean_imputation_structured_gea() {
+fn test_latent_vs_mean_imputation_structured_gea() {
     let sim_config = SimConfig {
         n_samples: 200,
         n_snps: 10_000,
@@ -2492,18 +2492,14 @@ fn test_nmf_vs_mean_imputation_structured_gea() {
     // Run a strategy on the shared masked data; return parsed TSV + TestResults
     let run = |impute: ImputeStrategy| {
         let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
-        let nmf = match impute {
-            ImputeStrategy::Nmf => Some(NmfConfig {
-                k: 3, n_iter: 8, eps: 1e-16,
-                cv_rate: 0.005, chunk_size: 2_000,
-                n_workers: 2, progress: false, seed: 42,
-            }),
+        let latent_impute = match impute {
+            ImputeStrategy::Latent => Some(LatentImputeConfig { cv_rate: 0.005 }),
             _ => None,
         };
         let config = Lfmm2Config {
             k: 3, lambda: 1e-5, chunk_size: 2_000, oversampling: 10,
             n_power_iter: 2, seed: 42, n_workers: 2, progress: false,
-            norm: SnpNorm::Eigenstrat, scale_cov: false, impute, nmf,
+            norm: SnpNorm::Eigenstrat, scale_cov: false, impute, latent_impute,
         };
         let d = sim.x.ncols();
         let cov_names = default_cov_names(d);
@@ -2514,7 +2510,7 @@ fn test_nmf_vs_mean_imputation_structured_gea() {
     };
 
     let (pr_mean, res_mean) = run(ImputeStrategy::Mean);
-    let (pr_nmf, res_nmf) = run(ImputeStrategy::Nmf);
+    let (pr_lat, res_lat) = run(ImputeStrategy::Latent);
 
     // --- metrics ---
     let power = |pr: &ParsedResults| -> f64 {
@@ -2539,13 +2535,13 @@ fn test_nmf_vs_mean_imputation_structured_gea() {
     };
 
     let pow_mean = power(&pr_mean);
-    let pow_nmf  = power(&pr_nmf);
+    let pow_lat  = power(&pr_lat);
     let mae_mean = beta_mae(&pr_mean);
-    let mae_nmf  = beta_mae(&pr_nmf);
+    let mae_lat  = beta_mae(&pr_lat);
     let t_mean   = mean_abs_t(&pr_mean);
-    let t_nmf    = mean_abs_t(&pr_nmf);
+    let t_lat    = mean_abs_t(&pr_lat);
     let fpr_mean = null_fpr(&pr_mean);
-    let fpr_nmf  = null_fpr(&pr_nmf);
+    let fpr_lat  = null_fpr(&pr_lat);
 
     eprintln!(
         "         | power | beta-MAE | mean |t| | null FPR | GIF",
@@ -2555,8 +2551,8 @@ fn test_nmf_vs_mean_imputation_structured_gea() {
         pow_mean, mae_mean, t_mean, fpr_mean, res_mean.gif,
     );
     eprintln!(
-        "NMF  imp | {:.3} | {:.4} | {:.3} | {:.4} | {:.4}",
-        pow_nmf, mae_nmf, t_nmf, fpr_nmf, res_nmf.gif,
+        "latent   | {:.3} | {:.4} | {:.3} | {:.4} | {:.4}",
+        pow_lat, mae_lat, t_lat, fpr_lat, res_lat.gif,
     );
 
     // Structure-based imputation should reduce residual variance at
@@ -2564,32 +2560,32 @@ fn test_nmf_vs_mean_imputation_structured_gea() {
     // (Beta MAE from Step-3 ridge is a diagnostic; the Step-4 t-test is
     // where the σ̂ reduction directly improves signal-to-noise.)
     assert!(
-        pow_nmf > pow_mean,
-        "NMF power ({:.3}) should exceed mean-impute power ({:.3})",
-        pow_nmf, pow_mean,
+        pow_lat > pow_mean,
+        "latent-impute power ({:.3}) should exceed mean-impute power ({:.3})",
+        pow_lat, pow_mean,
     );
     assert!(
-        t_nmf > t_mean,
-        "NMF mean |t| ({:.3}) should exceed mean-impute |t| ({:.3})",
-        t_nmf, t_mean,
+        t_lat > t_mean,
+        "latent-impute mean |t| ({:.3}) should exceed mean-impute |t| ({:.3})",
+        t_lat, t_mean,
     );
 
-    // NMF CV consistency
-    let gwas_mae = res_nmf.nmf_gwas_cv_mae.expect("nmf gwas cv mae missing");
-    let gwas_mean = res_nmf.nmf_gwas_cv_mean_mae.expect("nmf gwas cv mean missing");
+    // Held-out CV consistency
+    let cv = res_lat.gwas_cv.as_ref().expect("gwas cv report missing");
+    let (gwas_mae, gwas_mean) = (cv.mae, cv.mean_mae);
     assert!(
         gwas_mae < gwas_mean,
-        "NMF GWAS CV ({:.6}) should beat mean baseline ({:.6})",
+        "latent-impute held-out CV ({:.6}) should beat mean baseline ({:.6})",
         gwas_mae, gwas_mean,
     );
 
     // GIF sanity
     assert!(res_mean.gif > 0.5 && res_mean.gif < 2.0);
-    assert!(res_nmf.gif  > 0.5 && res_nmf.gif  < 2.0);
+    assert!(res_lat.gif  > 0.5 && res_lat.gif  < 2.0);
 
     // All SNP rows present in both outputs
     assert_eq!(pr_mean.p_values.len(), p);
-    assert_eq!(pr_nmf.p_values.len(), p);
+    assert_eq!(pr_lat.p_values.len(), p);
 }
 
 /// Mask a fraction of genotypes as missing (255 sentinel → PLINK 0b01).
@@ -2626,10 +2622,10 @@ fn mask_genotypes(sim: &schnellfmm::simulate::SimData, miss_rate: f64, seed: u64
 /// with zeros after centering — the global average — which is uncorrelated
 /// with the true structure at each SNP. The resulting dilution of the
 /// latent-factor fit inflates residual variance (higher median t²) and
-/// raises the GIF. NMF imputation fills with population-specific dosages,
+/// raises the GIF. Latent-factor imputation fills with structure-specific dosages,
 /// keeping the latent fit sharp and the GIF near 1.
 #[test]
-fn test_nmf_vs_mean_imputation_gif_inflation() {
+fn test_latent_vs_mean_imputation_gif_inflation() {
     let sim_config = SimConfig {
         n_samples: 200,
         n_snps: 10_000,
@@ -2653,18 +2649,14 @@ fn test_nmf_vs_mean_imputation_gif_inflation() {
 
     let run = |impute: ImputeStrategy| {
         let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
-        let nmf = match impute {
-            ImputeStrategy::Nmf => Some(NmfConfig {
-                k: 3, n_iter: 8, eps: 1e-16,
-                cv_rate: 0.005, chunk_size: 2_000,
-                n_workers: 2, progress: false, seed: 42,
-            }),
+        let latent_impute = match impute {
+            ImputeStrategy::Latent => Some(LatentImputeConfig { cv_rate: 0.005 }),
             _ => None,
         };
         let config = Lfmm2Config {
             k: 3, lambda: 1e-5, chunk_size: 2_000, oversampling: 10,
             n_power_iter: 2, seed: 42, n_workers: 2, progress: false,
-            norm: SnpNorm::Eigenstrat, scale_cov: false, impute, nmf,
+            norm: SnpNorm::Eigenstrat, scale_cov: false, impute, latent_impute,
         };
         let d = sim.x.ncols();
         let cov_names = default_cov_names(d);
@@ -2675,7 +2667,7 @@ fn test_nmf_vs_mean_imputation_gif_inflation() {
     };
 
     let (pr_mean, res_mean) = run(ImputeStrategy::Mean);
-    let (pr_nmf, res_nmf) = run(ImputeStrategy::Nmf);
+    let (pr_lat, res_lat) = run(ImputeStrategy::Latent);
 
     let causal_set: std::collections::HashSet<_> = sim.causal_indices.iter().cloned().collect();
     let power = |pr: &ParsedResults| -> f64 {
@@ -2695,9 +2687,9 @@ fn test_nmf_vs_mean_imputation_gif_inflation() {
     };
 
     let pow_mean = power(&pr_mean);
-    let pow_nmf  = power(&pr_nmf);
+    let pow_lat  = power(&pr_lat);
     let t_mean   = mean_abs_t(&pr_mean);
-    let t_nmf    = mean_abs_t(&pr_nmf);
+    let t_lat    = mean_abs_t(&pr_lat);
 
     eprintln!(
         "         | power | mean |t| | null FPR | GIF",
@@ -2707,33 +2699,33 @@ fn test_nmf_vs_mean_imputation_gif_inflation() {
         pow_mean, t_mean, null_fpr(&pr_mean), res_mean.gif,
     );
     eprintln!(
-        "NMF  imp | {:.3} | {:.3} | {:.4} | {:.4}",
-        pow_nmf, t_nmf, null_fpr(&pr_nmf), res_nmf.gif,
+        "latent   | {:.3} | {:.3} | {:.4} | {:.4}",
+        pow_lat, t_lat, null_fpr(&pr_lat), res_lat.gif,
     );
 
     // Mean imputation dilutes the structure signal (fills zeros),
     // inflating residual variance and raising the genomic-inflation
-    // factor. NMF fills track population structure, keeping the
-    // latent fit sharp and the GIF near the expected range.
+    // factor. Latent-factor fills track population structure, keeping
+    // the latent fit sharp and the GIF near the expected range.
     assert!(
-        res_mean.gif > res_nmf.gif,
-        "Mean GIF ({:.4}) should exceed NMF GIF ({:.4})",
-        res_mean.gif, res_nmf.gif,
+        res_mean.gif > res_lat.gif,
+        "Mean GIF ({:.4}) should exceed latent-impute GIF ({:.4})",
+        res_mean.gif, res_lat.gif,
     );
-    assert!(res_nmf.gif < 1.08,
-        "NMF GIF ({:.4}) should stay near 1", res_nmf.gif);
+    assert!(res_lat.gif < 1.08,
+        "latent-impute GIF ({:.4}) should stay near 1", res_lat.gif);
 
     // Power should be comparable — structure-based imputation reduces
     // residual variance, so it should not hurt power; it may help.
-    assert!(pow_nmf >= pow_mean * 0.9,
-        "NMF power ({:.3}) should not be far below mean ({:.3})", pow_nmf, pow_mean);
+    assert!(pow_lat >= pow_mean * 0.9,
+        "latent-impute power ({:.3}) should not be far below mean ({:.3})", pow_lat, pow_mean);
 
     // Output sanity
     assert_eq!(pr_mean.p_values.len(), p);
-    assert_eq!(pr_nmf.p_values.len(), p);
+    assert_eq!(pr_lat.p_values.len(), p);
 }
 
-fn nmf_test_config(k: usize, n_iter: usize, n_workers: usize) -> Lfmm2Config {
+fn latent_test_config(k: usize, n_workers: usize) -> Lfmm2Config {
     Lfmm2Config {
         k,
         lambda: 1e-5,
@@ -2745,34 +2737,23 @@ fn nmf_test_config(k: usize, n_iter: usize, n_workers: usize) -> Lfmm2Config {
         progress: false,
         norm: SnpNorm::Eigenstrat,
         scale_cov: false,
-        impute: ImputeStrategy::Nmf,
-        nmf: Some(NmfConfig {
-            k,
-            n_iter,
-            eps: 1e-16,
-            cv_rate: 0.005,
-            chunk_size: 2_000,
-            n_workers,
-            progress: false,
-            seed: 42,
-        }),
+        impute: ImputeStrategy::Latent,
+        latent_impute: Some(LatentImputeConfig { cv_rate: 0.005 }),
     }
 }
 
-/// End-to-end test of the NMF imputation path on simulated data with
+/// End-to-end test of the latent-factor imputation path on simulated data with
 /// population structure and MCAR-missing genotypes.
 ///
-/// Validates the redesigned raw-dosage NMF:
-/// - the pipeline runs with ImputeStrategy::Nmf and produces valid output
-/// - training-phase CV MAE (raw scale, paired mask) beats the mean-imputation
-///   baseline by the final iteration
-/// - the honest GWAS-phase CV (the actual on-the-fly estimator, evaluated on
-///   held-out raw genotypes) beats mean imputation
+/// Validates that:
+/// - the pipeline runs with ImputeStrategy::Latent and produces valid output
+/// - the held-out GWAS-phase CV (the deployed estimator, evaluated on masked
+///   raw genotypes) beats the mean-imputation baseline
 ///
 /// Note: LEA cross-comparison (run_lea_comparison.R) intentionally uses
 /// ImputeStrategy::Mean — LEA's lfmm2 does not accept missing genotypes.
 #[test]
-fn test_nmf_imputation_end_to_end() {
+fn test_latent_imputation_end_to_end() {
     let sim_config = SimConfig {
         n_samples: 200,
         n_snps: 10_000,
@@ -2794,8 +2775,7 @@ fn test_nmf_imputation_end_to_end() {
     write_plink(dir.path(), "sim", &sim_miss).unwrap();
     let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
 
-    let n_iter = 8;
-    let config = nmf_test_config(3, n_iter, 2);
+    let config = latent_test_config(3, 2);
 
     let d = sim.x.ncols();
     let cov_names = default_cov_names(d);
@@ -2803,38 +2783,17 @@ fn test_nmf_imputation_end_to_end() {
     let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
     let results = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
 
-    // NMF training-phase CV: one value per iteration, all finite and non-negative
-    let nmf_cv = results.nmf_cv.as_ref().expect("nmf_cv missing");
-    assert_eq!(nmf_cv.len(), n_iter, "expected {} CV values", n_iter);
-    for (i, &mae) in nmf_cv.iter().enumerate() {
-        assert!(mae.is_finite() && mae >= 0.0, "nmf_cv[{}] invalid: {}", i, mae);
-    }
-    let mean_cv = results.nmf_cv_mean.expect("nmf_cv_mean missing");
-    eprintln!("NMF train CV per iter: {:?}", nmf_cv);
-    eprintln!("Mean-impute train CV (paired): {:.6}", mean_cv);
-
-    // By the final iteration, NMF must beat mean imputation (paired, same mask)
-    let final_mae = *nmf_cv.last().unwrap();
-    assert!(
-        final_mae < mean_cv,
-        "NMF train CV ({:.6}) should beat mean-impute baseline ({:.6})",
-        final_mae, mean_cv,
-    );
-
-    // Honest GWAS-phase CV: the deployed on-the-fly estimator must beat mean
-    // imputation on held-out raw genotypes
-    let gwas_mae = results.nmf_gwas_cv_mae.expect("nmf_gwas_cv_mae missing");
-    let gwas_mean = results.nmf_gwas_cv_mean_mae.expect("nmf_gwas_cv_mean_mae missing");
-    let gwas_count = results.nmf_gwas_cv_count.expect("nmf_gwas_cv_count missing");
+    // Held-out GWAS-phase CV: the deployed estimator must beat mean imputation
+    let cv = results.gwas_cv.as_ref().expect("gwas_cv missing");
     eprintln!(
-        "GWAS-phase CV: nmf = {:.6}, mean = {:.6} (n = {})",
-        gwas_mae, gwas_mean, gwas_count,
+        "GWAS-phase CV: latent = {:.6}, mean = {:.6} (n = {})",
+        cv.mae, cv.mean_mae, cv.count,
     );
-    assert!(gwas_count > 1_000, "too few GWAS CV positions: {}", gwas_count);
+    assert!(cv.count > 1_000, "too few GWAS CV positions: {}", cv.count);
     assert!(
-        gwas_mae < gwas_mean,
-        "GWAS NMF CV ({:.6}) should beat mean imputation ({:.6})",
-        gwas_mae, gwas_mean,
+        !cv.lost_to_mean(),
+        "latent-impute held-out CV ({:.6}) should beat mean imputation ({:.6})",
+        cv.mae, cv.mean_mae,
     );
 
     // Output validity: all SNPs present, p-values in [0,1], finite betas/t
@@ -2878,10 +2837,10 @@ fn test_nmf_imputation_end_to_end() {
     );
 }
 
-/// The NMF path must be bitwise reproducible at fixed seed with multiple
+/// The latent-imputation path must be bitwise reproducible at fixed seed with multiple
 /// worker threads (per-worker accumulators give a fixed reduction order).
 #[test]
-fn test_nmf_determinism_multithreaded() {
+fn test_latent_impute_determinism_multithreaded() {
     let sim_config = SimConfig {
         n_samples: 100,
         n_snps: 3_000,
@@ -2904,7 +2863,7 @@ fn test_nmf_determinism_multithreaded() {
         let dir = tempfile::tempdir().unwrap();
         write_plink(dir.path(), "sim", &sim_miss).unwrap();
         let bed = BedFile::open(dir.path().join("sim.bed")).unwrap();
-        let config = nmf_test_config(2, 4, 2);
+        let config = latent_test_config(2, 2);
         let out_path = dir.path().join(format!("results_{}.tsv", tag));
         let cov_names = default_cov_names(d);
         let oc = OutputConfig { path: &out_path, bim: &bed.bim_records, cov_names: &cov_names, format: OutputFormat::Tsv };
@@ -2932,4 +2891,222 @@ fn test_nmf_determinism_multithreaded() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Imputation regression tests at realistic F_ST
+//
+// The GEA tests above simulate very strong structure (latent_scale = 2.5), which
+// is why they passed even while imputation was broken on real data.  These tests
+// pin the regime that actually matters: discrete populations at modest F_ST.
+// ---------------------------------------------------------------------------
+
+/// Balding-Nichols genotypes for `npop` discrete populations at a given F_ST.
+///
+/// Ancestral frequencies are drawn Uniform(0.1, 0.9); per-population frequencies
+/// are Beta(p(1-F)/F, (1-p)(1-F)/F); dosages are Binomial(2, p_pop).
+/// Returns (genotypes n x p in {0,1,2}, population label per sample).
+fn simulate_bn(
+    n: usize,
+    p: usize,
+    npop: usize,
+    fst: f64,
+    seed: u64,
+) -> (Array2<u8>, Vec<usize>) {
+    use rand::prelude::*;
+    use rand_distr::{Beta, Binomial, Uniform};
+
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+    let a = (1.0 - fst) / fst;
+    let unif = Uniform::new(0.1, 0.9);
+
+    // Per-population allele frequencies
+    let mut freqs = Array2::<f64>::zeros((npop, p));
+    for j in 0..p {
+        let panc: f64 = unif.sample(&mut rng);
+        for k in 0..npop {
+            let beta = Beta::new(panc * a, (1.0 - panc) * a).unwrap();
+            freqs[(k, j)] = beta.sample(&mut rng);
+        }
+    }
+
+    let labels: Vec<usize> = (0..n).map(|_| rng.gen_range(0..npop)).collect();
+    let mut geno = Array2::<u8>::zeros((n, p));
+    for i in 0..n {
+        for j in 0..p {
+            let bin = Binomial::new(2, freqs[(labels[i], j)]).unwrap();
+            geno[(i, j)] = bin.sample(&mut rng) as u8;
+        }
+    }
+    (geno, labels)
+}
+
+/// Assemble a SimData from Balding-Nichols genotypes plus a covariate whose
+/// correlation with population membership is `r_xu` (the GEA confounding knob).
+fn bn_simdata(
+    geno: Array2<u8>,
+    labels: &[usize],
+    npop: usize,
+    r_xu: f64,
+    seed: u64,
+) -> schnellfmm::simulate::SimData {
+    use rand::prelude::*;
+    use rand_distr::Normal;
+
+    let n = geno.nrows();
+    let p = geno.ncols();
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+    let normal = Normal::new(0.0, 1.0).unwrap();
+
+    // Standardized population score, then X = r*score + sqrt(1-r^2)*noise
+    let raw: Vec<f64> = labels
+        .iter()
+        .map(|&l| l as f64 - (npop as f64 - 1.0) / 2.0)
+        .collect();
+    let mean = raw.iter().sum::<f64>() / n as f64;
+    let sd = (raw.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+
+    let mut x = Array2::<f64>::zeros((n, 1));
+    for i in 0..n {
+        let z: f64 = normal.sample(&mut rng);
+        x[(i, 0)] = r_xu * (raw[i] - mean) / sd + (1.0 - r_xu * r_xu).sqrt() * z;
+    }
+
+    schnellfmm::simulate::SimData {
+        genotypes: geno,
+        x,
+        u_true: Array2::<f64>::zeros((n, 1)),
+        b_true: Array2::<f64>::zeros((1, p)),
+        causal_indices: Vec::new(),
+        allele_freqs: ndarray::Array1::<f64>::zeros(p),
+    }
+}
+
+/// Held-out imputation accuracy at modest F_ST -- the regime where the old NMF
+/// implementation was indistinguishable from (or worse than) mean imputation.
+///
+/// Uses the honest GWAS-phase cross-validation (mask observed genotypes, predict
+/// them from the deployed estimator, compare against the mean-imputation baseline
+/// on the same positions).  Expected gains are roughly +4% at F_ST = 0.05 and
+/// +8% at F_ST = 0.10; the assertions leave headroom.
+#[test]
+fn test_impute_beats_mean_at_modest_fst() {
+    let cases = [(0.05f64, 2.0f64), (0.10f64, 5.0f64)];
+
+    for (fst, min_gain_pct) in cases {
+        let n = 400;
+        let p = 8_000;
+        let (geno, labels) = simulate_bn(n, p, 3, fst, 20250902);
+        let sim = bn_simdata(geno, &labels, 3, 0.6, 77);
+        let sim_miss = mask_genotypes(&sim, 0.10, 4242);
+
+        let dir = tempfile::tempdir().unwrap();
+        write_plink(dir.path(), "bn", &sim_miss).unwrap();
+        let bed = BedFile::open(dir.path().join("bn.bed")).unwrap();
+
+        let config = Lfmm2Config {
+            k: 3,
+            lambda: 1e-5,
+            chunk_size: 2_000,
+            oversampling: 10,
+            n_power_iter: 2,
+            seed: 42,
+            n_workers: 2,
+            progress: false,
+            norm: SnpNorm::CenterOnly,
+            scale_cov: false,
+            impute: ImputeStrategy::Latent,
+            latent_impute: Some(LatentImputeConfig { cv_rate: 0.02 }),
+        };
+
+        let cov_names = default_cov_names(1);
+        let out_path = dir.path().join(format!("bn_{}.tsv", (fst * 100.0) as u32));
+        let oc = OutputConfig {
+            path: &out_path,
+            bim: &bed.bim_records,
+            cov_names: &cov_names,
+            format: OutputFormat::Tsv,
+        };
+        let res = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
+
+        let cv = res.gwas_cv.expect("gwas cv report missing");
+        let (mae, mean_mae, count) = (cv.mae, cv.mean_mae, cv.count);
+        let gain = 100.0 * (mean_mae - mae) / mean_mae;
+
+        eprintln!(
+            "F_ST={:.2}: impute MAE={:.4} mean MAE={:.4} gain={:+.2}% (n={})",
+            fst, mae, mean_mae, gain, count,
+        );
+
+        assert!(count > 10_000, "too few CV positions: {}", count);
+        assert!(
+            gain >= min_gain_pct,
+            "F_ST={:.2}: imputation gain {:+.2}% over mean baseline, expected >= {:.1}%. \
+             MAE={:.4} vs mean {:.4}",
+            fst, gain, min_gain_pct, mae, mean_mae,
+        );
+    }
+}
+
+/// Calibration guard: imputation must not feed the tested covariate back into the
+/// genotypes.  With X confounded with structure (r=0.6), 20% missingness and no
+/// causal SNPs, the GIF must stay near 1 and the null false-positive rate at
+/// alpha=0.05 must stay nominal.
+///
+/// Projecting the fill onto [1 | X | U_hat] instead of col(U_hat) alone drives
+/// GIF to ~1.5 and FPR to ~0.11 -- this test is what catches that.
+#[test]
+fn test_impute_does_not_inflate_null_calibration() {
+    let n = 400;
+    let p = 8_000;
+    let (geno, labels) = simulate_bn(n, p, 3, 0.10, 20250903);
+    let sim = bn_simdata(geno, &labels, 3, 0.6, 91);
+    let sim_miss = mask_genotypes(&sim, 0.20, 555);
+
+    let dir = tempfile::tempdir().unwrap();
+    write_plink(dir.path(), "bn_null", &sim_miss).unwrap();
+    let bed = BedFile::open(dir.path().join("bn_null.bed")).unwrap();
+
+    let config = Lfmm2Config {
+        k: 3,
+        lambda: 1e-5,
+        chunk_size: 2_000,
+        oversampling: 10,
+        n_power_iter: 2,
+        seed: 42,
+        n_workers: 2,
+        progress: false,
+        norm: SnpNorm::CenterOnly,
+        scale_cov: false,
+        impute: ImputeStrategy::Latent,
+        latent_impute: Some(LatentImputeConfig { cv_rate: 0.005 }),
+    };
+
+    let cov_names = default_cov_names(1);
+    let out_path = dir.path().join("bn_null.tsv");
+    let oc = OutputConfig {
+        path: &out_path,
+        bim: &bed.bim_records,
+        cov_names: &cov_names,
+        format: OutputFormat::Tsv,
+    };
+    let res = fit_lfmm2(&bed, &SubsetSpec::All, &bed, &sim.x, &config, &oc).unwrap();
+    let parsed = read_results_tsv(&out_path);
+
+    // Every SNP is null: no covariate effect was simulated.
+    let fpr = parsed.p_values.iter().filter(|pv| pv[0] < 0.05).count() as f64
+        / parsed.p_values.len() as f64;
+
+    eprintln!("null calibration: GIF={:.4}  FPR@0.05={:.4}", res.gif, fpr);
+
+    assert!(
+        res.gif < 1.10,
+        "GIF {:.4} exceeds 1.10 -- imputation is inflating test statistics",
+        res.gif,
+    );
+    assert!(
+        (0.04..=0.06).contains(&fpr),
+        "null FPR@0.05 = {:.4}, expected within [0.04, 0.06]",
+        fpr,
+    );
 }

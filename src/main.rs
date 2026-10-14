@@ -7,11 +7,11 @@ use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use schnellfmm::bed::{BedFile, SubsetSpec};
-use schnellfmm::{fit_lfmm2, ImputeStrategy, Lfmm2Config, NmfConfig, OutputConfig, OutputFormat, SnpNorm};
+use schnellfmm::{fit_lfmm2, ImputeStrategy, LatentImputeConfig, Lfmm2Config, OutputConfig, OutputFormat, SnpNorm};
 
 #[derive(Parser)]
 #[command(name = "schnelLFMM", about = "schnelLFMM: Latent Factor Mixed Models at scale", version = env!("CARGO_PKG_VERSION"))]
-#[command(group = ArgGroup::new("impute").args(&["mean_impute", "nmf_impute"]))]
+#[command(group = ArgGroup::new("impute").args(&["mean_impute", "latent_impute"]))]
 struct Cli {
     /// PLINK .bed file (with .bim/.fam)
     #[arg(short = 'b', long)]
@@ -88,22 +88,19 @@ struct Cli {
     #[arg(long, default_value = "true")]
     mean_impute: bool,
 
-    /// Use NMF low-rank imputation for missing genotypes.
+    /// Impute missing genotypes from the fitted latent-factor term rather than
+    /// the per-SNP mean. The imputation rank is K (-k).
     #[arg(long)]
-    nmf_impute: bool,
+    latent_impute: bool,
 
-    /// NMF rank (default: same as -k).
-    #[arg(long)]
-    nmf_k: Option<usize>,
-
-    /// NMF multiplicative update iterations (default: 10). Monitor the
-    /// per-iteration CV MAE in the summary file to check convergence.
-    #[arg(long, default_value = "10")]
-    nmf_iter: usize,
-
-    /// Fraction of genotypes held out per NMF iteration for CV (default: 0.0005).
+    /// Fraction of observed genotypes held out to measure imputation accuracy
+    /// against the mean-imputation baseline (default: 0.0005).
     #[arg(long, default_value = "0.0005")]
-    nmf_cv_rate: f64,
+    impute_cv_rate: f64,
+
+    /// Removed in 0.4.0 - see --latent-impute.
+    #[arg(long, hide = true)]
+    nmf_impute: bool,
 }
 
 fn default_threads() -> usize {
@@ -117,6 +114,15 @@ fn main() -> Result<()> {
     schnellfmm::with_multithreaded_blas(1, || {});
 
     let cli = Cli::parse();
+
+    if cli.nmf_impute {
+        anyhow::bail!(
+            "--nmf-impute was removed in 0.4.0. NMF imputation performed no better than \n\
+             mean imputation at moderate population structure (F_ST 5-25%); it has been \n\
+             replaced by --latent-impute, which imputes missing genotypes from the fitted \n\
+             latent-factor term. Use --latent-impute instead.",
+        );
+    }
 
     // Load genotype data
     eprintln!("Loading BED file: {}", cli.bed.display());
@@ -188,23 +194,13 @@ fn main() -> Result<()> {
         progress: config_progress,
         norm: cli.norm,
         scale_cov: cli.scale_cov,
-        impute: if cli.nmf_impute {
-            ImputeStrategy::Nmf
+        impute: if cli.latent_impute {
+            ImputeStrategy::Latent
         } else {
             ImputeStrategy::Mean
         },
-        nmf: if cli.nmf_impute {
-            let nmf_k = cli.nmf_k.unwrap_or(cli.k);
-            Some(NmfConfig {
-                k: nmf_k,
-                n_iter: cli.nmf_iter,
-                eps: 1e-16,
-                cv_rate: cli.nmf_cv_rate,
-                chunk_size: cli.chunk_size,
-                n_workers: cli.threads,
-                progress: config_progress,
-                seed: cli.seed,
-            })
+        latent_impute: if cli.latent_impute {
+            Some(LatentImputeConfig { cv_rate: cli.impute_cv_rate })
         } else {
             None
         },
@@ -260,22 +256,41 @@ fn main() -> Result<()> {
         writeln!(f, "covariates: {}", cov_names.join(", "))?;
         writeln!(f, "lambda: {}", cli.lambda)?;
         writeln!(f, "threads: {}", cli.threads)?;
-        writeln!(f, "imputation: {}", if cli.nmf_impute { "nmf" } else { "mean" })?;
-        if let Some(ref cv) = results.nmf_cv {
-            writeln!(f, "nmf_iterations: {}", cv.len())?;
-            for (i, mae) in cv.iter().enumerate() {
-                writeln!(f, "nmf_cv_mae_iter_{}: {:.6}", i + 1, mae)?;
-            }
-            if let Some(mean_mae) = results.nmf_cv_mean {
-                writeln!(f, "mean_impute_cv_mae: {:.6}", mean_mae)?;
+        writeln!(f, "imputation: {}", if cli.latent_impute { "latent" } else { "mean" })?;
+        if let Some(ref cv) = results.gwas_cv {
+            writeln!(f, "gwas_cv_mae: {:.6}", cv.mae)?;
+            writeln!(f, "gwas_cv_mean_mae: {:.6}", cv.mean_mae)?;
+            writeln!(f, "gwas_cv_count: {}", cv.count)?;
+            if cv.lost_to_mean() {
+                writeln!(
+                    f, "impute_warning: latent imputation did not beat mean imputation",
+                )?;
             }
         }
-        if let (Some(gwas_mae), Some(gwas_mean), Some(gwas_cnt)) =
-            (results.nmf_gwas_cv_mae, results.nmf_gwas_cv_mean_mae, results.nmf_gwas_cv_count)
-        {
-            writeln!(f, "nmf_gwas_cv_mae: {:.6}", gwas_mae)?;
-            writeln!(f, "nmf_gwas_cv_mean_mae: {:.6}", gwas_mean)?;
-            writeln!(f, "nmf_gwas_cv_count: {}", gwas_cnt)?;
+    }
+
+    if let Some(ref cv) = results.gwas_cv {
+        let gain = if cv.mean_mae > 0.0 {
+            100.0 * (cv.mean_mae - cv.mae) / cv.mean_mae
+        } else {
+            0.0
+        };
+        eprintln!(
+            "Imputation accuracy (held out, {} genotypes): MAE {:.4} vs mean-imputation {:.4} ({:+.2}%)",
+            cv.count, cv.mae, cv.mean_mae, gain,
+        );
+        if cv.lost_to_mean() {
+            eprintln!();
+            eprintln!("  ############################################################");
+            eprintln!("  ##  WARNING: latent imputation did NOT beat mean imputation");
+            eprintln!("  ##");
+            eprintln!("  ##  Held-out MAE {:.4} vs mean-imputation baseline {:.4}.", cv.mae, cv.mean_mae);
+            eprintln!("  ##  Results were still produced using latent imputation, as");
+            eprintln!("  ##  requested. This usually means there is little population");
+            eprintln!("  ##  structure for the latent factors to exploit; consider");
+            eprintln!("  ##  re-running with --mean-impute, or a different -k.");
+            eprintln!("  ############################################################");
+            eprintln!();
         }
     }
 
