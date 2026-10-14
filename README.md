@@ -130,19 +130,22 @@ Firstly, we accept standard PLINK 1.9 BED+FAM files for genotypes. No other
 reformatting of genotypes should be needed, and analyses leading to GEA or GWAS
 can use standard PLINK tooling for efficiency.
 
-We estimate genotype latent factors ($\mathbf{U}$) using randomised SVD. We use
-the Halko-Martinsson-Tropp algorithm (https://arxiv.org/abs/0909.4061) which
-computes only a sparse subset of the SVD, and allows streaming over the BED
-file without loading $\mathbf{Y}$ into memory.
+Like Caye et al, we estimate genotype latent factors ($\mathbf{U}$) using
+randomised SVD. We use the Halko-Martinsson-Tropp algorithm
+(https://arxiv.org/abs/0909.4061) which computes only a sparse subset of the
+SVD. Unlike Caye, we do this estimation on a random subset of the data
+(`--est-bed` or `--est-rate`) for efficiency, and use an implementation that
+allows streaming over the BED file without loading $\mathbf{Y}$ into memory.
 
 We then compute the effect sizes $\mathbf{B}$ with ridge regression and do
-per-locus statistical tests in an additional streaming pass over SNPs. We
-finally do a per-trait GIF correction of test statistics to avoid inflated
-p-values.
+per-locus statistical tests following Caye et al, however we do this in an
+additional streaming pass over all SNPs. We finally do a per-trait GIF
+correction of test statistics to avoid inflated p-values.
 
-These multiple passes of the BED file might seem inefficient, however with
-modern SSDs computation time will vastly exceed the IO speed, so the overall
-contribution to runtime is worth the vastly improved memory efficiency.
+These multiple passes over the BED file might seem inefficient, however with
+modern SSDs computation time will vastly exceed the IO speed, so the minor
+increase in IO is worth the vastly improved memory efficiency (and, because we
+can parallelise over chunks of genotypes, ends up much faster regardless).
 
 ## Latent-factor imputation
 
