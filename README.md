@@ -9,7 +9,7 @@ and GEA on large whole-genome datasets
 LFMM2 is a common approach for Genotype-Environment associations, initially
 described in [Caye et al. (2019)](https://academic.oup.com/mbe/article/36/4/852/5290100),
 and implemented in the [LEA R package
-](https://bioconductor.org/packages//release/bioc/html/LEA.html). This tool is
+](https://bioconductor.org/packages//release/bioc/html/LEA.html). This tool (schnelLFMM) is
 a reimplementation of the LFMM2 model in Rust that uses a randomised streaming
 approach to both compute genome blocks in parallel, and reduce memory usage
 for colossal datasets.
